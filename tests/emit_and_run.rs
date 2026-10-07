@@ -18,6 +18,8 @@ mod class_configuration;
 mod data_factory;
 #[path = "support/rails_root_join.rs"]
 mod rails_root_join;
+#[path = "support/cable_actions.rs"]
+mod cable_actions;
 
 #[test]
 fn critic_corrections_preserve_class_objects_reflection_and_operators() {
@@ -7787,4 +7789,17 @@ raise "probe" unless CaptureStdlibProbe.exercise == "ok"
 "#,
         )
         .assert_passes();
+}
+
+/// A client's `subscription.perform(action, data)` runs the channel's
+/// action with Rails' own rules (#71 item 6): which methods are actions,
+/// which get `data`, `receive` as the default, JSON `false` kept false,
+/// and nothing for a private or unknown name or a rejected subscription.
+/// The CRuby overlay's half; `spinel_toolchain` runs the same contract
+/// natively through the generated dispatch.
+#[test]
+fn a_cable_action_runs_with_rails_rules() {
+    let run = cable_actions::overlay().run_ruby(&cable_actions::ruby_script());
+    run.assert_passes();
+    assert_eq!(run.stdout, cable_actions::EXPECTED, "stderr:\n{}", run.stderr);
 }
