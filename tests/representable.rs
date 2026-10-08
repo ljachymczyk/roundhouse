@@ -134,3 +134,34 @@ fn a_represented_getter_is_rebased_onto_represented() {
     assert!(!rep.contains("represented.format"), "{rep}");
     assert!(!rep.contains("represented.t)"), "{rep}");
 }
+
+/// A decorator method named like a generated one (`to_hash`, `initialize`,
+/// `represented`, `as_json_str`, `representable_<name>`) would be replaced
+/// by the generated method, and a class-side method is outside the subset:
+/// both are refused rather than lowered in part.
+#[test]
+fn a_method_colliding_with_a_generated_one_is_refused() {
+    for body in [
+        "  def to_hash\n    {}\n  end\n",
+        "  def initialize(model)\n    super\n  end\n",
+        "  def representable_title\n    \"x\"\n  end\n",
+        "  def self.build\n    new(nil)\n  end\n",
+    ] {
+        let representer = format!(
+            "class ArticleRepresenter < Representable::Decorator\n  include Representable::JSON\n\n  property :title\n\n{body}end\n"
+        );
+        assert!(ingest_app_from_tree(tree(&representer, CONTROLLER)).is_err(), "accepted:\n{representer}");
+    }
+}
+
+/// `next` ends the getter only at its own level; one inside a nested block
+/// ends that block's iteration and must stay `next`.
+#[test]
+fn only_a_top_level_next_becomes_return() {
+    let (rep, _) = emitted(
+        "class ArticleRepresenter < Representable::Decorator\n  include Representable::JSON\n\n  property :title, getter: ->(**) { next \"none\" if title.nil?\n title.chars.map { |c| next \"_\" if c == \" \"\n c }.join }\nend\n",
+    );
+    assert!(rep.contains("return \"none\" if"), "{rep}");
+    assert!(rep.contains("next \"_\" if"), "{rep}");
+    assert!(!rep.contains("return \"_\""), "{rep}");
+}

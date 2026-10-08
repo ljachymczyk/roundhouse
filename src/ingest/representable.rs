@@ -234,8 +234,17 @@ fn collect_fields(
     for stmt in flatten_statements(body) {
         let offset = stmt.location().start_offset();
         let fail = |reason: &str| refuse(source, offset, reason);
-        if stmt.as_def_node().is_some() {
-            // The decorator's own methods are ingested as methods already.
+        if let Some(def) = stmt.as_def_node() {
+            // The decorator's own methods are ingested as methods already,
+            // unless the generated ones would replace them (Ruby keeps the
+            // later definition) or they sit on the class side.
+            if def.receiver().is_some() {
+                return Err(fail("a class method on a representer is outside the Representable subset"));
+            }
+            let name = constant_id_str(&def.name());
+            if GENERATED.contains(&name) || name.starts_with("representable_") {
+                return Err(fail(&format!("`def {name}` would be replaced by the generated method")));
+            }
             continue;
         }
         let Some(call) = stmt.as_call_node() else {
@@ -394,7 +403,7 @@ fn getter_source(
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     // Under `exec_context: :decorator` the body already runs on the
     // decorator, as the generated method does.
-    let mut rebase = RebaseVisitor { prefix: !reads_represented && !decorator_context, edits: &mut edits };
+    let mut rebase = RebaseVisitor { prefix: !reads_represented && !decorator_context, depth: 0, edits: &mut edits };
     ruby_prism::Visit::visit(&mut rebase, &body);
     let mut text = source.text[start..end].to_string();
     edits.sort_by(|a, b| b.0.cmp(&a.0));
@@ -404,9 +413,16 @@ fn getter_source(
     Ok(text)
 }
 
+/// Methods `synthesize` writes on the expanded class; a decorator `def` of
+/// one of these names would be silently replaced.
+const GENERATED: [&str; 4] = ["initialize", "represented", "to_hash", "as_json_str"];
+
 struct RebaseVisitor<'a> {
     /// Give receiverless calls `represented.` (the `(**)` form).
     prefix: bool,
+    /// Blocks and lambdas entered below the getter's own body: a `next`
+    /// there ends that block's iteration, not the getter.
+    depth: usize,
     edits: &'a mut Vec<(usize, usize, String)>,
 }
 
@@ -428,9 +444,21 @@ impl<'pr> ruby_prism::Visit<'pr> for RebaseVisitor<'_> {
         }
     }
     fn visit_next_node(&mut self, node: &ruby_prism::NextNode<'pr>) {
-        let at = node.location().start_offset();
-        self.edits.push((at, at + "next".len(), "return".to_string()));
+        if self.depth == 0 {
+            let at = node.location().start_offset();
+            self.edits.push((at, at + "next".len(), "return".to_string()));
+        }
         ruby_prism::visit_next_node(self, node);
+    }
+    fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+        self.depth += 1;
+        ruby_prism::visit_block_node(self, node);
+        self.depth -= 1;
+    }
+    fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+        self.depth += 1;
+        ruby_prism::visit_lambda_node(self, node);
+        self.depth -= 1;
     }
 }
 
