@@ -658,7 +658,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // require; on Spinel by its fileutils / openssl package.
     register_stdlib_class(classes, "FileUtils", &[
         ("mkdir_p", Ty::Array { elem: Box::new(Ty::Str) }),
-        ("cp", Ty::Nil),
+        // nil for one source, the source Array for several (CRuby 4.0.5).
+        ("cp", Ty::Union { variants: vec![Ty::Nil, Ty::Array { elem: Box::new(Ty::Str) }] }),
     ], &[]);
     register_stdlib_class(classes, "GC", &[("start", Ty::Nil)], &[]);
     register_stdlib_class(classes, "OpenSSL::HMAC", &[("digest", Ty::Str), ("hexdigest", Ty::Str)], &[]);
