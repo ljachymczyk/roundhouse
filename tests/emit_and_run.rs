@@ -14,12 +14,35 @@ mod integer_query_find_by;
 
 #[path = "support/class_configuration.rs"]
 mod class_configuration;
+#[path = "support/runtime_block_signature.rs"]
+mod runtime_block_signature;
 #[path = "support/data_factory.rs"]
 mod data_factory;
 #[path = "support/rails_root_join.rs"]
 mod rails_root_join;
 #[path = "support/cable_actions.rs"]
 mod cable_actions;
+#[path = "support/anonymous_keywords.rs"]
+mod anonymous_keywords;
+
+/// The same anonymous keyword packet survives defaulting, local-name
+/// collisions, and a virtual override in emitted CRuby. Effectful input
+/// values also stay left-to-right and run once.
+#[test]
+fn anonymous_keyword_forwarding_runs_without_capturing_or_reordering_values() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/services/keyword_forwarder.rb",
+            anonymous_keywords::SOURCE,
+        )
+        .run_ruby(anonymous_keywords::ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("anonymous keyword forwarding contract passed"));
+    let emitted = std::fs::read_to_string(run.emitted.join("app/models/keyword_forwarder.rb"))
+        .expect("emitted keyword forwarding class");
+    assert!(emitted.contains("class KeywordForwarder"), "{emitted}");
+    assert!(emitted.contains("request(kind: :get, path: path, **)"), "{emitted}");
+}
 
 #[test]
 fn critic_corrections_preserve_class_objects_reflection_and_operators() {
@@ -257,6 +280,19 @@ raise "cable endpoint disappeared: #{cable.status} #{cable.body}" unless cable.s
 puts "runtime cable endpoint preserved"
 "##)
         .assert_passes();
+}
+
+/// A client's `subscription.perform(action, data)` runs the channel's
+/// action with Rails' own rules (#71 item 6): which methods are actions,
+/// which get `data`, `receive` as the default, JSON `false` kept false,
+/// and nothing for a private or unknown name or a rejected subscription.
+/// The CRuby overlay's half; `spinel_toolchain` runs the same contract
+/// natively through the generated dispatch.
+#[test]
+fn a_cable_action_runs_with_rails_rules() {
+    let run = cable_actions::overlay().run_ruby(&cable_actions::ruby_script());
+    run.assert_passes();
+    assert_eq!(run.stdout, cable_actions::EXPECTED, "stderr:\n{}", run.stderr);
 }
 
 #[test]
@@ -5780,6 +5816,50 @@ fn a_template_only_action_is_fed_by_its_before_action() {
         .assert_passes();
 }
 
+#[test]
+fn array_and_hash_checks_preserve_members() {
+    emit_and_run::real_blog()
+        .write("app/lib/container_narrowing_probe.rb", r##"class ContainerNarrowingProbe
+  def self.array_members
+    value = ["alpha", "beta"]
+    if value.is_a?(Array)
+      value.map { |item| item.upcase }
+    else
+      raise("not an Array")
+    end
+  end
+  def self.hash_members
+    value = {"answer" => 41}
+    if value.is_a?(Hash)
+      value.map { |key, item| "#{key.upcase}=#{item + 1}" }
+    else
+      raise("not a Hash")
+    end
+  end
+  def self.nested_members
+    value = [{"name" => "alpha"}, {"name" => "beta"}]
+    if value.is_a?(Array)
+      value.map do |item|
+        if item.is_a?(Hash)
+          item.fetch("name").upcase
+        else
+          raise("not a Hash")
+        end
+      end
+    else
+      raise("not an Array")
+    end
+  end
+end
+"##)
+        .run_ruby(r#"
+raise "Array members changed" unless ContainerNarrowingProbe.array_members == ["ALPHA", "BETA"]
+raise "Hash members changed" unless ContainerNarrowingProbe.hash_members == ["ANSWER=42"]
+raise "nested members changed" unless ContainerNarrowingProbe.nested_members == ["ALPHA", "BETA"]
+"#)
+        .assert_passes();
+}
+
 const ARTICLES_CONTROLLER: &str = "app/controllers/articles_controller.rb";
 const TRACK_FILTER: &str = "  def track\n    \
                               @tracked = %w[index show].include?(action_name)\n    \
@@ -6824,6 +6904,8 @@ end
 mod relation_finders;
 #[path = "emit_and_run/attach_hash.rs"]
 mod attach_hash;
+#[path = "emit_and_run/many_attached.rs"]
+mod many_attached;
 
 /// A controller under `ActionController::API`, the base `rails new
 /// --api` writes, dispatches (#163). The runtime defined only `Base`,
@@ -7791,15 +7873,62 @@ raise "probe" unless CaptureStdlibProbe.exercise == "ok"
         .assert_passes();
 }
 
-/// A client's `subscription.perform(action, data)` runs the channel's
-/// action with Rails' own rules (#71 item 6): which methods are actions,
-/// which get `data`, `receive` as the default, JSON `false` kept false,
-/// and nothing for a private or unknown name or a rejected subscription.
-/// The CRuby overlay's half; `spinel_toolchain` runs the same contract
-/// natively through the generated dispatch.
 #[test]
-fn a_cable_action_runs_with_rails_rules() {
-    let run = cable_actions::overlay().run_ruby(&cable_actions::ruby_script());
-    run.assert_passes();
-    assert_eq!(run.stdout, cable_actions::EXPECTED, "stderr:\n{}", run.stderr);
+fn campfire_video_preview_config_runs() {
+    // Campfire tip initializer sets video_preview_arguments (gte(t,5))
+    // and swaps previewers VideoPreviewer → TimeLimitedVideoPreviewer.
+    // Suite asserts ActiveStorage.previewers / video_preview_arguments;
+    // poster reads the vf filter from the same config.
+    emit_and_run::real_blog()
+        .write(
+            "lib/rails_ext/time_limited_video_previewer.rb",
+            r#"class TimeLimitedVideoPreviewer < ActiveStorage::Previewer::VideoPreviewer
+  TIME_LIMIT = 10
+end
+"#,
+        )
+        .write(
+            "config/initializers/extensions.rb",
+            r#"Dir[Rails.root.join("lib/rails_ext/*.rb")].sort.each { |f| require f }
+"#,
+        )
+        .write(
+            "config/initializers/active_storage.rb",
+            r#"require "rails_ext/time_limited_video_previewer"
+
+Rails.application.configure do
+  config.active_storage.video_preview_arguments =
+    "-vf 'select=eq(n\\,0)+eq(key\\,1)+gt(scene\\,0.015)+gte(t\\,5),loop=loop=-1:size=2,trim=start_frame=1'" \
+    " -frames:v 1 -f image2"
+
+  config.active_storage.previewers = config.active_storage.previewers.map do |previewer|
+    previewer == ActiveStorage::Previewer::VideoPreviewer ? TimeLimitedVideoPreviewer : previewer
+  end
+end
+"#,
+        )
+        .run_ruby(
+            r#"
+raise "args" unless ActiveStorage.video_preview_arguments.include?("gte(t\\,5)")
+raise "filter" unless ActiveStorage.video_preview_vf_filter.include?("gte(t\\,5)")
+raise "previewers include" unless ActiveStorage.previewers.include?(TimeLimitedVideoPreviewer)
+raise "previewers exclude" if ActiveStorage.previewers.include?(ActiveStorage::Previewer::VideoPreviewer)
+
+# `-vf` must match as a whole option, not a prefix of `-vframes`.
+def ActiveStorage.video_preview_arguments
+  "-vframes 1 -vf 'scale=320:240' -f image2"
+end
+raise "vf vs vframes" unless ActiveStorage.video_preview_vf_filter == "scale=320:240"
+"#,
+        )
+        .assert_passes();
+}
+
+#[test]
+fn an_rbs_array_block_runs_after_app_emission() {
+    emit_and_run::real_blog()
+        .write("app/lib/batch.rb", runtime_block_signature::RUBY)
+        .write("sig/batch.rbs", runtime_block_signature::RBS)
+        .run_ruby("raise 'wrong sum' unless Batch.new.consume == 3")
+        .assert_passes();
 }
