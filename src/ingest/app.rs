@@ -376,6 +376,11 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         }
     }
 
+    let database_yml = dir.join("config/database.yml");
+    if let Ok(text) = vfs.read_to_string(&database_yml) {
+        app.database_paths = database_paths(&text);
+    }
+
     let schema_path = dir.join("db/schema.rb");
     let structure_path = dir.join("db/structure.sql");
     if vfs.exists(&schema_path) {
@@ -9993,6 +9998,53 @@ fn locale_literal(value: &str) -> Option<String> {
         _ => return None,
     };
     (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The main database file per environment from `config/database.yml`,
+/// read as Rails reads it: an environment's own `database:`, or, for a
+/// multi-database environment, the first configuration's (Rails calls it
+/// primary). ERB tags are replaced before parsing so `max_connections:
+/// <%= ... %>` lines do not stop the file from loading; a `database:`
+/// whose value was ERB is computed at boot in Rails, so that environment
+/// is left out and keeps the runtime's default.
+pub(crate) fn database_paths(text: &str) -> Vec<(String, String)> {
+    use serde_yaml_ng::Value;
+    const ERB_PLACEHOLDER: &str = "__roundhouse_erb__";
+    let mut plain = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<%") {
+        plain.push_str(&rest[..start]);
+        let Some(end) = rest[start..].find("%>") else { break };
+        plain.push_str(ERB_PLACEHOLDER);
+        rest = &rest[start + end + 2..];
+    }
+    plain.push_str(rest);
+    let Ok(Value::Mapping(root)) = serde_yaml_ng::from_str::<Value>(&plain) else { return Vec::new() };
+    let database = |m: &serde_yaml_ng::Mapping| -> Option<String> {
+        match m.get(Value::from("database")) {
+            Some(Value::String(s)) if !s.contains(ERB_PLACEHOLDER) => Some(s.clone()),
+            _ => None,
+        }
+    };
+    let mut out = Vec::new();
+    for (env, config) in &root {
+        let (Value::String(env), Value::Mapping(config)) = (env, config) else { continue };
+        if config.contains_key(Value::from("database")) {
+            if let Some(path) = database(config) {
+                out.push((env.clone(), path));
+            }
+            continue;
+        }
+        // Multi-database: the first nested configuration is the primary.
+        let first = config.iter().find_map(|(_, v)| match v {
+            Value::Mapping(m) => Some(m),
+            _ => None,
+        });
+        if let Some(path) = first.and_then(database) {
+            out.push((env.clone(), path));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
