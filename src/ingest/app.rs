@@ -9732,16 +9732,27 @@ fn locale_literal(value: &str) -> Option<String> {
 
 /// The main database file per environment from `config/database.yml`,
 /// read as Rails reads it: an environment's own `database:`, or, for a
-/// multi-database environment, the first configuration's (Rails calls it
-/// primary). ERB tags are replaced before parsing so `max_connections:
-/// <%= ... %>` lines do not stop the file from loading; a `database:`
-/// whose value was ERB is computed at boot in Rails, so that environment
-/// is left out and keeps the runtime's default.
+/// multi-database environment, the configuration named `primary`, else the
+/// first one. ERB tags are replaced before parsing so `max_connections:
+/// <%= ... %>` lines do not stop the file from loading, and a line holding
+/// only a control or comment tag (`<% if ... %>`, `<% end %>`) is blanked,
+/// since a bare placeholder line would make the YAML invalid; a
+/// `database:` whose value was ERB is computed at boot in Rails, so that
+/// environment is left out and keeps the runtime's default.
 pub(crate) fn database_paths(text: &str) -> Vec<(String, String)> {
     use serde_yaml_ng::Value;
     const ERB_PLACEHOLDER: &str = "__roundhouse_erb__";
+    let text = text
+        .lines()
+        .map(|line| {
+            let t = line.trim();
+            let tag_only = t.starts_with("<%") && !t.starts_with("<%=") && t.ends_with("%>");
+            if tag_only { "" } else { line }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut plain = String::new();
-    let mut rest = text;
+    let mut rest = text.as_str();
     while let Some(start) = rest.find("<%") {
         plain.push_str(&rest[..start]);
         let Some(end) = rest[start..].find("%>") else { break };
@@ -9765,16 +9776,47 @@ pub(crate) fn database_paths(text: &str) -> Vec<(String, String)> {
             }
             continue;
         }
-        // Multi-database: the first nested configuration is the primary.
-        let first = config.iter().find_map(|(_, v)| match v {
-            Value::Mapping(m) => Some(m),
-            _ => None,
-        });
-        if let Some(path) = first.and_then(database) {
+        // Multi-database: the configuration named `primary` is the
+        // default, else the first one (Rails' `primary?`).
+        let primary = match config.get(Value::from("primary")) {
+            Some(Value::Mapping(m)) => Some(m),
+            _ => config.iter().find_map(|(_, v)| match v {
+                Value::Mapping(m) => Some(m),
+                _ => None,
+            }),
+        };
+        if let Some(path) = primary.and_then(database) {
             out.push((env.clone(), path));
         }
     }
     out
+}
+
+#[cfg(test)]
+mod database_paths_tests {
+    use super::database_paths;
+
+    fn paths(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(e, p)| (e.to_string(), p.to_string())).collect()
+    }
+
+    #[test]
+    fn a_control_tag_on_its_own_line_leaves_the_rest_of_the_file_readable() {
+        let yml = "development:\n  database: storage/dev.sqlite3\n<% if ENV[\"CI\"] %>\ntest:\n  database: storage/ci.sqlite3\n<% end %>\n<%# a comment %>\n";
+        assert_eq!(
+            database_paths(yml),
+            paths(&[("development", "storage/dev.sqlite3"), ("test", "storage/ci.sqlite3")])
+        );
+    }
+
+    #[test]
+    fn a_multi_database_environment_takes_the_one_named_primary() {
+        let yml = "production:\n  cache:\n    database: storage/cache.sqlite3\n  primary:\n    database: storage/production.sqlite3\nstaging:\n  queue:\n    database: storage/queue.sqlite3\n  other:\n    database: storage/other.sqlite3\n";
+        assert_eq!(
+            database_paths(yml),
+            paths(&[("production", "storage/production.sqlite3"), ("staging", "storage/queue.sqlite3")])
+        );
+    }
 }
 
 #[cfg(test)]
