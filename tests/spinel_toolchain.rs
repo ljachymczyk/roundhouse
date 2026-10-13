@@ -78,6 +78,10 @@ mod json_request_values;
 mod io_process_constants_contract;
 #[path = "spinel_toolchain/io_process_constants.rs"]
 mod io_process_constants;
+#[path = "support/safe_navigation.rs"]
+mod safe_navigation_contract;
+#[path = "spinel_toolchain/safe_navigation.rs"]
+mod safe_navigation;
 #[path = "spinel_toolchain/action_text_sanitize.rs"]
 mod action_text_sanitize;
 #[path = "support/campfire_caches.rs"]

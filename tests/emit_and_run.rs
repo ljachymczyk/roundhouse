@@ -64,6 +64,10 @@ mod delegate_association;
 mod io_process_constants_contract;
 #[path = "emit_and_run/io_process_constants.rs"]
 mod io_process_constants;
+#[path = "support/safe_navigation.rs"]
+mod safe_navigation_contract;
+#[path = "emit_and_run/safe_navigation.rs"]
+mod safe_navigation;
 #[path = "emit_and_run/helper_anonymous_rest.rs"]
 mod helper_anonymous_rest;
 #[path = "emit_and_run/controller_response_body.rs"]
