@@ -126,6 +126,27 @@ fn an_after_initialize_hook_is_carried_and_an_i18n_store_one_is_not() {
 }
 
 #[test]
+fn an_after_initialize_hook_that_needs_its_surroundings_is_not_carried() {
+    // `do |app|` takes the application Rails yields, and the second reads
+    // the initializer's own local: a carried body runs without either, so
+    // both stay unconsumed. A comment naming the I18n store does not make
+    // the third an I18n block; it is carried.
+    let (_, ledger) = ingest(&[(
+        "config/initializers/hooks.rb",
+        "limit = 5\n\
+         Rails.application.config.after_initialize do |app|\n  Mailer.verify!(app)\nend\n\
+         Rails.application.config.after_initialize do\n  Mailer.verify!(limit)\nend\n\
+         Rails.application.config.after_initialize do\n  # I18n.backend.store_translations\n  Mailer.verify!\nend\n",
+    )]);
+    let hooks: Vec<&str> = ledger
+        .iter()
+        .filter(|d| statement(d) == "Rails.application.config.after_initialize")
+        .map(location)
+        .collect();
+    assert_eq!(hooks, ["config/initializers/hooks.rb:2:1", "config/initializers/hooks.rb:5:1"]);
+}
+
+#[test]
 fn inert_allowlisted_statements_are_not_reported_but_a_computed_value_is() {
     let (_, ledger) = ingest(&[(
         "config/initializers/inert.rb",

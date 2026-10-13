@@ -8371,35 +8371,97 @@ pub(super) fn extract_initializer_filters(source: &[u8], file: &str) -> Vec<crat
 /// which the emitted boot calls once everything is loaded, where Rails
 /// runs its `after_initialize` callbacks.
 ///
-/// A block that only feeds I18n's backend (`I18n.backend
+/// A block that feeds I18n's backend (`I18n.backend
 /// .store_translations`) is skipped: the runtime's I18n has no backend
-/// to store into.
+/// to store into. So is one the body alone cannot run: a block that takes
+/// the application Rails yields (`do |app|`), or one that reads a local
+/// of the initializer around it. Those stay unread, so the initializer
+/// ledger reports them.
 pub(super) fn extract_after_initialize_blocks(source: &[u8], file: &str) -> Vec<String> {
     let result = super::prism::parse(source, file);
     let root = result.node();
-    let src = String::from_utf8_lossy(source).into_owned();
     let Some(program) = root.as_program_node() else { return Vec::new() };
-    let mut out = Vec::new();
-    for stmt in program.statements().body().iter() {
-        let Some(call) = stmt.as_call_node() else { continue };
-        if super::util::constant_id_str(&call.name()) != "after_initialize" {
-            continue;
-        }
-        let Some(recv) = call.receiver() else { continue };
-        let recv_loc = recv.location();
-        if &src[recv_loc.start_offset()..recv_loc.end_offset()] != "Rails.application.config" {
-            continue;
-        }
-        let Some(block) = call.block().and_then(|b| b.as_block_node()) else { continue };
-        let Some(body) = block.body() else { continue };
-        let loc = body.location();
-        let text = &src[loc.start_offset()..loc.end_offset()];
-        if text.contains("I18n.backend.store_translations") {
-            continue;
-        }
-        out.push(format!("(-> do\n{text}\nend).call"));
+    program
+        .statements()
+        .body()
+        .iter()
+        .filter_map(|stmt| stmt.as_call_node().and_then(|call| after_initialize_callback(&call)))
+        .collect()
+}
+
+/// One top-level statement as [`extract_after_initialize_blocks`] carries
+/// it, or `None`. Read from the node parsed with its whole file, so a
+/// local of the initializer is told apart from a method call (the
+/// initializer ledger asks with that node too).
+pub(super) fn after_initialize_callback(call: &ruby_prism::CallNode<'_>) -> Option<String> {
+    if super::util::constant_id_str(&call.name()) != "after_initialize" {
+        return None;
     }
-    out
+    if call.receiver()?.location().as_slice() != b"Rails.application.config" {
+        return None;
+    }
+    let block = call.block().and_then(|b| b.as_block_node())?;
+    if block.parameters().is_some() {
+        return None;
+    }
+    let body = block.body()?;
+    let mut uses = CallbackUses { nesting: 0, outer_local: false, stores_translations: false };
+    ruby_prism::Visit::visit(&mut uses, &body);
+    if uses.outer_local || uses.stores_translations {
+        return None;
+    }
+    let text = String::from_utf8_lossy(body.location().as_slice());
+    Some(format!("(-> do\n{text}\nend).call"))
+}
+
+/// What an `after_initialize` body reaches beyond itself: a local of the
+/// code around the block (a variable whose depth is past the blocks the
+/// body opens), and a `I18n.backend.store_translations` call.
+struct CallbackUses {
+    nesting: u32,
+    outer_local: bool,
+    stores_translations: bool,
+}
+
+impl<'pr> ruby_prism::Visit<'pr> for CallbackUses {
+    fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+        self.nesting += 1;
+        ruby_prism::visit_block_node(self, node);
+        self.nesting -= 1;
+    }
+    fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+        self.nesting += 1;
+        ruby_prism::visit_lambda_node(self, node);
+        self.nesting -= 1;
+    }
+    fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+        self.outer_local |= node.depth() > self.nesting;
+    }
+    fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+        self.outer_local |= node.depth() > self.nesting;
+    }
+    fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+        self.outer_local |= node.depth() > self.nesting;
+        ruby_prism::visit_local_variable_write_node(self, node);
+    }
+    fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+        self.outer_local |= node.depth() > self.nesting;
+        ruby_prism::visit_local_variable_operator_write_node(self, node);
+    }
+    fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+        self.outer_local |= node.depth() > self.nesting;
+        ruby_prism::visit_local_variable_and_write_node(self, node);
+    }
+    fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+        self.outer_local |= node.depth() > self.nesting;
+        ruby_prism::visit_local_variable_or_write_node(self, node);
+    }
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        if super::util::constant_id_str(&node.name()) == "store_translations" {
+            self.stores_translations |= node.receiver().is_some_and(|r| r.location().as_slice() == b"I18n.backend");
+        }
+        ruby_prism::visit_call_node(self, node);
+    }
 }
 
 /// The generated module whose `run` performs the carried
