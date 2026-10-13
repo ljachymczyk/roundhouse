@@ -288,6 +288,43 @@ end
     assert!(!out.contains("REFERENCES articles"), "{out}");
 }
 
+/// `add_reference ..., foreign_key: true`: SQLite cannot add the
+/// constraint in place, so Rails' adapter rebuilds the table
+/// (alter_table) and the database has the foreign key, as here.
+#[test]
+fn add_reference_with_a_foreign_key_rebuilds_the_table() {
+    let ms = record(&[
+        ("db/migrate/20260101000001_create_articles.rb", CREATE_ARTICLES),
+        (
+            "db/migrate/20260101000002_create_notes.rb",
+            r#"
+class CreateNotes < ActiveRecord::Migration[8.1]
+  def change
+    create_table :notes do |t|
+      t.text :body
+    end
+  end
+end
+"#,
+        ),
+        (
+            "db/migrate/20260101000003_reference.rb",
+            r#"
+class Reference < ActiveRecord::Migration[8.1]
+  def change
+    add_reference :notes, :article, foreign_key: true
+  end
+end
+"#,
+        ),
+    ]);
+    assert!(matches!(&ms[2].steps[..], [MigrationStep::RebuildTable { .. }]), "{:?}", ms[2].steps);
+    let out = sql(&ms[2]).join("\n");
+    assert!(out.contains("FOREIGN KEY (article_id) REFERENCES articles (id)"), "{out}");
+    assert!(out.contains("INSERT INTO notes__rh_alter (id, body) SELECT id, body FROM notes"), "{out}");
+    assert!(out.contains("CREATE INDEX index_notes_on_article_id ON notes (article_id)"), "{out}");
+}
+
 #[test]
 fn seed_sql_records_the_versions_the_schema_includes_as_schema_load_does() {
     let mut app = roundhouse::App::default();

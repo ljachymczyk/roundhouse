@@ -1979,6 +1979,15 @@ fn record_verb(
         }
         "add_column" | "add_timestamps" | "add_reference" | "add_belongs_to" => {
             let after = schema.tables.get(&Symbol::from(table.as_str())).cloned();
+            // `foreign_key: true`: SQLite cannot add a constraint in place,
+            // so Rails' adapter rebuilds the table (alter_table), which also
+            // recreates its indexes
+            if let (Some(b), Some(a)) = (&before, &after) {
+                if b.foreign_keys != a.foreign_keys {
+                    steps.push(S::RebuildTable { before: b.clone(), after: a.clone() });
+                    return Ok(steps);
+                }
+            }
             if let (Some(b), Some(a)) = (&before, &after) {
                 let added: Vec<Column> =
                     a.columns.iter().filter(|c| !b.columns.iter().any(|o| o.name == c.name)).cloned().collect();
