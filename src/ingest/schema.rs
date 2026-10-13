@@ -1833,6 +1833,204 @@ fn index_from_call(
     build_index(table_name, columns, args.iter().skip(1), file).map(Some)
 }
 
+/// Read one migration as `rails db:migrate` runs it: its version and the
+/// schema changes it makes, in order, folding them into `schema` (the
+/// scratch state the migrations before it left). Never fails: anything
+/// the steps cannot express (a verb the fold does not model, Ruby beside
+/// the verbs) is recorded as [`Migration::not_renderable`], and the verbs
+/// inside such a statement still fold, so later migrations see the state
+/// the fold would have.
+pub fn record_migration(source: &[u8], file: &str, schema: &mut Schema) -> crate::schema::Migration {
+    use crate::schema::Migration;
+    let stem = std::path::Path::new(file).file_name().and_then(|n| n.to_str()).unwrap_or(file);
+    let version: String = stem.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let mut migration = Migration { version, file: file.into(), steps: Vec::new(), not_renderable: None, in_schema: false };
+    super::sources::register(file, &String::from_utf8_lossy(source));
+    let result = super::prism::parse(source, file);
+    let root = result.node();
+    let Some(class) = find_first_class(&root) else {
+        migration.not_renderable = Some("no migration class".into());
+        return migration;
+    };
+    let mut change_body: Option<Node<'_>> = None;
+    let mut up_body: Option<Node<'_>> = None;
+    if let Some(body) = class.body() {
+        for stmt in flatten_statements(body) {
+            if let Some(def) = stmt.as_def_node() {
+                match constant_id_str(&def.name()) {
+                    "change" => change_body = def.body(),
+                    "up" => up_body = def.body(),
+                    _ => {}
+                }
+            }
+        }
+    }
+    let Some(body) = change_body.or(up_body) else { return migration };
+    let gap = |m: &mut Migration, why: String| {
+        if m.not_renderable.is_none() {
+            m.not_renderable = Some(why);
+        }
+    };
+    for stmt in flatten_statements(body) {
+        let call = stmt.as_call_node().filter(|c| c.receiver().is_none());
+        let verb = call.as_ref().map(|c| constant_id_str(&c.name()).to_string());
+        match (call, verb.as_deref()) {
+            // `say "..."` prints and changes nothing
+            (Some(c), Some("say")) if c.block().is_none() => {}
+            (Some(c), Some(v)) if is_schema_verb(v) => {
+                if v == "execute" {
+                    match data_only_sql(&c) {
+                        Some(sql) => migration.steps.push(crate::schema::MigrationStep::Execute { sql }),
+                        None => gap(&mut migration, "`execute` with SQL that is not a literal data change (UPDATE / INSERT / DELETE)".into()),
+                    }
+                    continue;
+                }
+                if UNSUPPORTED_VERBS.contains(&v) {
+                    gap(&mut migration, format!("`{v}` is not a change roundhouse renders as SQL"));
+                    continue;
+                }
+                match record_verb(v, &c, file, schema) {
+                    Ok(steps) => migration.steps.extend(steps),
+                    Err(IngestError::Unsupported { message, .. }) => gap(&mut migration, message),
+                    Err(e) => gap(&mut migration, e.to_string()),
+                }
+            }
+            _ => {
+                let text = String::from_utf8_lossy(stmt.location().as_slice());
+                let first = text.lines().next().unwrap_or("").trim();
+                gap(&mut migration, format!("`{first}` is not a schema change the migration fold models"));
+                // its verbs still fold, as `ingest_migration` would fold them
+                walk_calls(&stmt, &mut |inner| {
+                    if inner.receiver().is_none() {
+                        let v = constant_id_str(&inner.name()).to_string();
+                        let _ = apply_migration_verb(&v, inner, file, schema, GeneratedExpressionDialect::Portable);
+                    }
+                });
+            }
+        }
+    }
+    migration
+}
+
+/// The SQL of `execute "..."` when it is a literal that changes data only
+/// (UPDATE, INSERT, DELETE): the schema the fold follows stays as it is.
+/// Anything else (DDL, interpolation) the fold could not follow.
+fn data_only_sql(call: &ruby_prism::CallNode<'_>) -> Option<String> {
+    let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    if args.len() != 1 {
+        return None;
+    }
+    let sql = string_value(&args[0])?;
+    let head = sql.trim_start().split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+    matches!(head.as_str(), "UPDATE" | "INSERT" | "DELETE").then_some(sql)
+}
+
+/// The verbs [`apply_migration_verb`] folds (and [`UNSUPPORTED_VERBS`],
+/// which it refuses with a message).
+fn is_schema_verb(verb: &str) -> bool {
+    UNSUPPORTED_VERBS.contains(&verb)
+        || matches!(
+            verb,
+            "create_table" | "drop_table" | "rename_table" | "add_column" | "change_column"
+                | "remove_column" | "rename_column" | "change_column_null" | "change_column_default"
+                | "add_timestamps" | "add_reference" | "add_belongs_to" | "remove_reference"
+                | "remove_belongs_to" | "add_index" | "remove_index" | "add_foreign_key"
+                | "remove_foreign_key" | "enable_extension" | "disable_extension"
+        )
+}
+
+/// Fold one verb and say what it did to the database, from the touched
+/// tables before and after.
+fn record_verb(
+    verb: &str,
+    call: &ruby_prism::CallNode<'_>,
+    file: &str,
+    schema: &mut Schema,
+) -> Result<Vec<crate::schema::MigrationStep>, IngestError> {
+    use crate::schema::MigrationStep as S;
+    let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    let name = |i: usize| args.get(i).and_then(table_name_value);
+    let table = name(0).unwrap_or_default();
+    let before = schema.tables.get(&Symbol::from(table.as_str())).cloned();
+    apply_migration_verb(verb, call, file, schema, GeneratedExpressionDialect::Portable)?;
+    let mut steps = Vec::new();
+    match verb {
+        "create_table" => {
+            if let Some(t) = schema.tables.get(&Symbol::from(table.as_str())) {
+                steps.push(S::CreateTable { table: t.clone() });
+            }
+        }
+        "drop_table" => steps.push(S::DropTable { name: Symbol::from(table.as_str()) }),
+        "rename_table" => {
+            let to = name(1).unwrap_or_default();
+            steps.push(S::RenameTable { from: Symbol::from(table.as_str()), to: Symbol::from(to.as_str()) });
+            // the fold renamed the indexes carrying the generated name
+            let after = schema.tables.get(&Symbol::from(to.as_str())).cloned();
+            steps.extend(index_changes(before.as_ref(), after.as_ref()));
+        }
+        "add_column" | "add_timestamps" | "add_reference" | "add_belongs_to" => {
+            let after = schema.tables.get(&Symbol::from(table.as_str())).cloned();
+            if let (Some(b), Some(a)) = (&before, &after) {
+                let added: Vec<Column> =
+                    a.columns.iter().filter(|c| !b.columns.iter().any(|o| o.name == c.name)).cloned().collect();
+                if !added.is_empty() {
+                    steps.push(S::AddColumns { table: Symbol::from(table.as_str()), columns: added });
+                }
+            }
+            steps.extend(index_changes(before.as_ref(), after.as_ref()));
+        }
+        "rename_column" => {
+            let (from, to) = (name(1).unwrap_or_default(), name(2).unwrap_or_default());
+            steps.push(S::RenameColumn {
+                table: Symbol::from(table.as_str()),
+                from: Symbol::from(from.as_str()),
+                to: Symbol::from(to.as_str()),
+            });
+            // the fold renamed an index over it carrying the generated name
+            let after = schema.tables.get(&Symbol::from(table.as_str())).cloned();
+            steps.extend(index_changes(before.as_ref(), after.as_ref()));
+        }
+        "remove_column" | "remove_reference" | "remove_belongs_to" | "change_column" | "change_column_null"
+        | "change_column_default" | "add_foreign_key" | "remove_foreign_key" => {
+            let after = schema.tables.get(&Symbol::from(table.as_str())).cloned();
+            if let (Some(b), Some(a)) = (before, after) {
+                if b != a {
+                    steps.push(S::RebuildTable { before: b, after: a });
+                }
+            }
+        }
+        "add_index" | "remove_index" => {
+            let after = schema.tables.get(&Symbol::from(table.as_str())).cloned();
+            steps.extend(index_changes(before.as_ref(), after.as_ref()));
+        }
+        _ => {}
+    }
+    Ok(steps)
+}
+
+/// The index changes between two states of one table: removed (or
+/// redefined) ones dropped, then new ones created.
+fn index_changes(before: Option<&Table>, after: Option<&Table>) -> Vec<crate::schema::MigrationStep> {
+    use crate::schema::MigrationStep as S;
+    let empty: Vec<Index> = Vec::new();
+    let old = before.map(|t| &t.indexes).unwrap_or(&empty);
+    let new = after.map(|t| &t.indexes).unwrap_or(&empty);
+    let mut steps = Vec::new();
+    for i in old {
+        if !new.iter().any(|n| n == i) {
+            steps.push(S::RemoveIndex { name: i.name.clone() });
+        }
+    }
+    if let Some(t) = after {
+        for n in new {
+            if !old.iter().any(|i| i == n) {
+                steps.push(S::AddIndex { table: t.clone(), index: n.clone() });
+            }
+        }
+    }
+    steps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
