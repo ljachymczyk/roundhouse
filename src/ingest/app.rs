@@ -1927,7 +1927,18 @@ end
     enum_constants.validate_consumed_sources(&app, &sources, &enum_input_files)?;
     keep_initializer_defined(&mut app, dir, &sources, initializer_defined, &after_initialize_blocks);
     if let Some(class) = app_initializers_class(&after_initialize_blocks) {
-        app.library_classes.push(class);
+        let taken = app.library_classes.iter().any(|c| c.name == class.name)
+            || app.models.iter().any(|m| m.name == class.name)
+            || app.controllers.iter().any(|c| c.name == class.name);
+        if taken {
+            super::survey::continue_or_fail(IngestError::Unsupported {
+                file: "config/initializers".into(),
+                message: "the app defines `AppInitializers`, the module its after_initialize callbacks run from".into(),
+            })?;
+        } else {
+            app.library_classes.push(class);
+            app.runs_after_initialize = true;
+        }
     }
     // The ledger of boot statements no recognizer above read. A warning
     // per statement, in the ingest diagnostic channel; no `App` field.

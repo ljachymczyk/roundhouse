@@ -3430,7 +3430,7 @@ fn ruby_family_runtime_files(
 /// initializers have run and the callbacks fire.
 fn apply_app_initializers(files: &mut [(String, String)], app: &App) {
     const MARK: &str = "AppInitializers.run";
-    if !app.library_classes.iter().any(|c| c.name.0.as_str() == "AppInitializers") {
+    if !app.runs_after_initialize {
         return;
     }
     let Some((_, boot)) = files.iter_mut().find(|(p, _)| p == "boot.rb") else { return };
