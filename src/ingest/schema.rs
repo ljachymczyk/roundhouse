@@ -283,7 +283,16 @@ fn apply_migration_verb(
                             idx.name = Symbol::from(default_index_name(&new, &cols));
                         }
                     }
-                    schema.tables.insert(Symbol::from(new), table);
+                    schema.tables.insert(Symbol::from(new.clone()), table);
+                    // SQLite's RENAME TO rewrites the foreign keys that
+                    // name the table, in every table (its own included)
+                    for t in schema.tables.values_mut() {
+                        for fk in &mut t.foreign_keys {
+                            if fk.to_table.0.as_str() == old {
+                                fk.to_table = TableRef(Symbol::from(new.clone()));
+                            }
+                        }
+                    }
                 }
             }
         }

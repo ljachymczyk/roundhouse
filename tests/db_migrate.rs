@@ -263,6 +263,31 @@ end
     assert!(why.contains("Article.update_all"), "{why}");
 }
 
+/// `rename_table` on SQLite rewrites the foreign keys that name the table
+/// (Rails 8.1.4's schema then names the new table), so a later rebuild of
+/// the referencing table keeps a foreign key that resolves.
+#[test]
+fn rename_table_moves_the_foreign_keys_that_name_it() {
+    let ms = record(&[
+        ("db/migrate/20260101000001_create_articles.rb", CREATE_ARTICLES),
+        ("db/migrate/20260101000002_create_comments.rb", CREATE_COMMENTS),
+        (
+            "db/migrate/20260101000003_rename.rb",
+            r#"
+class Rename < ActiveRecord::Migration[8.1]
+  def change
+    rename_table :articles, :posts
+    change_column_default :comments, :body, from: nil, to: "none"
+  end
+end
+"#,
+        ),
+    ]);
+    let out = sql(&ms[2]).join("\n");
+    assert!(out.contains("FOREIGN KEY (article_id) REFERENCES posts (id)"), "{out}");
+    assert!(!out.contains("REFERENCES articles"), "{out}");
+}
+
 #[test]
 fn seed_sql_records_the_versions_the_schema_includes_as_schema_load_does() {
     let mut app = roundhouse::App::default();
