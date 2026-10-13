@@ -27,12 +27,16 @@ const SCHEMA: &str = "ActiveRecord::Schema.define(version: 1) do\n  \
 const ARTICLE: &str = "class Article < ApplicationRecord\n  has_many :comments\nend\n";
 const COMMENT: &str = "class Comment < ApplicationRecord\n  belongs_to :article\nend\n";
 
-/// Calls `resume_comment`, which it does not define.
+/// Calls `resume_comment`, which it does not define. Spelled with `&&`
+/// rather than `&.` on purpose: `&.` is a `nil?` test, and after one the
+/// typer reports no gradual escape for the call (as for a hand-written
+/// `t.nil? ? nil : t.article`), so no case below would show whether
+/// anything was lent.
 const INNER: &str = r#"module Impersonation
   extend ActiveSupport::Concern
 
   def current_article
-    resume_comment&.article
+    resume_comment && resume_comment.article
   end
 end
 "#;
