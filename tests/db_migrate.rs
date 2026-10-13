@@ -12,6 +12,23 @@ use roundhouse::emit::shared::schema_sql::render_migration_step;
 use roundhouse::ingest::schema::record_migration;
 use roundhouse::schema::{Migration, MigrationStep, Schema};
 
+/// real-blog's migration versions, oldest first, read from the fixture:
+/// `bin/rh fixture` generates it, so the timestamps are the day it ran.
+fn real_blog_versions() -> Vec<String> {
+    let dir = roundhouse::fixtures::real_blog().join("db/migrate");
+    let mut versions: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+            let version: String = name.chars().take_while(|c| c.is_ascii_digit()).collect();
+            (!version.is_empty() && name.ends_with(".rb")).then_some(version)
+        })
+        .collect();
+    versions.sort();
+    assert_eq!(versions.len(), 2, "real-blog has two migrations: {versions:?}");
+    versions
+}
+
 fn record(files: &[(&str, &str)]) -> Vec<Migration> {
     let mut scratch = Schema::default();
     files
@@ -323,17 +340,11 @@ end
 
 #[test]
 fn a_schema_rb_older_than_db_migrate_leaves_the_newer_migrations_pending() {
-    // real-blog's schema.rb is at 2026_10_02_110112, its last migration;
-    // one more is newer. Rails loads schema.rb, records the versions up to
-    // its `version:`, and `db:prepare` then runs the newer one.
-    emit_and_run::real_blog()
-        .write(
-            "db/migrate/20991231000001_add_subtitle_to_articles.rb",
-            "class AddSubtitleToArticles < ActiveRecord::Migration[8.1]\n  def change\n    add_column :articles, :subtitle, :string\n  end\nend\n",
-        )
-        .run_ruby(
-            r#"m = ActiveRecord::Migrator
-raise "schema versions: #{Migrations.schema_versions.inspect}" unless Migrations.schema_versions == ["20261002110111", "20261002110112"]
+    // real-blog's schema.rb is at its last migration; one more is newer.
+    // Rails loads schema.rb, records the versions up to its `version:`, and
+    // `db:prepare` then runs the newer one.
+    let script = r#"m = ActiveRecord::Migrator
+raise "schema versions: #{Migrations.schema_versions.inspect}" unless Migrations.schema_versions == VERSIONS
 # boot loaded schema.rb and recorded its versions only
 raise "applied: #{m.applied_versions.inspect}" unless m.applied_versions.sort == Migrations.schema_versions
 raise "pending" unless m.pending(Migrations.all).map { |r| r[0] } == ["20991231000001"]
@@ -342,8 +353,14 @@ raise "environment: #{environment.inspect}" unless environment == [Rails.env.to_
 raise "one applied" unless m.prepare(Schema.statements, Migrations.schema_versions, Migrations.all, "development") == 1
 columns = ActiveRecord.adapter.select_rows("SELECT name FROM pragma_table_info('articles')").map { |r| r["name"] }
 raise "subtitle: #{columns.inspect}" unless columns.include?("subtitle")
-"#,
+"#
+    .replace("VERSIONS", &format!("{:?}", real_blog_versions()));
+    emit_and_run::real_blog()
+        .write(
+            "db/migrate/20991231000001_add_subtitle_to_articles.rb",
+            "class AddSubtitleToArticles < ActiveRecord::Migration[8.1]\n  def change\n    add_column :articles, :subtitle, :string\n  end\nend\n",
         )
+        .run_ruby(&script)
         .assert_passes();
 }
 
@@ -351,17 +368,17 @@ raise "subtitle: #{columns.inspect}" unless columns.include?("subtitle")
 fn structure_sql_includes_the_versions_it_inserts() {
     // the dump ends with the versions it was taken at; here only the
     // first of real-blog's two
-    let dump = include_str!("support/real_blog_structure.sql").replace(
-        "('20261002052542'),\n('20261002052541');",
-        "('20261002110111');",
-    );
+    let [first, second] = <[String; 2]>::try_from(real_blog_versions()).expect("two versions");
+    let dump = include_str!("support/real_blog_structure.sql")
+        .replace("('20261002052542'),\n('20261002052541');", &format!("('{first}');"));
+    let script = r#"raise "schema versions: #{Migrations.schema_versions.inspect}" unless Migrations.schema_versions == ["FIRST"]
+raise "pending" unless ActiveRecord::Migrator.pending(Migrations.all).map { |r| r[0] } == ["SECOND"]
+"#
+    .replace("FIRST", &first)
+    .replace("SECOND", &second);
     emit_and_run::real_blog()
         .remove("db/schema.rb")
         .write("db/structure.sql", &dump)
-        .run_ruby(
-            r#"raise "schema versions: #{Migrations.schema_versions.inspect}" unless Migrations.schema_versions == ["20261002110111"]
-raise "pending" unless ActiveRecord::Migrator.pending(Migrations.all).map { |r| r[0] } == ["20261002110112"]
-"#,
-        )
+        .run_ruby(&script)
         .assert_passes();
 }
