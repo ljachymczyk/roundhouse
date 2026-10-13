@@ -415,7 +415,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         migration_sources.push((entry, source));
     }
     {
-        let mut scratch = crate::schema::Schema::default();
+        let mut scratch = super::schema::MigrationFold::default();
         for (entry, source) in &migration_sources {
             app.migrations.push(super::schema::record_migration(
                 source,

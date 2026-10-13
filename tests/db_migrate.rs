@@ -9,8 +9,8 @@
 mod emit_and_run;
 
 use roundhouse::emit::shared::schema_sql::render_migration_step;
-use roundhouse::ingest::schema::record_migration;
-use roundhouse::schema::{Migration, MigrationStep, Schema};
+use roundhouse::ingest::schema::{record_migration, MigrationFold};
+use roundhouse::schema::{Migration, MigrationStep};
 
 /// real-blog's migration versions, oldest first, read from the fixture:
 /// `bin/rh fixture` generates it, so the timestamps are the day it ran.
@@ -30,7 +30,7 @@ fn real_blog_versions() -> Vec<String> {
 }
 
 fn record(files: &[(&str, &str)]) -> Vec<Migration> {
-    let mut scratch = Schema::default();
+    let mut scratch = MigrationFold::default();
     files
         .iter()
         .map(|(name, src)| record_migration(src.as_bytes(), name, &mut scratch))
@@ -261,6 +261,43 @@ end
         .as_deref()
         .expect("a Ruby backfill is not renderable");
     assert!(why.contains("Article.update_all"), "{why}");
+}
+
+/// A table changed by a migration the fold does not follow (here
+/// `change_table`) is not known afterwards: a later migration that would
+/// rebuild it from the folded state would drop the column the database
+/// has, so it is not renderable, and `db:migrate` stops there.
+#[test]
+fn a_rebuild_after_an_unfollowed_change_to_its_table_is_not_renderable() {
+    let ms = record(&[
+        ("db/migrate/20260101000001_create_articles.rb", CREATE_ARTICLES),
+        (
+            "db/migrate/20260101000002_change.rb",
+            r#"
+class Change < ActiveRecord::Migration[8.1]
+  def change
+    change_table :articles do |t|
+      t.string :subtitle
+    end
+  end
+end
+"#,
+        ),
+        (
+            "db/migrate/20260101000003_default.rb",
+            r#"
+class Default < ActiveRecord::Migration[8.1]
+  def change
+    change_column_default :articles, :title, from: nil, to: "untitled"
+    add_column :articles, :rank, :integer
+  end
+end
+"#,
+        ),
+    ]);
+    let why = ms[2].not_renderable.as_deref().expect("the rebuild is refused");
+    assert!(why.contains("the state of `articles` before this migration is not known"), "{why}");
+    assert!(why.contains("20260101000002_change.rb"), "{why}");
 }
 
 /// `rename_table` on SQLite rewrites the foreign keys that name the table

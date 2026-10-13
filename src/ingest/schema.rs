@@ -1848,9 +1848,13 @@ fn index_from_call(
 /// the steps cannot express (a verb the fold does not model, Ruby beside
 /// the verbs) is recorded as [`Migration::not_renderable`], and the verbs
 /// inside such a statement still fold, so later migrations see the state
-/// the fold would have.
-pub fn record_migration(source: &[u8], file: &str, schema: &mut Schema) -> crate::schema::Migration {
+/// the fold would have. A table such a migration changed without the fold
+/// following it is not known from then on, and a later migration that
+/// would rebuild it is not renderable either: the rebuild would drop what
+/// the database has and the fold does not.
+pub fn record_migration(source: &[u8], file: &str, fold: &mut MigrationFold) -> crate::schema::Migration {
     use crate::schema::Migration;
+    let MigrationFold { schema, unknown } = fold;
     let stem = std::path::Path::new(file).file_name().and_then(|n| n.to_str()).unwrap_or(file);
     let version: String = stem.chars().take_while(|c| c.is_ascii_digit()).collect();
     let mut migration = Migration { version, file: file.into(), steps: Vec::new(), not_renderable: None, in_schema: false };
@@ -1887,21 +1891,56 @@ pub fn record_migration(source: &[u8], file: &str, schema: &mut Schema) -> crate
             // `say "..."` prints and changes nothing
             (Some(c), Some("say")) if c.block().is_none() => {}
             (Some(c), Some(v)) if is_schema_verb(v) => {
+                let table = first_table(&c);
                 if v == "execute" {
                     match data_only_sql(&c) {
                         Some(sql) => migration.steps.push(crate::schema::MigrationStep::Execute { sql }),
-                        None => gap(&mut migration, "`execute` with SQL that is not a literal data change (UPDATE / INSERT / DELETE)".into()),
+                        None => {
+                            gap(&mut migration, "`execute` with SQL that is not a literal data change (UPDATE / INSERT / DELETE)".into());
+                            unknown.push((None, file.to_string()));
+                        }
                     }
                     continue;
                 }
                 if UNSUPPORTED_VERBS.contains(&v) {
                     gap(&mut migration, format!("`{v}` is not a change roundhouse renders as SQL"));
+                    // `change_table` changes the table it names; a block
+                    // (`reversible`, `up_only`, `revert`) can change any
+                    match v {
+                        "change_table" => unknown.push((table, file.to_string())),
+                        "create_join_table" | "drop_join_table" => {}
+                        _ => unknown.push((None, file.to_string())),
+                    }
                     continue;
                 }
                 match record_verb(v, &c, file, schema) {
-                    Ok(steps) => migration.steps.extend(steps),
-                    Err(IngestError::Unsupported { message, .. }) => gap(&mut migration, message),
-                    Err(e) => gap(&mut migration, e.to_string()),
+                    Ok(steps) => {
+                        for step in &steps {
+                            match step {
+                                crate::schema::MigrationStep::RebuildTable { before, .. } => {
+                                    let name = before.name.as_str();
+                                    if let Some((_, by)) = unknown.iter().find(|(t, _)| t.as_deref().is_none_or(|t| t == name)) {
+                                        gap(&mut migration, format!("the state of `{name}` before this migration is not known (`{by}` changed it in a way the migration fold does not follow), so rebuilding it could drop columns"));
+                                    }
+                                }
+                                crate::schema::MigrationStep::RenameTable { from, to } => {
+                                    let by = unknown.iter().find(|(t, _)| t.as_deref() == Some(from.as_str())).map(|(_, b)| b.clone());
+                                    if let Some(by) = by {
+                                        unknown.push((Some(to.as_str().to_string()), by));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        migration.steps.extend(steps);
+                    }
+                    Err(e) => {
+                        gap(&mut migration, match e {
+                            IngestError::Unsupported { message, .. } => message,
+                            e => e.to_string(),
+                        });
+                        unknown.push((table, file.to_string()));
+                    }
                 }
             }
             _ => {
@@ -1912,13 +1951,30 @@ pub fn record_migration(source: &[u8], file: &str, schema: &mut Schema) -> crate
                 walk_calls(&stmt, &mut |inner| {
                     if inner.receiver().is_none() {
                         let v = constant_id_str(&inner.name()).to_string();
-                        let _ = apply_migration_verb(&v, inner, file, schema, GeneratedExpressionDialect::Portable);
+                        if apply_migration_verb(&v, inner, file, schema, GeneratedExpressionDialect::Portable).is_err() && is_schema_verb(&v) {
+                            unknown.push((first_table(inner), file.to_string()));
+                        }
                     }
                 });
             }
         }
     }
     migration
+}
+
+/// The scratch schema [`record_migration`] folds the migrations into, in
+/// order, and the tables whose state there is not known: a migration
+/// changed them in a way the fold does not follow (`change_table`, DDL
+/// through `execute`), with that migration's file. `None` is any table.
+#[derive(Clone, Debug, Default)]
+pub struct MigrationFold {
+    pub schema: Schema,
+    unknown: Vec<(Option<String>, String)>,
+}
+
+/// The table a migration verb names first (`change_table :posts`).
+fn first_table(call: &ruby_prism::CallNode<'_>) -> Option<String> {
+    call.arguments().and_then(|a| a.arguments().iter().next()).and_then(|n| table_name_value(&n))
 }
 
 /// The SQL of `execute "..."` when it is a literal that changes data only
