@@ -111,12 +111,18 @@ fn a_to_prepare_block_is_unwrapped_like_the_recognizers_and_only_the_unread_stat
 }
 
 #[test]
-fn an_after_initialize_hook_is_one_unconsumed_statement() {
+fn an_after_initialize_hook_is_carried_and_an_i18n_store_one_is_not() {
+    // The carried callback (`AppInitializers.run`) consumes the hook; one
+    // that only stores I18n translations is skipped by that reader, so it
+    // is still one unconsumed statement.
     let (_, ledger) = ingest(&[(
         "config/initializers/hooks.rb",
-        "Rails.application.config.after_initialize do\n  Mailer.verify!\nend\n",
+        "Rails.application.config.after_initialize do\n  Mailer.verify!\nend\n\
+         Rails.application.config.after_initialize do\n  \
+         I18n.backend.store_translations(:pl, {})\nend\n",
     )]);
     assert_eq!(statements(&ledger), ["Rails.application.config.after_initialize"]);
+    assert_eq!(location(&ledger[0]), "config/initializers/hooks.rb:4:1");
 }
 
 #[test]

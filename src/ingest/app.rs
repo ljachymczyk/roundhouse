@@ -257,6 +257,7 @@ fn keep_initializer_defined(
     dir: &Path,
     sources: &[crate::span::SourceFile],
     candidates: Vec<LibraryClass>,
+    initializer_blocks: &[String],
 ) {
     const FRAMEWORK_ROOTS: &[&str] = &[
         "Rails", "ActiveRecord", "ActiveSupport", "ActiveModel", "ActiveJob",
@@ -273,7 +274,9 @@ fn keep_initializer_defined(
     let root = dir.display().to_string();
     let root = root.trim_end_matches('/');
     let referenced = |name: &str| {
-        sources.iter().any(|f| {
+        // A carried `after_initialize` body runs at boot, so what it names
+        // is live like what the app names.
+        initializer_blocks.iter().any(|text| names_root_constant(text, name)) || sources.iter().any(|f| {
             let rel = f.path.strip_prefix(root).unwrap_or(&f.path).trim_start_matches('/');
             if !(rel.starts_with("app/") || rel.starts_with("lib/")) {
                 return false;
@@ -1270,6 +1273,9 @@ end
     // kept or dropped after every app file is read (see
     // `keep_initializer_defined`).
     let mut initializer_defined: Vec<LibraryClass> = Vec::new();
+    // `Rails.application.config.after_initialize do … end` bodies, in
+    // initializer order (see `extract_after_initialize_blocks`).
+    let mut after_initialize_blocks: Vec<String> = Vec::new();
 
     // `Time::DATE_FORMATS[:name] = ->(t) { … }` in an initializer —
     // read independently of config/application.rb above, since an app
@@ -1325,6 +1331,7 @@ end
                 }
                 app.module_mixins.extend(mixins);
                 app.initializer_filters.extend(extract_initializer_filters(&bytes, &path_str));
+                after_initialize_blocks.extend(extract_after_initialize_blocks(&bytes, &path_str));
                 app.sql_functions
                     .extend(super::sql_functions::extract_sql_functions(&bytes, &path_str));
             }
@@ -1918,7 +1925,10 @@ end
     }
 
     enum_constants.validate_consumed_sources(&app, &sources, &enum_input_files)?;
-    keep_initializer_defined(&mut app, dir, &sources, initializer_defined);
+    keep_initializer_defined(&mut app, dir, &sources, initializer_defined, &after_initialize_blocks);
+    if let Some(class) = app_initializers_class(&after_initialize_blocks) {
+        app.library_classes.push(class);
+    }
     // The ledger of boot statements no recognizer above read. A warning
     // per statement, in the ingest diagnostic channel; no `App` field.
     super::initializer_ledger::record(
@@ -8351,6 +8361,79 @@ pub(super) fn extract_initializer_filters(source: &[u8], file: &str) -> Vec<crat
         out.push(InitializerFilter { target: Symbol::from(target), method: Symbol::from(method), only });
     }
     out
+}
+
+/// `Rails.application.config.after_initialize do … end` in an
+/// initializer, as source text that runs its body: a lambda called in
+/// place, so a `next` in the body (`next unless defined?(Rails::Server)`)
+/// leaves it as it leaves the block in Rails. The texts become the body
+/// of a generated `AppInitializers.run` (see [`app_initializers_class`]),
+/// which the emitted boot calls once everything is loaded, where Rails
+/// runs its `after_initialize` callbacks.
+///
+/// A block that only feeds I18n's backend (`I18n.backend
+/// .store_translations`) is skipped: the runtime's I18n has no backend
+/// to store into.
+pub(super) fn extract_after_initialize_blocks(source: &[u8], file: &str) -> Vec<String> {
+    let result = super::prism::parse(source, file);
+    let root = result.node();
+    let src = String::from_utf8_lossy(source).into_owned();
+    let Some(program) = root.as_program_node() else { return Vec::new() };
+    let mut out = Vec::new();
+    for stmt in program.statements().body().iter() {
+        let Some(call) = stmt.as_call_node() else { continue };
+        if super::util::constant_id_str(&call.name()) != "after_initialize" {
+            continue;
+        }
+        let Some(recv) = call.receiver() else { continue };
+        let recv_loc = recv.location();
+        if &src[recv_loc.start_offset()..recv_loc.end_offset()] != "Rails.application.config" {
+            continue;
+        }
+        let Some(block) = call.block().and_then(|b| b.as_block_node()) else { continue };
+        let Some(body) = block.body() else { continue };
+        let loc = body.location();
+        let text = &src[loc.start_offset()..loc.end_offset()];
+        if text.contains("I18n.backend.store_translations") {
+            continue;
+        }
+        out.push(format!("(-> do\n{text}\nend).call"));
+    }
+    out
+}
+
+/// The generated module whose `run` performs the carried
+/// `after_initialize` bodies, in initializer order. `None` when there
+/// are none, or when the text does not re-parse.
+fn app_initializers_class(blocks: &[String]) -> Option<LibraryClass> {
+    if blocks.is_empty() {
+        return None;
+    }
+    let mut source = String::from("def self.run\n");
+    for block in blocks {
+        source.push_str(block);
+        source.push('\n');
+    }
+    source.push_str("nil\nend\n");
+    let mut methods = crate::runtime_src::parse_methods(&source).ok()?;
+    let name = crate::ident::ClassId(crate::ident::Symbol::from("AppInitializers"));
+    for m in &mut methods {
+        m.receiver = MethodReceiver::Class;
+        m.enclosing_class = Some(name.0.clone());
+    }
+    Some(LibraryClass {
+        name,
+        is_module: true,
+        parent: None,
+        parent_span: Default::default(),
+        includes: Vec::new(),
+        methods,
+        nullable_columns: Vec::new(),
+        origin: None,
+        constants: Vec::new(),
+        unknown_calls: Vec::new(),
+        class_ivar_initializers: Vec::new(),
+    })
 }
 
 /// The source text of a node that is a constant or a constant path
