@@ -10003,8 +10003,9 @@ fn locale_literal(value: &str) -> Option<String> {
 /// The main database file per environment from `config/database.yml`,
 /// read as Rails reads it: an environment's own `database:`, or, for a
 /// multi-database environment, the configuration named `primary`, else the
-/// first one. ERB tags are replaced before parsing so `max_connections:
-/// <%= ... %>` lines do not stop the file from loading, and a line holding
+/// first one, after YAML merge keys (`<<: *default`) apply. ERB tags are
+/// replaced before parsing so `max_connections: <%= ... %>` lines do not
+/// stop the file from loading, and a line holding
 /// only a control or comment tag (`<% if ... %>`, `<% end %>`) is blanked,
 /// since a bare placeholder line would make the YAML invalid; a
 /// `database:` whose value was ERB is computed at boot in Rails, so that
@@ -10030,7 +10031,12 @@ pub(crate) fn database_paths(text: &str) -> Vec<(String, String)> {
         rest = &rest[start + end + 2..];
     }
     plain.push_str(rest);
-    let Ok(Value::Mapping(root)) = serde_yaml_ng::from_str::<Value>(&plain) else { return Vec::new() };
+    // Merge keys (`<<: *default`) resolve first, as Psych does when Rails loads the file.
+    let Ok(mut value) = serde_yaml_ng::from_str::<Value>(&plain) else { return Vec::new() };
+    if value.apply_merge().is_err() {
+        return Vec::new();
+    }
+    let Value::Mapping(root) = value else { return Vec::new() };
     let database = |m: &serde_yaml_ng::Mapping| -> Option<String> {
         match m.get(Value::from("database")) {
             Some(Value::String(s)) if !s.contains(ERB_PLACEHOLDER) => Some(s.clone()),
@@ -10076,6 +10082,15 @@ mod database_paths_tests {
         assert_eq!(
             database_paths(yml),
             paths(&[("development", "storage/dev.sqlite3"), ("test", "storage/ci.sqlite3")])
+        );
+    }
+
+    #[test]
+    fn a_database_inherited_through_a_merge_key_is_read() {
+        let yml = "default: &default\n  adapter: sqlite3\n  database: storage/shared.sqlite3\nproduction:\n  primary:\n    <<: *default\n  cache:\n    <<: *default\n    database: storage/cache.sqlite3\ntest:\n  <<: *default\n  database: storage/test.sqlite3\n";
+        assert_eq!(
+            database_paths(yml),
+            paths(&[("default", "storage/shared.sqlite3"), ("production", "storage/shared.sqlite3"), ("test", "storage/test.sqlite3")])
         );
     }
 
