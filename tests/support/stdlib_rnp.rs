@@ -5,6 +5,7 @@
 pub const SOURCE: &str = r#"require "fileutils"
 require "openssl"
 require "csv"
+require "ostruct"
 class StdlibProbe
   def self.copy(dir)
     target = File.join(dir, "a", "b")
@@ -40,6 +41,27 @@ class StdlibProbe
   def self.lazy?(value)
     value.is_a?(Enumerator::Lazy)
   end
+
+  def self.config
+    OpenStruct.new({ "locales" => ["da", "en"], "country_code" => "dk" })
+  end
+
+  def self.config_members
+    settings = config
+    [settings.locales, settings.country_code, settings.missing, settings.locales.first]
+  end
+
+  def self.keyword_member
+    OpenStruct.new(query_text: "flat").query_text
+  end
+
+  def self.config_hash
+    config.to_h
+  end
+
+  def self.config?
+    config.is_a?(OpenStruct)
+  end
 end
 "#;
 
@@ -56,6 +78,10 @@ raise "csv" unless StdlibProbe.rows("a,b\nc,d\n") == 2
 raise "csv malformed" unless StdlibProbe.rows("a,\"b") == -1
 raise "product" unless StdlibProbe.pairs == 4
 raise "lazy" if StdlibProbe.lazy?([1].each)
+raise "ostruct #{StdlibProbe.config_members}" unless StdlibProbe.config_members == [["da", "en"], "dk", nil, "da"]
+raise "ostruct keyword" unless StdlibProbe.keyword_member == "flat"
+raise "ostruct to_h #{StdlibProbe.config_hash}" unless StdlibProbe.config_hash == { locales: ["da", "en"], country_code: "dk" }
+raise "ostruct?" unless StdlibProbe.config?
 puts "stdlib constants OK"
 "#;
 

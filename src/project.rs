@@ -5224,7 +5224,7 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         // rqrcode_core's / spinel-rqrcode's.
         | "RQRCodeCore::QRCodeRunTimeError" | "RQRCodeCore::QRCodeArgumentError"
         | "GC" | "OpenSSL::HMAC" | "CSV::MalformedCSVError"
-        | "Enumerator::Product" | "Enumerator::Lazy"
+        | "Enumerator::Product" | "Enumerator::Lazy" | "OpenStruct"
         | "Monitor" | "ConditionVariable" | "Thread::ConditionVariable"
         | "UNIXServer" | "UNIXSocket" | "Open3" | "Find");
     if !bundled {
@@ -7928,9 +7928,9 @@ fn with_bundled_requires(mut files: Vec<(String, String)>) -> Vec<(String, Strin
 }
 
 /// The libraries in `BUNDLED` that are bundled gems, not default gems,
-/// as of Ruby 3.4. Under bundler a bundled gem is not on the load path
+/// as of Ruby 3.4 (ostruct as of 4.0). Under bundler a bundled gem is not on the load path
 /// unless the Gemfile names it.
-const BUNDLED_GEMS: [&str; 3] = ["base64", "bigdecimal", "csv"];
+const BUNDLED_GEMS: [&str; 4] = ["base64", "bigdecimal", "csv", "ostruct"];
 
 /// Names in the Gemfile each bundled gem that the tree requires.
 /// Without the line, `bundle exec` stops at the require with "cannot
@@ -7970,7 +7970,7 @@ fn apply_bundled_gem_wiring(files: &mut [(String, String)]) {
 /// Constant → bundled library that provides it. One table, read by
 /// both the pass that writes the requires and the gate that checks a
 /// tree for missing ones — a second copy is how the rule drifts.
-const BUNDLED: [(&str, &str); 25] = [
+const BUNDLED: [(&str, &str); 26] = [
     // INERT in our trees, and deliberately: `runtime/spinel/base64.rb`
     // defines `Base64` without requiring the library, which the second
     // condition below reads as "the program defines it" and drops the
@@ -8056,6 +8056,9 @@ const BUNDLED: [(&str, &str); 25] = [
     ("UNIXSocket", "socket"),
     ("Open3", "open3"),
     ("Find", "find"),
+    // `OpenStruct.new(hash)`: a bundled gem on CRuby 4.0; without the
+    // require both CRuby and spinel raise NameError on the constant.
+    ("OpenStruct", "ostruct"),
 ];
 
 /// Every gap in a tree, as `(file index, require line)`. One walk,
