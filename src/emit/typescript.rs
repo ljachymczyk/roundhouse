@@ -109,7 +109,9 @@ fn server_source_for_active_profile() -> &'static str {
     }
 }
 
+mod char_set;
 mod expr;
+pub(crate) use expr::{array_method_handled, numeric_method_handled, string_method_handled};
 pub mod js_ast;
 mod library;
 mod naming;
@@ -611,6 +613,9 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     all_app_classes.extend(fixture_lcs.iter().cloned());
     all_app_classes.extend(test_lcs.iter().cloned());
     all_app_classes.extend(test_inner_lcs.iter().cloned());
+    // Each class's `static` constants, for a child constant that shadows
+    // an ancestor's (`expr::ancestor_declares_static`).
+    expr::set_static_constants(all_app_classes.iter().chain(runtime_seed_classes.iter()).chain(app.library_classes.iter()));
     // Send-site shapes for every class this emit knows: see
     // `expr::set_class_shapes`.
     expr::set_class_shapes(
@@ -897,15 +902,35 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
         .collect();
     synthesized_names.sort();
     synthesized_names.dedup();
+    let mut nested_by_root: std::collections::BTreeMap<&str, Vec<&crate::dialect::LibraryClass>> =
+        std::collections::BTreeMap::new();
+    for lc in &app.library_classes {
+        if let Some(root) = library::nested_class_root(lc) {
+            nested_by_root.entry(root).or_default().push(lc);
+        }
+    }
+    expr::set_nested_class_names(
+        nested_by_root.values().flatten().map(|lc| lc.name.0.as_str().to_string()),
+    );
     for lc in &model_lcs {
         let stem = crate::naming::snake_case(lc.name.0.as_str());
         let out_path = PathBuf::from(format!("app/models/{stem}.ts"));
-        files.extend(library::emit_class_file_with_synthesized(
-            lc,
-            app,
-            out_path,
-            &synthesized_names,
-        ));
+        match nested_by_root.remove(lc.name.0.as_str()) {
+            Some(nested) => files.extend(library::emit_class_file_with_nested(
+                Some(lc),
+                lc.name.0.as_str(),
+                &nested,
+                app,
+                out_path,
+                &synthesized_names,
+            )),
+            None => files.extend(library::emit_class_file_with_synthesized(
+                lc,
+                app,
+                out_path,
+                &synthesized_names,
+            )),
+        }
     }
 
     // Views: flatten the per-template LibraryClasses into
@@ -981,9 +1006,27 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     }
 
     for lc in &app.library_classes {
+        if library::nested_class_root(lc).is_some() {
+            continue;
+        }
         let stem = crate::naming::snake_case(lc.name.0.as_str());
         let out_path = PathBuf::from(format!("app/models/{stem}.ts"));
-        files.extend(library::emit_class_file(lc, app, out_path));
+        match nested_by_root.remove(lc.name.0.as_str()) {
+            Some(nested) => files.extend(library::emit_class_file_with_nested(
+                Some(lc),
+                lc.name.0.as_str(),
+                &nested,
+                app,
+                out_path,
+                &[],
+            )),
+            None => files.extend(library::emit_class_file(lc, app, out_path)),
+        }
+    }
+    // A root no class carries (`module Billing` around `class Invoice`) gets a file of its own.
+    for (root, nested) in nested_by_root {
+        let out_path = PathBuf::from(format!("app/models/{}.ts", crate::naming::snake_case(root)));
+        files.extend(library::emit_class_file_with_nested(None, root, &nested, app, out_path, &[]));
     }
 
     for lc in &fixture_lcs {
@@ -1832,6 +1875,35 @@ pub(super) fn js_library_class(
 
     let mut wrote_fields = false;
     let has_parent = effective_parent.is_some();
+    // Class-body constants (`WEIGHTS = { "small" => 1 }.freeze`) as
+    // `static WEIGHTS = { "small": 1 };`, so a `Klass.WEIGHTS` read
+    // resolves (#1223). Only a literal value TS renders as written is
+    // declared; a constant whose name a static method or field also
+    // takes is left out, as is any other value.
+    for (name, value) in &class.constants {
+        let Some(value) = declarable_constant_value(value) else { continue };
+        // Only a static member collides: TypeScript keeps a class's static
+        // and instance sides apart, as Ruby keeps a constant apart from an
+        // instance method of the same name.
+        if fields.iter().any(|f| f.2 && f.0 == name.as_str())
+            || class.methods.iter().any(|m| m.receiver == crate::dialect::MethodReceiver::Class && m.name.as_str() == name.as_str())
+        {
+            continue;
+        }
+        // A constant shadowing an ancestor's static of the same name is
+        // typed `any`: TypeScript requires the child's static side to be
+        // assignable to the parent's (TS2417), and Ruby's values may differ.
+        let shadows = expr::ancestor_declares_static(class.parent.as_ref().map(|p| p.0.as_str()), name.as_str());
+        members.push(JsClassMember::Field {
+            is_static: true,
+            declare: false,
+            name: name.as_str().to_string(),
+            ty: shadows.then(|| TsType("any".into())),
+            init: Some(expr::js_expr(value)),
+            span: value.span,
+        });
+        wrote_fields = true;
+    }
     // Field names declared by the framework Base (active_record_base.ts)
     // — every model extends ActiveRecordBase transitively, so these
     // need a `declare` modifier on the subclass to avoid TS2612.
@@ -1839,6 +1911,11 @@ pub(super) fn js_library_class(
     // parent's field list through emit_library_class; expand when a
     // new framework parent surface materializes.
     const INHERITED_FIELD_NAMES: &[&str] = &["id", "errors", "error_details", "persisted", "destroyed"];
+    // A reader whose whole body memoizes a literal into the ivar of its
+    // own name (`def label; @label ||= "x"; end`) is dropped in favour of
+    // the field below; the field starts at that literal, which is what
+    // every read answers (#1238).
+    let memoized = memoized_literals(class);
     for (name, ty, is_static, from_ivar, span) in &fields {
         // ivar-derived fields on a derived class get `declare` —
         // the constructor body's `this.x = ...` (or a parent
@@ -1860,7 +1937,11 @@ pub(super) fn js_library_class(
         // load; mirror that with a type-driven default. Skip the
         // initializer when the field is `declare`d (parent provides
         // backing).
-        let init = if *is_static && !needs_declare {
+        let memo = memoized.get(&(name.clone(), *is_static));
+        let needs_declare = needs_declare && memo.is_none();
+        let init = if let Some(literal) = memo {
+            Some(expr::js_expr(literal))
+        } else if *is_static && !needs_declare {
             ts_default_for_type(ty)
         } else {
             None
@@ -1951,7 +2032,8 @@ pub(super) fn js_library_class(
             // accessor-expose an ivar are subsumed by the field.
             // Non-trivial colliders (rare) lose runtime semantics
             // here; surface those as a separate Ruby-source change
-            // rather than emitting broken TS.
+            // rather than emitting broken TS. A literal memo is not
+            // one: its field starts at the literal (`memoized_literals`).
             if field_names_seen.contains(&stripped) {
                 return false;
             }
@@ -1985,6 +2067,62 @@ pub(super) fn js_library_class(
         members,
         span: crate::span::Span::synthetic(),
     })
+}
+
+/// `(ivar, is_static)` → literal for each method of `class` whose body is
+/// `@<its own name> ||= <literal>` (a literal `declarable_constant_value`
+/// takes): the reader `js_library_class` drops for the field of that
+/// name, and the value the field starts at.
+fn memoized_literals(
+    class: &crate::dialect::LibraryClass,
+) -> std::collections::HashMap<(String, bool), &crate::expr::Expr> {
+    use crate::expr::{ExprNode, LValue, OpAssignOp};
+    let mut out = std::collections::HashMap::new();
+    for m in &class.methods {
+        if !m.params.is_empty() {
+            continue;
+        }
+        let body = match &*m.body.node {
+            ExprNode::Seq { exprs } if exprs.len() == 1 => &exprs[0],
+            _ => &m.body,
+        };
+        let ExprNode::OpAssign { target: LValue::Ivar { name }, op: OpAssignOp::OrOr, value } = &*body.node else {
+            continue;
+        };
+        if name.as_str() != m.name.as_str() {
+            continue;
+        }
+        if let Some(literal) = declarable_constant_value(value) {
+            let is_static = matches!(m.receiver, crate::dialect::MethodReceiver::Class);
+            out.insert((name.as_str().to_string(), is_static), literal);
+        }
+    }
+    out
+}
+
+/// A class-body constant's value as TypeScript declares it: `.freeze`
+/// stripped (it has no TS analog), when what is left is a literal TS
+/// renders as written: `nil`, a Boolean, number, String, Symbol or
+/// regexp, or an Array or Hash of those. Anything else (a call, a
+/// constant read, `Struct.new`) is `None`.
+pub(super) fn declarable_constant_value(value: &crate::expr::Expr) -> Option<&crate::expr::Expr> {
+    use crate::expr::ExprNode;
+    let value = match &*value.node {
+        ExprNode::Send { recv: Some(r), method, args, block: None, .. } if method.as_str() == "freeze" && args.is_empty() => r,
+        _ => value,
+    };
+    fn literal(e: &crate::expr::Expr) -> bool {
+        match &*e.node {
+            ExprNode::Lit { .. } => true,
+            ExprNode::Array { elements, .. } => elements.iter().all(literal),
+            ExprNode::Hash { entries, .. } => entries.iter().all(|(k, v)| literal(k) && literal(v)),
+            ExprNode::Send { recv: Some(r), method, args, block: None, .. } if method.as_str() == "freeze" && args.is_empty() => {
+                literal(r)
+            }
+            _ => false,
+        }
+    }
+    literal(value).then_some(value)
 }
 
 /// True when a method's signature return type is `Ty::Time` (or a

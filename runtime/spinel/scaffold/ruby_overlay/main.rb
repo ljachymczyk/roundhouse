@@ -33,6 +33,9 @@
 require_relative "boot"
 
 module Main
+  # The framework class used by the nominal ParseError fallback.
+  FrameworkParseError = ActionDispatch::Http::Parameters::ParseError
+
   # Dispatch one request to a response descriptor — the single source
   # of routing / controller / flash / redirect logic. Returns the
   # 10-tuple `[status, body, content_type, location, set_cookies,
@@ -63,6 +66,21 @@ module Main
     @route_table ||= [RouteTable.root] + RouteTable.table + ActiveStorage::Routes.table
   end
 
+  # A 404 the app did not rescue (no route, ActionNotFound,
+  # RecordNotFound), answered as Rails' production exceptions app
+  # (ActionDispatch::PublicExceptions) does: `{"status":404,"error":
+  # "Not Found"}` when the request's format is JSON
+  # (ActionDispatch::MimeNegotiation.json_format?), the HTML page
+  # otherwise. The spinel twin is `Main.render_not_found`.
+  def self.not_found_response(format_param, path, request, env)
+    extension = path.end_with?(".json") ? "json" : ""
+    if ActionDispatch::MimeNegotiation.json_format?(format_param, extension,
+         request.fetch(:accept, "").to_s, env["HTTP_X_REQUESTED_WITH"].to_s, env["CONTENT_TYPE"].to_s)
+      return [404, %({"status":404,"error":"Not Found"}), "application/json; charset=UTF-8", nil, {}, {}, {}, {}, {}]
+    end
+    [404, "<h1>404 Not Found</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
+  end
+
   def self.dispatch_core(env, stdin)
     # Rails wraps every request in the AR query cache: identical
     # SELECTs within one request replay the first result; any write
@@ -87,6 +105,13 @@ module Main
   def self.dispatch_core_inner(env, stdin)
     ActionView::ViewHelpers.reset_slots!
     Broadcasts.reset_log!
+    # config.assume_ssl, same as the spinel dispatcher: the Rack env is
+    # what `request.ssl?` and the Secure cookie flag both read.
+    if AppEnvironment.serving_assume_ssl?
+      env["HTTPS"] = "on"
+      env["HTTP_X_FORWARDED_PROTO"] = "https"
+      env["rack.url_scheme"] = "https"
+    end
 
     request = CgiIo.parse_request(env, stdin)
     # Browser forms can only GET/POST; a hidden `_method` field carries
@@ -123,7 +148,9 @@ module Main
     matched = ActionDispatch::Router.match(request[:method], request_path,
                            route_table)
     if matched.nil?
-      return [404, "<h1>404 Not Found</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
+      # No route: the format is the `?format=` param, a trusted Accept,
+      # or the path's extension (Main.not_found_response).
+      return not_found_response(request[:params]["format"].to_s, request_path, request, env)
     end
     # A `(.:format)` EXTENSION the router stripped off the path
     # (`/rooms/3/refresh.turbo_stream`). The `.json` sniff above runs
@@ -256,7 +283,7 @@ module Main
     # ENV would reject); params delegation gets the same merged hash the
     # controller sees.
     controller.request = ActionDispatch::Request.new(env.to_h, merged)
-    controller.request.path_parameters = matched.path_params
+    controller.request.path_parameters = Main.route_parameters(controller, matched)
     # The body's params alone, for ParamsWrapper (`Params.wrap`).
     controller.request.request_parameters = request[:body_params]
     # Same object, module-reachable — helpers are module functions with
@@ -269,10 +296,19 @@ module Main
     begin
       controller.process_action(matched.action)
     rescue ActiveRecord::RecordNotFound, ActionController::RoutingError, AbstractController::ActionNotFound
-      return [404, "<h1>404 Not Found</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
-    rescue ActionController::ParameterMissing, ActionController::BadRequest
-      # `params.expect` / `params.require` refused the request and the app
-      # did not rescue it: Rails' rescue_responses answer :bad_request.
+      # The routed format (extension, route default) is the `format`
+      # param; an html one may still name `?format=`.
+      format_param = request_format == :html ? merged["format"].to_s : request_format.to_s
+      return not_found_response(format_param, request_path, request, env)
+    rescue ActionController::ParameterMissing, ActionController::BadRequest,
+           ActionDispatch::Http::Parameters::ParseError => error
+      # The app's handlers have already run. Rails' rescue_responses map
+      # an unhandled ParseError to :bad_request by its exact class name;
+      # an application subclass has no default mapping.
+      # Bind the built-ins so application instance/class overrides cannot
+      # turn a subclass into the framework's exact exception class.
+      raise if Kernel.instance_method(:is_a?).bind_call(error, FrameworkParseError) &&
+               !Kernel.instance_method(:instance_of?).bind_call(error, FrameworkParseError)
       return [400, "<h1>400 Bad Request</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
     rescue ActiveRecord::RecordInvalid, ActiveRecord::RecordNotSaved, ActionController::InvalidAuthenticityToken
       # Not a 500: Rails' rescue_responses answer these with 422.
@@ -347,6 +383,7 @@ module Main
     # Cache-Control, and a 304 for a matching If-None-Match, on the
     # controller's status, body and headers before they are read below.
     controller.commit_conditional_get!(env["REQUEST_METHOD"].to_s, env["HTTP_IF_NONE_MATCH"].to_s)
+    controller.commit_default_headers!
     # Headers the action set beyond Content-Type/Location — a
     # `Content-Disposition` on a download, the Cache-Control a blob
     # route asks for — ride as the tuple's sixth element.
@@ -359,7 +396,7 @@ module Main
     end
     if is_redirect
       [controller.status,
-       %(<a href="#{controller.location}">Redirecting</a>),
+       %(<a href="#{ActionView::ViewHelpers.html_escape(controller.location.to_s)}">Redirecting</a>),
        "text/html; charset=utf-8", controller.location, out_cookies, extra_headers, secure_cookies, samesite_cookies, httponly_cookies, expires_cookies]
     else
       # The controller body IS the full page: the Ruby emit path's
@@ -464,6 +501,19 @@ module Main
     when :comments then CommentsController.new
     else ActiveStorage::Routes.instantiate_controller(sym)
     end
+  end
+
+  # Rails' `request.path_parameters`: the route's captures, with the
+  # controller and action the request was dispatched to. The
+  # controller's own `path_parameters` and params keep the captures alone.
+  def self.route_parameters(controller, matched)
+    out = {}
+    matched.path_params.each { |k, v| out[k] = v }
+    # The dispatched controller and action win over a capture of the same
+    # name: Rails dispatches by these two, so they name what ran.
+    out["controller"] = controller.controller_path
+    out["action"] = matched.action.to_s
+    out
   end
 
   # First-time setup. Idempotent: skips when already configured (so
