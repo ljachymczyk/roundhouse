@@ -28,6 +28,8 @@
 require_relative "boot"
 
 module Main
+  # Spinel's class reflection needs a lexical class receiver.
+  FrameworkParseError = ActionDispatch::Http::Parameters::ParseError
 
   # Maps the routes-table controller symbol to a literal `.new`
   # constructor call. Spinel's hash specializations don't accept class
@@ -40,6 +42,19 @@ module Main
     when :comments then CommentsController.new
     else ActiveStorage::Routes.instantiate_controller(sym)
     end
+  end
+
+  # Rails' `request.path_parameters`: the route's captures, with the
+  # controller and action the request was dispatched to. The
+  # controller's own `path_parameters` and params keep the captures alone.
+  def self.route_parameters(controller, matched)
+    out = {}
+    matched.path_params.each { |k, v| out[k] = v }
+    # The dispatched controller and action win over a capture of the same
+    # name: Rails dispatches by these two, so they name what ran.
+    out["controller"] = controller.controller_path
+    out["action"] = matched.action.to_s
+    out
   end
 
   # The controller's params, built the way Rails builds them
@@ -209,7 +224,33 @@ module Main
       return nil
     end
     res.headers["Content-Type"] = Main.asset_content_type(path)
+    # `config.public_file_server.headers`, as ActionDispatch::Static
+    # sends them on every public/ and /assets/ file.
+    Rails.application.public_file_server_headers.each do |name, value|
+      res.headers[name] = value
+    end
     res.send_file(disk)
+    nil
+  end
+
+  # A 404 the app did not rescue (no route, ActionNotFound,
+  # RecordNotFound), answered as Rails' production exceptions app
+  # (ActionDispatch::PublicExceptions) does: `{"status":404,"error":
+  # "Not Found"}` when the request's format is JSON
+  # (ActionDispatch::MimeNegotiation.json_format?), the HTML page
+  # otherwise. `format_param` is the request's `format` parameter, ""
+  # when it has none.
+  def self.render_not_found(res, format_param, path, req)
+    res.status = 404
+    extension = path.end_with?(".json") ? "json" : ""
+    if ActionDispatch::MimeNegotiation.json_format?(format_param, extension,
+         req.req_headers.fetch("accept", ""), req.req_headers.fetch("x-requested-with", ""),
+         req.req_headers.fetch("content-type", ""))
+      res.headers["Content-Type"] = "application/json; charset=UTF-8"
+      res.body = "{\"status\":404,\"error\":\"Not Found\"}"
+    else
+      res.body = "<h1>404 Not Found</h1>"
+    end
     nil
   end
 
@@ -385,8 +426,9 @@ module Main
 
     matched = ActionDispatch::Router.match(verb, request_path, Main.route_table)
     if matched.nil?
-      res.status = 404
-      res.body = "<h1>404 Not Found</h1>"
+      # No route: the format is the `?format=` param, a trusted Accept,
+      # or the path's extension (Main.render_not_found).
+      Main.render_not_found(res, req.req_params.fetch("format", ""), request_path, req)
       return
     end
     # A `(.:format)` EXTENSION the router stripped off the path
@@ -454,7 +496,11 @@ module Main
     request_obj.remote_ip = req.remote_host
     request_obj.referer = req.req_headers.fetch("referer", "")
     request_obj.host = req.req_headers.fetch("host", "localhost")
-    request_obj.path_parameters = matched.path_params
+    request_obj.path_parameters = Main.route_parameters(controller, matched)
+    # The controller's params, copied into the request's own slot (as
+    # `Request.for` copies, see runtime/action_dispatch/request.rb):
+    # `request.filtered_parameters` reads them.
+    params.each { |k, v| request_obj.params[k] = v }
     fmt_name = "html"
     fmt_name = "json" if request_format == :json
     fmt_name = "rss" if request_format == :rss
@@ -478,7 +524,16 @@ module Main
     # includes `X-Forwarded-Proto`, CSRF/origin/fetch metadata, auth, and
     # content type; keeping one mapping avoids a drifting header allowlist.
     req.req_headers.each do |name, value|
-      request_obj.env[ActionDispatch::Http::Headers.env_name(name)] = value
+      request_obj.env[ActionDispatch::Http::Headers.env_name_from_header(name)] = value
+    end
+    request_obj.env["roundhouse.listener"] = req.listener_transport
+    # config.assume_ssl: TLS ends at a proxy that forwards plain http.
+    # Rails' AssumeSSL marks the request https before the action, so
+    # secure cookies and absolute redirects use https.
+    if AppEnvironment.serving_assume_ssl?
+      request_obj.env["HTTPS"] = "on"
+      request_obj.env["HTTP_X_FORWARDED_PROTO"] = "https"
+      request_obj.env["rack.url_scheme"] = "https"
     end
     # `user_agent` is ALSO a separate reader slot. The overlay twin's
     # `user_agent` reads `@env["HTTP_USER_AGENT"]`; the shared runtime's
@@ -561,12 +616,19 @@ module Main
     begin
       controller.process_action(matched.action)
     rescue ActiveRecord::RecordNotFound, ActionController::RoutingError, AbstractController::ActionNotFound
-      res.status = 404
-      res.body = "<h1>404 Not Found</h1>"
+      # The routed format (extension, route default) is the `format`
+      # param; an html one may still name `?format=`.
+      format_param = request_format == :html ? req.req_params.fetch("format", "") : fmt_name
+      Main.render_not_found(res, format_param, request_path, req)
       return
-    rescue ActionController::ParameterMissing, ActionController::BadRequest
-      # `params.expect` / `params.require` refused the request and the app
-      # did not rescue it: Rails' rescue_responses answer :bad_request.
+    rescue ActionController::ParameterMissing, ActionController::BadRequest,
+           ActionDispatch::Http::Parameters::ParseError => error
+      # The app's handlers have already run. Rails' rescue_responses map
+      # an unhandled ParseError to :bad_request by its exact class name;
+      # an application subclass has no default mapping.
+      # Spinel has no built-in method binding: compare nominal classes,
+      # without consulting any application's subclass matcher.
+      raise if FrameworkParseError === error && error.class != FrameworkParseError
       res.status = 400
       res.body = "<h1>400 Bad Request</h1>"
       return
@@ -587,6 +649,7 @@ module Main
     # changes all three.
     controller.commit_cache_control!
     controller.commit_conditional_get!(req.verb, req.req_headers.fetch("if-none-match", ""))
+    controller.commit_default_headers!
 
     res.status = controller.status
     # The layout wrap happens at the controller's render call sites
@@ -754,6 +817,7 @@ end
 port = (ENV["PORT"] || "3000").to_i
 workers = (ENV["WORKERS"] || "1").to_i
 binding_arg = ""
+unix_bind = ENV["UNIX_BIND"].to_s
 i = 0
 while i < ARGV.length
   arg = ARGV[i]
@@ -763,6 +827,7 @@ while i < ARGV.length
     puts "  -p, --port N     listen port (default 3000; PORT env)"
     puts "  -w, --workers N  prefork N processes (default 1; WORKERS env)"
     puts "  -b, --binding IP bind to IP (BINDING env; default localhost in development, 0.0.0.0 otherwise)"
+    puts "      --unix-bind URL add unix:///absolute/path?mode=600 (UNIX_BIND env; default disabled)"
     puts "  -h, --help       show this help and exit"
     puts ""
     puts "  OS workers per process: one per core; SPINEL_WORKERS=N caps it"
@@ -778,6 +843,9 @@ while i < ARGV.length
     i += 2
   elsif (arg == "--binding" || arg == "-b") && i + 1 < ARGV.length
     binding_arg = ARGV[i + 1]
+    i += 2
+  elsif arg == "--unix-bind" && i + 1 < ARGV.length
+    unix_bind = ARGV[i + 1]
     i += 2
   else
     $stderr.puts "unknown option: " + arg + " (try --help)"
@@ -808,6 +876,10 @@ if workers > 1 && binding_arg != "0.0.0.0"
   exit(1)
 end
 Tep::APP.bind_host = binding_arg
+Sock.sphttp_install_term_handlers
+unix_listener = Tep::UnixListener.new(unix_bind)
+unix_listener.open
+begin
 Main.configure_default_adapter!
 # Serving, so WAL checkpoints move off the request path: a background
 # thread runs them instead of some request's COMMIT
@@ -823,6 +895,8 @@ Broadcasts.set_transport(Cable::Transport.new)
 # reaches this line keeps the inline behaviour rather than dropping work
 # into an Array nobody reads.
 ActiveJob.register_drain
+# Under queue_adapter :sidekiq jobs go to Redis instead; say where.
+SidekiqPush.announce if JobRegistry.sidekiq?
 Thread.new do
   Main.job_loop
 end
@@ -842,7 +916,10 @@ Tep::APP.name = Rails.application.global_id_app
 # the environment differing (matz/spinel#4306). HTTP only; see the note
 # at the top of tep/server_scheduled.rb.
 if (ENV["TEP_SERVER"] || "thread") == "fiber"
-  Tep::Server::Scheduled.new(MainApp.new).run(port, workers, false)
+  Tep::Server::Scheduled.new(MainApp.new).run(port, workers, false, unix_listener)
 else
-  Tep::Server::Threaded.new(MainApp.new).run(port, workers, false)
+  Tep::Server::Threaded.new(MainApp.new).run(port, workers, false, unix_listener)
+end
+ensure
+  unix_listener.close
 end
