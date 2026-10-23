@@ -42,7 +42,9 @@ fn lower_with(tag: &str, callback: &str) -> (Vec<String>, bool) {
             .expect("ruby files");
         (lowered, tree)
     });
-    let messages = lowered.iter().chain(pushed.iter()).map(|d| d.message.clone()).collect();
+    // Unclaimed statements are analysis errors (`diagnose`), not emit warnings.
+    let analysis = roundhouse::analyze::diagnose(&app);
+    let messages = lowered.iter().chain(pushed.iter()).chain(analysis.iter()).map(|d| d.message.clone()).collect();
     let article = tree
         .iter()
         .find(|(path, _)| path.ends_with("app/models/article.rb"))
@@ -53,7 +55,7 @@ fn lower_with(tag: &str, callback: &str) -> (Vec<String>, bool) {
 }
 
 fn reports_unlowered(messages: &[String]) -> bool {
-    messages.iter().any(|m| m.contains("model DSL call on `Article` not lowered"))
+    messages.iter().any(|m| m.contains("in the body of `Article` is not modelled"))
 }
 
 /// `if:` is an option the block form does not lower; the callback used to

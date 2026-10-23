@@ -50,42 +50,60 @@ pub(crate) fn normalizations(model: &Model) -> IndexMap<Symbol, (Symbol, Expr)> 
     let mut out = IndexMap::new();
     for item in &model.body {
         let ModelBodyItem::Unknown { expr, .. } = item else { continue };
-        let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
-        if method.as_str() != "normalizes" {
-            continue;
-        }
-        let mut attrs = Vec::new();
-        let mut with = None;
-        let mut supported = true;
-        for arg in args {
-            match &*arg.node {
-                ExprNode::Lit { value: Literal::Sym { value } } => attrs.push(value.clone()),
-                ExprNode::Hash { entries, .. } => {
-                    for (k, v) in entries {
-                        let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else {
-                            supported = false;
-                            continue;
-                        };
-                        match (key.as_str(), &*v.node) {
-                            ("with", ExprNode::Lambda { params, rest_param: None, extra_params, body, .. })
-                                if params.len() == 1 && extra_params.is_empty() =>
-                            {
-                                with = Some((params[0].clone(), body.clone()));
-                            }
-                            ("apply_to_nil", ExprNode::Lit { value: Literal::Bool { value: false } }) => {}
-                            _ => supported = false,
-                        }
-                    }
-                }
-                _ => supported = false,
-            }
-        }
-        let (Some(with), true) = (with, supported) else { continue };
+        let Some((attrs, with)) = normalization(expr) else { continue };
         for attr in attrs {
             out.insert(attr, with.clone());
         }
     }
     out
+}
+
+/// Whether `expr` is a `normalizes` declaration this pass reproduces in
+/// full: every attribute it names is one of the model's columns (the
+/// only ones `push_normalize_methods` writes a normalizer for).
+pub(crate) fn claims(model: &Model, expr: &Expr) -> bool {
+    normalization(expr).is_some_and(|(attrs, _)| {
+        !attrs.is_empty() && attrs.iter().all(|a| model.attributes.fields.contains_key(a))
+    })
+}
+
+/// One `normalizes :a, :b, with: ->(v) { … }` call: its attributes and
+/// the lambda's parameter and body, or `None` for a form not reproduced.
+fn normalization(expr: &Expr) -> Option<(Vec<Symbol>, (Symbol, Expr))> {
+    let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { return None };
+    if method.as_str() != "normalizes" {
+        return None;
+    }
+    let mut attrs = Vec::new();
+    let mut with = None;
+    let mut supported = true;
+    for arg in args {
+        match &*arg.node {
+            ExprNode::Lit { value: Literal::Sym { value } } => attrs.push(value.clone()),
+            ExprNode::Hash { entries, .. } => {
+                for (k, v) in entries {
+                    let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else {
+                        supported = false;
+                        continue;
+                    };
+                    match (key.as_str(), &*v.node) {
+                        ("with", ExprNode::Lambda { params, rest_param: None, extra_params, body, .. })
+                            if params.len() == 1 && extra_params.is_empty() =>
+                        {
+                            with = Some((params[0].clone(), body.clone()));
+                        }
+                        ("apply_to_nil", ExprNode::Lit { value: Literal::Bool { value: false } }) => {}
+                        _ => supported = false,
+                    }
+                }
+            }
+            _ => supported = false,
+        }
+    }
+    match (with, supported) {
+        (Some(with), true) => Some((attrs, with)),
+        _ => None,
+    }
 }
 
 /// `Model._normalize_<attr>(value)` for each normalized attribute that

@@ -234,6 +234,29 @@ fn collect_belongs_to(model: &Model) -> Vec<LoweredAssocRef> {
     out
 }
 
+/// Whether `broadcasts_to` with these arguments lowers in full: a lambda
+/// or String stream, and options this pass reads (`inserts_by:` one of
+/// the three actions it knows, `target:`). Any other form is not lowered,
+/// so the unclaimed-statement report names it instead of it vanishing.
+pub(crate) fn claims_broadcasts_to(args: &[Expr]) -> bool {
+    let stream_ok = match args.first().map(|a| &*a.node) {
+        Some(ExprNode::Lambda { extra_params, .. }) => extra_params.is_empty(),
+        Some(ExprNode::Lit { value: Literal::Str { .. } }) => true,
+        _ => false,
+    };
+    let options_ok = match args.get(1).map(|a| &*a.node) {
+        None => true,
+        Some(ExprNode::Hash { entries, .. }) => entries.iter().all(|(k, v)| match hash_sym_key(k).as_ref().map(|k| k.as_str()) {
+            Some("target") => true,
+            Some("inserts_by") => matches!(&*v.node,
+                ExprNode::Lit { value: Literal::Sym { value } } if matches!(value.as_str(), "append" | "prepend" | "replace")),
+            _ => false,
+        }),
+        Some(_) => false,
+    };
+    stream_ok && options_ok && args.len() <= 2
+}
+
 fn collect_broadcasts_to(out: &mut LoweredBroadcasts, args: &[Expr]) {
     let Some(stream_arg) = args.first() else {
         return;

@@ -73,6 +73,18 @@ const GENERATION_OPTIONS: &[&str] = &["dependent", "sequence_separator", "reserv
 /// The model's friendly_id configuration, or `None` when it declares
 /// none or declares one this lowering cannot honor (see the module doc).
 pub(crate) fn config(model: &Model) -> Option<FriendlyConfig> {
+    evaluate(model).ok().flatten()
+}
+
+/// Why the model's `friendly_id` declaration is declined, or `None` when
+/// it declares none or this lowering honors it. The unclaimed-call
+/// report names it, so a declined option is not a bare "not lowered".
+pub(crate) fn decline_reason(model: &Model) -> Option<String> {
+    evaluate(model).err()
+}
+
+/// `Ok(None)`: no declaration; `Err`: declined, with the reason.
+fn evaluate(model: &Model) -> Result<Option<FriendlyConfig>, String> {
     let mut found: Option<FriendlyConfig> = None;
     let mut extend_span = None;
     for item in &model.body {
@@ -81,24 +93,33 @@ pub(crate) fn config(model: &Model) -> Option<FriendlyConfig> {
         match method.as_str() {
             "extend" if is_friendly_id_const(args.first()) => extend_span = Some(expr.span),
             "friendly_id" => {
-                if found.is_some() || block.is_some() {
-                    return None;
+                if found.is_some() {
+                    return Err("more than one `friendly_id` declaration".into());
+                }
+                if block.is_some() {
+                    return Err("a configuration block is not modelled".into());
                 }
                 found = Some(parse_call(expr.span, args)?);
             }
             _ => {}
         }
     }
-    let mut cfg = found?;
+    let Some(mut cfg) = found else { return Ok(None) };
     cfg.extend_span = extend_span;
     let integer_id = model.primary_key.as_ref().is_none_or(|k| k.as_str() == "id")
         && model.attributes.fields.get(&Symbol::from("id")).is_none_or(|t| *t == Ty::Int);
+    if !integer_id {
+        return Err("the primary key is not an integer `id`".into());
+    }
     let slug_is_string = model.attributes.fields.get(&cfg.slug_column).is_some_and(|t| match t {
         Ty::Str => true,
         Ty::Union { variants } => variants.iter().all(|v| matches!(v, Ty::Str | Ty::Nil)),
         _ => false,
     });
-    (integer_id && slug_is_string).then_some(cfg)
+    if !slug_is_string {
+        return Err(format!("the slug column `{}` is not a String column", cfg.slug_column.as_str()));
+    }
+    Ok(Some(cfg))
 }
 
 fn is_friendly_id_const(arg: Option<&Expr>) -> bool {
@@ -113,10 +134,11 @@ fn sym_or_str(e: &Expr) -> Option<Symbol> {
     }
 }
 
-fn parse_call(span: Span, args: &[Expr]) -> Option<FriendlyConfig> {
+fn parse_call(span: Span, args: &[Expr]) -> Result<FriendlyConfig, String> {
     let mut slug_column = Symbol::from("slug");
     let mut history = false;
     let mut slugged = false;
+    let literal = |e: &Expr, what: &str| sym_or_str(e).ok_or_else(|| format!("a non-literal {what} is not modelled"));
     for (i, arg) in args.iter().enumerate() {
         match &*arg.node {
             // The base: a column or method name. It feeds generation only.
@@ -124,7 +146,7 @@ fn parse_call(span: Span, args: &[Expr]) -> Option<FriendlyConfig> {
             ExprNode::Hash { entries, .. } => {
                 for (k, v) in entries {
                     let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else {
-                        return None;
+                        return Err("a non-Symbol option key is not modelled".into());
                     };
                     match key.as_str() {
                         "use" => {
@@ -133,29 +155,33 @@ fn parse_call(span: Span, args: &[Expr]) -> Option<FriendlyConfig> {
                                 _ => vec![v],
                             };
                             for m in mods {
-                                match sym_or_str(m)?.as_str() {
+                                match literal(m, "`use:` module")?.as_str() {
                                     "slugged" => slugged = true,
                                     "history" => history = true,
                                     g if GENERATION_ONLY.contains(&g) => {}
-                                    _ => return None,
+                                    other => return Err(format!("`use: :{other}` is not modelled")),
                                 }
                             }
                         }
-                        "slug_column" => slug_column = sym_or_str(v)?,
+                        "slug_column" => slug_column = literal(v, "`slug_column:`")?,
                         "routes" => {
-                            if sym_or_str(v)?.as_str() != "friendly" {
-                                return None;
+                            let routes = literal(v, "`routes:`")?;
+                            if routes.as_str() != "friendly" {
+                                return Err(format!("`routes: :{}` is not modelled", routes.as_str()));
                             }
                         }
                         o if GENERATION_OPTIONS.contains(&o) => {}
-                        _ => return None,
+                        other => return Err(format!("the `{other}:` option is not modelled")),
                     }
                 }
             }
-            _ => return None,
+            _ => return Err("a base that is not a Symbol literal is not modelled".into()),
         }
     }
-    slugged.then_some(FriendlyConfig { slug_column, history, call_span: span, extend_span: None })
+    if !slugged {
+        return Err("`use:` does not include `:slugged`".into());
+    }
+    Ok(FriendlyConfig { slug_column, history, call_span: span, extend_span: None })
 }
 
 /// Whether the statement at `span` is a `friendly_id` call or its

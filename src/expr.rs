@@ -118,6 +118,11 @@ pub const RESOLVED_MIXIN: u64 = 1 << 22;
 /// can ask; `project::report_unsupported_bundled_constants` reports it elsewhere.
 pub const MODULE_QUERY: u64 = 1 << 23;
 
+/// A model class-body call to a class macro `ingest::class_macros` could
+/// not expand: that pass reports it, with the reason, so the
+/// unclaimed-statement report does not name it a second time.
+pub const REFUSED_CLASS_MACRO: u64 = 1 << 24;
+
 /// Whether `expr` is a [`SELF_BINDING`] cast.
 pub fn is_self_binding(expr: &Expr) -> bool {
     expr.decisions & SELF_BINDING != 0

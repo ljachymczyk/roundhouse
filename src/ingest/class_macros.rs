@@ -104,6 +104,7 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile]) {
         let mut reserved: Option<HashSet<Symbol>> = None;
         let mut expansions: HashMap<usize, Vec<ModelBodyItem>> = HashMap::new();
         let mut defaults: indexmap::IndexMap<Symbol, Expr> = indexmap::IndexMap::new();
+        let mut refused: Vec<usize> = Vec::new();
         for (index, item) in model.body.iter().enumerate() {
             let ModelBodyItem::Unknown { expr, .. } = item else { continue };
             let ExprNode::Send { recv, method, args, block, .. } = &*expr.node else { continue };
@@ -150,6 +151,7 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile]) {
                     expansions.insert(index, items);
                 }
                 Err(why) => {
+                    refused.push(index);
                     super::prism::push(crate::diagnostic::Diagnostic::unsupported(
                         expr.span,
                         None,
@@ -157,6 +159,11 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile]) {
                         format!("`{}` defines methods this call does not expand ({why}), so they are missing", method.as_str()),
                     ));
                 }
+            }
+        }
+        for index in refused {
+            if let ModelBodyItem::Unknown { expr, .. } = &mut app.models[model_index].body[index] {
+                expr.decisions |= crate::expr::REFUSED_CLASS_MACRO;
             }
         }
         if expansions.is_empty() {

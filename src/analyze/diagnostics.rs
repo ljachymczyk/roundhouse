@@ -207,6 +207,9 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     out.extend(devise_refusals(app));
     out.extend(overridden_synthesized_accessors(app));
     out.extend(runtime_defined_surfaces(app));
+    // Model class-body statements no pass lowers: their effect would be
+    // dropped from the output, so each is an error, not an emit warning.
+    out.extend(crate::lower::model_to_library::unclaimed::diagnostics(app));
     // A filter's return value is Rails' to discard (`around_action
     // :switch_locale` → `I18n.with_locale(locale, &action)`): nothing
     // escapes from its tail, so an `untyped` there is not a gradual

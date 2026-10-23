@@ -288,18 +288,28 @@ pub(super) fn is_abstract_class(model: &Model) -> bool {
                 if args.is_empty() && method.as_str() == "primary_abstract_class" {
                     abstract_class = true;
                 }
-            } else if let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node {
-                if matches!(&*recv.node, ExprNode::SelfRef) && method.as_str() == "abstract_class=" {
-                    if let [arg] = args.as_slice() {
-                        if let ExprNode::Lit { value: Literal::Bool { value } } = &*arg.node {
-                            abstract_class = *value;
-                        }
-                    }
-                }
+            } else if let Some(value) = abstract_class_setting(expr) {
+                abstract_class = value;
             }
         }
     }
     abstract_class
+}
+
+/// The literal of a `self.abstract_class = true/false` statement, the
+/// only form `is_abstract_class` reads.
+pub(crate) fn abstract_class_setting(expr: &Expr) -> Option<bool> {
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node else { return None };
+    if !matches!(&*recv.node, ExprNode::SelfRef) || method.as_str() != "abstract_class=" {
+        return None;
+    }
+    match args.as_slice() {
+        [arg] => match &*arg.node {
+            ExprNode::Lit { value: Literal::Bool { value } } => Some(*value),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// `attr_accessor :vote` / `attr_reader :x` / `attr_writer :y` on a model
@@ -511,25 +521,30 @@ pub(super) fn push_attr_accessor_methods(methods: &mut Vec<MethodDef>, model: &M
 /// reader for `f.check_box`) and the permit-writer filter (an
 /// `attribute` writer is assignable).
 pub(crate) fn attribute_api_decls(body: &[ModelBodyItem]) -> Vec<(Symbol, Symbol)> {
-    let mut out = Vec::new();
-    for item in body {
-        let ModelBodyItem::Unknown { expr, .. } = item else { continue };
-        let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else {
-            continue;
-        };
-        if method.as_str() != "attribute" || args.len() != 2 {
-            continue;
-        }
-        let (
-            ExprNode::Lit { value: Literal::Sym { value: name } },
-            ExprNode::Lit { value: Literal::Sym { value: ty } },
-        ) = (&*args[0].node, &*args[1].node)
-        else {
-            continue;
-        };
-        out.push((name.clone(), ty.clone()));
+    body.iter()
+        .filter_map(|item| match item {
+            ModelBodyItem::Unknown { expr, .. } => attribute_api_decl(expr),
+            _ => None,
+        })
+        .collect()
+}
+
+/// One `attribute :name, :type` statement, the only form
+/// `attribute_api_decls` reads.
+pub(crate) fn attribute_api_decl(expr: &Expr) -> Option<(Symbol, Symbol)> {
+    let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else { return None };
+    if method.as_str() != "attribute" {
+        return None;
     }
-    out
+    match args.as_slice() {
+        [name, ty] => match (&*name.node, &*ty.node) {
+            (ExprNode::Lit { value: Literal::Sym { value: name } }, ExprNode::Lit { value: Literal::Sym { value: ty } }) => {
+                Some((name.clone(), ty.clone()))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// `attr` is an `attribute :attr, :boolean` whose reader and writer are the

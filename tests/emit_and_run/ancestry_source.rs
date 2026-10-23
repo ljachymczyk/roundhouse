@@ -47,9 +47,13 @@ fn app() -> emit_and_run::Overlay {
     with_gem(overlay, Path::new(GEM), "vendor/bundle/ruby/3.4.0/gems/ancestry-4.3.3")
 }
 
+/// Two statements of the expansion are not modelled and are reported:
+/// `after_touch :touch_ancestors_callback` (no `after_touch` lowering; it
+/// touches ancestors under `touch: true`) and `attribute <column>, default:`
+/// (`"/"` under `materialized_path2`). Neither changes this tree walk.
 #[test]
 fn has_ancestry_builds_and_walks_a_tree_from_the_gem_source() {
-    app()
+    let run = app()
         .run_ruby(
             r##"
 def check(label, got, want)
@@ -77,6 +81,12 @@ check("predicates", [root.is_root?, root.has_children?, grand.is_childless?], [t
 check("roots", titles(Article.roots), ["Root"])
 puts "ok"
 "##,
-        )
-        .assert_passes();
+        );
+    let gaps: Vec<&str> = run
+        .errors
+        .iter()
+        .filter_map(|e| ["`after_touch` in the body of `Article`", "`attribute` in the body of `Article`"].into_iter().find(|g| e.contains(g)))
+        .collect();
+    assert_eq!((gaps.len(), run.errors.len()), (2, 2), "{:#?}", run.errors);
+    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
 }

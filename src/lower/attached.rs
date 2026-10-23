@@ -592,6 +592,22 @@ fn macro_attrs(model: &Model, macro_name: &str) -> Vec<(Span, Symbol)> {
     out
 }
 
+/// Whether this pass reproduces `expr` in full: a `has_*_attached :name`
+/// whose only option is `dependent:` (`attached_dependent`). `macro_attrs`
+/// expands any named declaration, but `service:` or `strict_loading:`
+/// change what Rails does and are not read, so those forms are not claimed.
+pub(crate) fn claims(expr: &Expr) -> bool {
+    let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { return false };
+    matches!(method.as_str(), "has_one_attached" | "has_many_attached")
+        && matches!(args.first().map(|a| &*a.node), Some(ExprNode::Lit { value: Literal::Sym { .. } }))
+        && args[1..].iter().all(|a| match &*a.node {
+            ExprNode::Hash { entries, .. } => entries.iter().all(|(k, _)| {
+                matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "dependent")
+            }),
+            _ => false,
+        })
+}
+
 /// One `attachable.variant :name, resize_to_limit: [w, h], format: :f`
 /// declaration from a `has_one_attached` block — Rails'
 /// `ActiveStorage::Variation`, narrowed to what lowers. The

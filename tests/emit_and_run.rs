@@ -33,6 +33,8 @@ mod interval_columns;
 mod branch_local_join;
 #[path = "emit_and_run/utc_zone_time.rs"]
 mod utc_zone_time;
+#[path = "emit_and_run/model_body_unknown_call.rs"]
+mod model_body_unknown_call;
 #[path = "emit_and_run/discard.rs"]
 mod discard;
 #[path = "emit_and_run/pundit_source.rs"]

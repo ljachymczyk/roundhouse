@@ -66,7 +66,9 @@ fn callbacks_keep_distinct_captured_default_locals() {
 }
 
 /// A required keyword (`|key:|`) has no default to bind: the block is not
-/// spliced into a hook body with `key` unbound.
+/// spliced into a hook body with `key` unbound. Rails raises
+/// `ArgumentError: missing keyword: :key` on save, so the dropped
+/// callback is reported, not left silent.
 #[test]
 fn a_block_callback_with_a_required_keyword_is_not_spliced_unbound() {
     let (tree, errors) = super::emit_and_run::real_blog()
@@ -76,7 +78,10 @@ fn a_block_callback_with_a_required_keyword_is_not_spliced_unbound() {
             "class Article < ApplicationRecord\n  before_save { |key:| self.body = \"#{body} #{key}\" }\n",
         )
         .emit(roundhouse::project::BuildTarget::Ruby);
-    assert!(errors.is_empty(), "{errors:#?}");
+    assert!(
+        errors.len() == 1 && errors[0].contains("`before_save` in the body of `Article` is not modelled"),
+        "{errors:#?}"
+    );
     let model = std::fs::read_to_string(tree.join("app/models/article.rb")).unwrap();
     assert!(!model.contains("#{key}"), "{model}");
 }

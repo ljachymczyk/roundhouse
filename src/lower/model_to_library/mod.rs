@@ -31,6 +31,7 @@ mod associations;
 pub(crate) use associations::polymorphic_type_switch;
 pub(crate) mod broadcasts;
 pub(crate) mod markers;
+pub(crate) mod unclaimed;
 pub mod row;
 
 use std::collections::{HashMap, HashSet};
@@ -728,261 +729,27 @@ pub(crate) fn collect_model_constants(model: &Model) -> Vec<(Symbol, Expr)> {
 /// Untyped-body method synthesis — shared by the single-model and
 /// bulk entry points. Body-typing is the caller's responsibility (it
 /// needs the cross-model registry).
-/// Report model-body statements that no lowering pass claims.
-///
-/// `ModelBodyItem::Unknown` is a holding pen, not a verdict: broadcasts
-/// (`broadcasts_to`), markers (`primary_abstract_class`), block-form
-/// callbacks, and class-scope constants are all fished out of it by
-/// later recognizers. Whatever nobody claims simply never reaches the
-/// lowered output — and before this report, that drop was silent:
-/// `has_one_attached :audio` vanished and the user's first signal was a
-/// dispatch failure at some call site three files away. Pushing a
-/// *spanned* diagnostic at the declaration names the actual gap.
-///
-/// Warning, not Error: plenty of unclaimed DSL is tolerable per app
-/// (`include`, concerns the app never calls through typed paths), and
-/// dynamic targets often run fine without it. The skip-list below must
-/// stay in sync with the claiming passes — each entry names the pass
-/// that consumes the shape.
-fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
+/// The emit-time half of the unclaimed-statement report: the
+/// slug-generation gap on a claimed `friendly_id` declaration, a warning.
+/// Unclaimed statements themselves are errors from `analyze::diagnose`
+/// (`unclaimed::diagnostics`), so `check` and every build see them once.
+fn report_unclaimed_unknowns(model: &Model, _schema: &Schema) {
     use crate::diagnostic::{Diagnostic, Severity};
-    use crate::expr::LValue;
 
     for item in &model.body {
         let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
-        // Replayed where the source has it (`ingest::app_extension_calls`).
-        if expr.decisions & crate::expr::REPLAYED_CLASS_BODY != 0 {
+        let ExprNode::Send { recv: None, method, .. } = &*expr.node else { continue };
+        if method.as_str() != "friendly_id" || !crate::lower::friendly_id::claims(model, expr.span) {
             continue;
         }
-        // Claimed by `apply_inherited_visibility` and `analyze::private_calls`.
-        if expr.decisions & crate::expr::INHERITED_VISIBILITY != 0 {
-            continue;
+        if let Some((span, message)) = crate::lower::friendly_id::write_gap(model) {
+            let kind = crate::diagnostic::DiagnosticKind::LowerResidue {
+                pass: crate::ident::Symbol::from("friendly_id"),
+                construct: crate::ident::Symbol::from("friendly_id"),
+                reason: crate::ident::Symbol::from("slug generation on save"),
+            };
+            crate::emit::diagnostics::push(Diagnostic { span, severity: Severity::Warning, kind, message });
         }
-        // Class-scope constants — claimed by analyze::extract_const_assignments.
-        if matches!(&*expr.node, ExprNode::Assign { target: LValue::Const { .. }, .. }) {
-            continue;
-        }
-        let ExprNode::Send { recv, method, args, .. } = &*expr.node else {
-            continue;
-        };
-        let name = method.as_str();
-        if let Some(recv) = recv {
-            // Class-body writes are sends too, and dropping an unclaimed
-            // setting must report just like dropping a receiver-less DSL.
-            if !matches!(&*recv.node, ExprNode::SelfRef)
-                || !name.ends_with('=')
-                || matches!(name, "==" | "!=" | "<=" | ">=" | "===")
-            {
-                continue;
-            }
-            // Literal table settings are consumed by ingest::model's
-            // explicit_class_setting; dynamic values remain unsupported.
-            if matches!(name, "table_name=" | "table_name_prefix=")
-                && args.len() == 1
-                && matches!(&*args[0].node, ExprNode::Lit { value: Literal::Str { .. } | Literal::Sym { .. } })
-            {
-                continue;
-            }
-        }
-        // A bare visibility keyword is a marker for the `def`s after
-        // it (the method walk reads it as one); it is not a DSL call.
-        if matches!(name, "private" | "protected" | "public") {
-            continue;
-        }
-        // `attr_accessor`/`attr_reader`/`attr_writer` — claimed by
-        // markers::push_attribute_api_methods, which synthesizes the
-        // virtual attributes the permit filter counts as writers.
-        if matches!(name, "attr_accessor" | "attr_reader" | "attr_writer") {
-            continue;
-        }
-        // `has_one_attached` / `has_many_attached :name` (with or
-        // without a variants block) — claimed by lower::attached on
-        // exactly that shape. Campfire's three (`avatar`, `attachment`,
-        // `logo`) were reported as not lowered on every emit while the
-        // attachment lowering ran on each.
-        if name == "has_one_attached" || name == "has_many_attached" {
-            if let ExprNode::Send { args, .. } = &*expr.node {
-                if !args.is_empty() {
-                    continue;
-                }
-            }
-        }
-        // `broadcasts_to` — claimed by lower::broadcasts.
-        if name == "broadcasts_to" {
-            continue;
-        }
-        // `typed_store` — claimed by lower::typed_store's shared
-        // method synthesis (all targets).
-        if name == "typed_store" {
-            continue;
-        }
-        // `has_secure_password` — claimed by lower::secure_password's
-        // shared method synthesis (all targets).
-        if name == "has_secure_password" {
-            continue;
-        }
-        // `has_secure_token` — claimed by lower::secure_token, which
-        // expands the bare/`length:`/`on:` forms it can honor. Asked
-        // by span rather than re-derived, same as has_json/
-        // has_rich_text below: an option it declines to expand keeps
-        // warning.
-        if name == "has_secure_token"
-            && crate::lower::secure_token::secure_token_decls(&model.body)
-                .iter()
-                .any(|d| d.span == expr.span)
-        {
-            continue;
-        }
-        // `extend FriendlyId` / `friendly_id :col, use: [...]` — claimed
-        // by lower::friendly_id on the configurations it honors. The
-        // slug-generation gap that remains is reported once, below the
-        // claim, as its own warning.
-        if (name == "friendly_id" || name == "extend")
-            && crate::lower::friendly_id::claims(model, expr.span)
-        {
-            if name == "friendly_id" {
-                if let Some((span, message)) = crate::lower::friendly_id::write_gap(model) {
-                    let kind = crate::diagnostic::DiagnosticKind::LowerResidue {
-                        pass: crate::ident::Symbol::from("friendly_id"),
-                        construct: crate::ident::Symbol::from("friendly_id"),
-                        reason: crate::ident::Symbol::from("slug generation on save"),
-                    };
-                    crate::emit::diagnostics::push(Diagnostic {
-                        span,
-                        severity: Severity::Warning,
-                        kind,
-                        message,
-                    });
-                }
-            }
-            continue;
-        }
-        // `generates_token_for :purpose, expires_in: D do … end` —
-        // claimed by lower::generates_token_for for the forms it
-        // expands; asked by span for the same reason.
-        if name == "generates_token_for" && crate::lower::generates_token_for::claims(model, expr.span) {
-            continue;
-        }
-        // `has_json :col, key: <literal>, …` — claimed by
-        // lower::has_json's shared method synthesis. A declaration
-        // carrying a schema entry that pass cannot expand (a
-        // symbol-declared type, whose Rails default is nil) is NOT
-        // claimed and keeps warning: half an expansion is worse than
-        // none. `has_json_decls` is the one place that decides which
-        // declarations are claimed; this test asks it rather than
-        // re-deriving the shape (same dance as `has_rich_text`).
-        if name == "has_json"
-            && crate::lower::has_json::has_json_decls(&model.body)
-                .iter()
-                .any(|d| d.span == expr.span)
-        {
-            continue;
-        }
-        // `serialize :col, coder: JSON` (and legacy positional `JSON`) —
-        // claimed by lower::serialize; accessors go through JsonColumn.
-        if name == "serialize"
-            && crate::lower::serialize::serialize_decls(model)
-                .iter()
-                .any(|d| d.span == expr.span)
-        {
-            continue;
-        }
-        // `default_scope { where(col: literal) }` — claimed by
-        // lower::default_scope (the runtime Relation applies it; a target
-        // without one reports it per target). Other shapes keep warning.
-        if name == "default_scope" && crate::lower::default_scope::static_default_scope(model).is_some() {
-            continue;
-        }
-        // Bare `has_rich_text :body` — claimed by lower::rich_text.
-        // The option-carrying forms (`encrypted:`, `store_if_blank:`)
-        // are NOT claimed: each changes the expansion and none is
-        // implemented, so they keep warning. `rich_text_attrs` is the
-        // one place that decides which shape is claimed; this test
-        // asks it rather than re-deriving the arity.
-        if name == "has_rich_text"
-            && crate::lower::rich_text::rich_text_attrs(model)
-                .iter()
-                .any(|(span, _)| *span == expr.span)
-        {
-            continue;
-        }
-        // Bare `has_markdown :body` — claimed by lower::plain_text_attr
-        // (named plain-text association+storage) only when the
-        // `action_text_markdowns` table is present. Option-carrying
-        // forms and missing-table apps stay unclaimed.
-        if name == "has_markdown"
-            && crate::lower::plain_text_attr::record_table_present(schema)
-            && crate::lower::plain_text_attr::plain_text_attrs(model)
-                .iter()
-                .any(|(span, _)| *span == expr.span)
-        {
-            continue;
-        }
-        // 2-arg `attribute :name, :type` — claimed by
-        // markers::push_attribute_api_methods (typed virtual
-        // attributes). Other arities (default:-carrying) stay
-        // unclaimed and warn.
-        if name == "attribute" {
-            if let ExprNode::Send { args, .. } = &*expr.node {
-                if args.len() == 2 {
-                    continue;
-                }
-            }
-        }
-        // `primary_abstract_class` — claimed by markers.rs.
-        if name == "primary_abstract_class" {
-            continue;
-        }
-        // `include Notifications` — a model concern, spliced by the
-        // analyzer (`model_includes` + `concern_model_items`) into the
-        // includer's registry and lowered with its methods; nothing is
-        // left for an emitter to lower. Framework marker includes are
-        // dropped by `model_includes` for the same reason.
-        if name == "include" {
-            continue;
-        }
-        // Block-form and lambda-argument lifecycle hooks
-        // (`before_create -> { … }`) — both claimed by
-        // markers::push_block_callback, on the shape it reads: a block,
-        // or a parameterless lambda as the first argument.
-        // Exactly the shapes `markers::push_block_callback` lowers
-        // (`block_callback_shape`); a declined one reports below.
-        if self::markers::block_callback_shape(expr).is_some() {
-            continue;
-        }
-        // sorbet's pure ANNOTATIONS. The library-class walk drops
-        // these at ingest; a model never saw them until an abstract
-        // base outside `app/models` started being classified as one,
-        // and then every such base reported its `abstract!` as
-        // unlowered DSL. They carry types and nothing else, and the
-        // emitted tree has no sorbet-runtime to read them.
-        if matches!(
-            name,
-            "abstract!" | "interface!" | "final!" | "sealed!" | "sig" | "type_parameters"
-        ) {
-            continue;
-        }
-        // The mixin spelling of the same thing: `extend T::Helpers`.
-        // (`include` is already skipped above, whatever its argument.)
-        if name == "extend" {
-            if let ExprNode::Send { args, .. } = &*expr.node {
-                if let Some(ExprNode::Const { path }) = args.first().map(|a| &*a.node) {
-                    let written =
-                        path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
-                    if matches!(written.as_str(), "T::Sig" | "T::Helpers" | "T::Generic") {
-                        continue;
-                    }
-                }
-            }
-        }
-        let mut d = Diagnostic::unsupported(
-            expr.span,
-            None,
-            name,
-            format!("model DSL call on `{}` not lowered", model.name.0.as_str()),
-        );
-        d.severity = Severity::Warning;
-        crate::emit::diagnostics::push(d);
     }
 }
 
