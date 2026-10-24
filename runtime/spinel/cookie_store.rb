@@ -105,7 +105,8 @@ module ActionDispatch
         next unless key == "notice" || key == "alert"
         next unless v.is_a?(String)
         next if discard.is_a?(Array) && discard.include?(key)
-        out[key] = v
+        # to_s: Spinel keeps the boxed value boxed past is_a?, and Flash.new takes a String Hash
+        out[key] = v.to_s
       end
       out
     end
