@@ -91,15 +91,19 @@ pub(in crate::analyze) fn mark(
 
 /// One declaration: no verbatim class-body call, no template origin, only
 /// app modules mixed in (themselves free of class-body calls), and no
-/// method body reaching for singleton metaprogramming.
+/// constant value, class-ivar write or method body reaching for singleton
+/// metaprogramming.
 fn declaration_closed(lc: &LibraryClass, declarations: &HashMap<&ClassId, Vec<&LibraryClass>>) -> bool {
     let module_ok = |id: &ClassId| {
         declarations.get(id).is_some_and(|decls| {
             decls.iter().all(|m| m.is_module && m.unknown_calls.is_empty() && m.origin.is_none() && methods_closed(m))
         })
     };
+    // Constant values and `@ivar` writes run in the class body too, outside `unknown_calls`.
     lc.unknown_calls.is_empty()
         && lc.origin.is_none()
+        && lc.constants.iter().all(|(_, value)| !reaches_metaprogramming(value))
+        && lc.class_ivar_initializers.iter().all(|value| !reaches_metaprogramming(value))
         && lc.includes.iter().all(module_ok)
         && methods_closed(lc)
 }

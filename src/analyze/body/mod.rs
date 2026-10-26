@@ -2304,6 +2304,12 @@ impl<'a> BodyTyper<'a> {
                         .clone()
                         .filter(|t| !matches!(t, Ty::Var { .. } | Ty::Untyped))
                     {
+                        // A writer nothing defines still raises; the value stays the argument's type.
+                        if self.inquirers.is_some() && crate::expr::ExprCold::diagnostic(&expr.cold).is_none() {
+                            if let Some(kind) = self.class_side_miss(recv.as_ref(), recv_ty.as_ref(), method, ctx) {
+                                crate::expr::ExprCold::set_diagnostic(&mut expr.cold, Some(kind));
+                            }
+                        }
                         return t;
                     }
                 }
