@@ -73,6 +73,11 @@ puts SqliteBatchProbe.floats(db).inspect
 puts SqliteBatchProbe.transactions(db).inspect
 db.close
 puts db.closed?
+puts(begin
+  db.transaction_active?
+rescue SQLite3::Exception => e
+  e.message
+end)
 "#;
 
 /// The sqlite3 gem's answers (2.10.1 on CRuby 4.0) for `SCRIPT`.
@@ -81,6 +86,7 @@ pub const EXPECTED: &str = concat!(
     "[[[\"c\", \"real\"]], 2.5]\n",
     "[\"committed\", \"boom\", false, true, true, true, false, [\"a;b\", \"c\", \"d\"]]\n",
     "true\n",
+    "cannot use a closed database\n",
 );
 
 pub fn overlay() -> Overlay {

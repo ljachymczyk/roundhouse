@@ -199,8 +199,12 @@ module SQLite3
       true
     end
 
+    # After close the handle is gone; the gem raises before asking SQLite.
     def transaction_active?
-      @lock.synchronize { SQL.sqlite3_get_autocommit(@dbh) == 0 }
+      @lock.synchronize do
+        raise SQLite3::Exception, "cannot use a closed database" if @closed
+        SQL.sqlite3_get_autocommit(@dbh) == 0
+      end
     end
 
     private
