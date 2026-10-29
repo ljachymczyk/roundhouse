@@ -151,8 +151,12 @@ The supported subset:
   matches it with `===`, Mocha with `==`), are refused, as are spies
   (`have_received`), `and_call_original` and block implementations.
   What Roundhouse serves of Mocha on each target is what these chains
-  get: on Spinel a stub returning a value from an app method is not
-  served yet, and the test fails at that line.
+  get. On an app method (a model's or a plain class's, instance or class
+  side) that covers `returns` and `with` of plain values and `anything`
+  on every target, Spinel included: the method answers from a typed
+  slot, the newest matching stub first, and a call no stub admits fails
+  as Mocha's unexpected invocation. The stub's answer has to have the
+  method's own type there, and Roundhouse does not check that yet.
 
 Roundhouse reads `spec/spec_helper.rb` and `spec/rails_helper.rb`, and
 the `spec/support/` files they load with the generated

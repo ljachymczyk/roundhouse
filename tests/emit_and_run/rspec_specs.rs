@@ -287,6 +287,89 @@ fn rspec_mocks_run_as_mocha_on_ruby() {
     }
 }
 
+// Stubs on app methods with answers (`lower::mocha`'s typed answer
+// slots): a class method, and an argument-keyed answer on an object a
+// `let` builds. These run inside the Spinel build too.
+const GREETER: &str = r#"class Greeter
+  def self.current
+    Greeter.new("real")
+  end
+
+  def initialize(name)
+    @name = name
+  end
+
+  def name
+    @name
+  end
+
+  def greet(who)
+    "hello " + who + " from " + @name
+  end
+end
+"#;
+
+const STUBS_SPEC: &str = r#"require "rails_helper"
+
+RSpec.describe Greeter do
+  let(:greeter) { Greeter.new("x") }
+
+  before do
+    allow(Greeter).to receive(:current).and_return(greeter)
+    allow(greeter).to receive(:greet).with("ann").and_return("hi ann")
+  end
+
+  it "answers from the stubs" do
+    expect(Greeter.current).to equal(greeter)
+    expect(Greeter.current.greet("ann")).to eq("hi ann")
+  end
+
+  it "counts an expected call" do
+    expect(greeter).to receive(:name).and_return("named")
+    expect(greeter.name).to eq("named")
+  end
+end
+"#;
+
+fn stubs_app(spec: &str) -> emit_and_run::Overlay {
+    app(SPEC).write("app/models/greeter.rb", GREETER).write("spec/models/greeter_spec.rb", spec)
+}
+
+#[test]
+fn app_method_stubs_from_specs_run_on_ruby() {
+    stubs_app(STUBS_SPEC).run_test("test/models/models_greeter_spec_test.rb").assert_passes();
+    // A call the keyed stub does not admit, and an expected call never
+    // made, each fail the test.
+    for (find, replace) in [
+        ("expect(Greeter.current.greet(\"ann\")).to eq(\"hi ann\")", "Greeter.current.greet(\"bob\")"),
+        ("    expect(greeter.name).to eq(\"named\")\n", ""),
+    ] {
+        let run = stubs_app(&STUBS_SPEC.replacen(find, replace, 1)).run_test("test/models/models_greeter_spec_test.rb");
+        assert!(run.errors.is_empty(), "{find}: {:?}", run.errors);
+        assert!(!run.success, "`{find}` -> `{replace}` passed:\n{}\n{}", run.stdout, run.stderr);
+    }
+}
+
+#[test]
+#[ignore = "requires spin and spinel on PATH plus SQLite development libraries"]
+fn app_method_stubs_from_specs_pass_in_the_spinel_build() {
+    let (emitted, errors) = stubs_app(STUBS_SPEC).emit(roundhouse::project::BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:?}");
+    let output = std::process::Command::new("spin")
+        .args(["test", "test/models_greeter_spec_test.rb"])
+        .current_dir(&*emitted)
+        .output()
+        .expect("spawn spin");
+    std::fs::write(emitted.join("spin-test.stdout"), &output.stdout).unwrap();
+    assert!(
+        output.status.success(),
+        "spin test failed in {}\n=== stdout ===\n{}\n=== stderr ===\n{}",
+        emitted.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // The point of the lane: the same examples run inside the Spinel build.
 #[test]
 #[ignore = "requires spin and spinel on PATH plus SQLite development libraries"]
