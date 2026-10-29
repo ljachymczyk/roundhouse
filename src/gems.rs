@@ -74,6 +74,7 @@ pub(crate) const GEM_REQUIRES: &[&str] = &[
     "faraday/retry",
     "retryable",
     "jwt",
+    "webauthn",
 ];
 
 /// Whether the compiler's own tables have a Ruby-family tree declare or
@@ -91,7 +92,7 @@ pub(crate) fn compiler_runtime_gems() -> &'static [(Marker, &'static str)] {
     // (constant an emitted body names, gem that defines it). Only gems
     // whose absence is a RUNTIME error belong here — the list is the
     // façade's, not a survey of what an app might like.
-    const RUNTIME_GEMS: [(Marker, &str); 22] = [
+    const RUNTIME_GEMS: [(Marker, &str); 23] = [
         (Marker::Constant("BCrypt"), "bcrypt"),
         (Marker::Constant("HTMLEntities"), "htmlentities"),
         (Marker::Constant("ROTP"), "rotp"),
@@ -209,6 +210,11 @@ pub(crate) fn compiler_runtime_gems() -> &'static [(Marker, &'static str)] {
         // refused on the strict targets (`lower::ruby_family_gems`).
         (Marker::Constant("Retryable"), "retryable"),
         (Marker::Constant("JWT"), "jwt"),
+        // Passkey registration and sign-in. The real gem on this lane; the
+        // spinel tree swaps its façade for the spinel-webauthn spin package
+        // (`project::spin_shape`), and the strict targets refuse it
+        // (`lower::ruby_family_gems`).
+        (Marker::Constant("WebAuthn"), "webauthn"),
     ];
     &RUNTIME_GEMS
 }
@@ -691,6 +697,7 @@ const FATES: &[(&str, GemFate)] = &[
     ("web-push", GemFate::Modeled),    // WebPush pool (runtime/ruby)
     ("webpush", GemFate::Modeled),     // the gem's former name; same surface
     ("webmock", GemFate::Modeled),     // webmock double (runtime/ruby)
+    ("webauthn", GemFate::Modeled),    // catalog/gems: WebAuthn; the real gem on ruby and jruby, the spinel-webauthn spin package on spinel, lower/ruby_family_gems refuses every other target
     ("will_paginate", GemFate::Modeled), // catalog: paginate; registry/view: will_paginate, page_entries_info
     // ── Infrastructure ───────────────────────────────────────────
     ("active_record_doctor", GemFate::Infrastructure),
@@ -917,6 +924,7 @@ pub fn namespace_of(gem: &str) -> String {
         ("sqlite3", "SQLite3"),
         ("twilio-ruby", "Twilio"),
         ("web-push", "WebPush"),
+        ("webauthn", "WebAuthn"),
         ("zip_kit", "ZipKit"),
     ];
     if let Some((_, ns)) = IRREGULAR.iter().find(|(g, _)| *g == gem) {

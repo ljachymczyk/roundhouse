@@ -9672,6 +9672,7 @@ fn is_gem_facade_root(root: &str) -> bool {
             | "ROTP"
             | "BCrypt"
             | "RQRCode"
+            | "WebAuthn"
             | "SVG"
             | "OpenTelemetry"
     )

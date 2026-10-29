@@ -7912,6 +7912,10 @@ fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(St
         // spin_shape replaces it with `require "nokogiri"` (spinel-nokogiri)
         // when the app names Nokogiri.
         "nokogiri_facade",
+        // WebAuthn's raising stand-in, its own file for the same swap:
+        // spin_shape replaces it with `require "webauthn"` (spinel-webauthn)
+        // when the app names WebAuthn.
+        "webauthn_facade",
         // OpenTelemetry's non-recording-span stub — never swapped for a
         // real gem (see the file's own header); still its own file, same
         // whole-file-grain reasoning. `gem_facades.rb`'s own
@@ -10511,6 +10515,29 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
         apply_spinel_css_select(&mut files);
     }
 
+    // webauthn: the same swap, for passkey registration and sign-in
+    // (`WebAuthn::Credential.options_for_create` / `from_create` /
+    // `options_for_get` / `from_get`). The package is spinel-webauthn,
+    // the gem's relying-party half in the gem's class names, with the
+    // signatures checked by spinel's openssl package. Manifest below.
+    let needs_webauthn = files
+        .iter()
+        .any(|(p, c)| p.starts_with("app/") && p.ends_with(".rb") && names_constant(c, "WebAuthn"));
+    if needs_webauthn {
+        let facade = files
+            .iter_mut()
+            .find(|(p, _)| p == "runtime/webauthn_facade.rb")
+            .ok_or("spin_shape: app references WebAuthn but runtime/webauthn_facade.rb \
+                    is not in the spinel file set")?;
+        facade.1 = "# Real webauthn - the spinel-webauthn spin package (the gem's\n\
+                    # relying-party half; see spin.toml [dependencies]). This file is\n\
+                    # the swap point: the scaffold base ships a raising façade here for\n\
+                    # targets without the package. Same require anchor either way.\n\
+                    require \"webauthn\"\n"
+            .to_string();
+        files.retain(|(p, _)| p != "runtime/webauthn_facade.rbs");
+    }
+
     // redis: the same swap, for a tree on queue_adapter :sidekiq with a
     // payload job (`needs_redis`, recorded as the registry's `sidekiq?`).
     // `runtime/sidekiq_redis.rb` becomes the real connection over
@@ -10669,6 +10696,19 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
              nokogiri = { git = \"https://github.com/rubys/spinel-nokogiri\", ref = \"v0.3.1\" }\n",
         );
     }
+    if needs_webauthn {
+        if !manifest.lines().any(|l| l.trim() == "[dependencies]") {
+            manifest.push_str("\n[dependencies]\n");
+        }
+        manifest.push_str(
+            "# Passkeys: the webauthn gem's relying-party half (options, attestation\n\
+             # and assertion verification), pure Ruby over spinel's openssl\n\
+             # package, which needs the system libcrypto (`libssl-dev` on\n\
+             # Debian/Ubuntu). Git form for the reason bcrypt gives above; the\n\
+             # tag names the gem version the package answers as.\n\
+             webauthn = { git = \"https://github.com/sology/spinel-webauthn\", ref = \"v3.4.3\" }\n",
+        );
+    }
     if needs_commonmarker {
         if !manifest.lines().any(|l| l.trim() == "[dependencies]") {
             manifest.push_str("\n[dependencies]\n");
@@ -10819,7 +10859,7 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
             for (from, to) in dep_patches {
                 makefile.1 = makefile.1.replacen(from, to, 1);
             }
-        } else if needs_bcrypt || needs_vips || needs_rqrcode || needs_nokogiri || needs_commonmarker || needs_redis {
+        } else if needs_bcrypt || needs_vips || needs_rqrcode || needs_nokogiri || needs_webauthn || needs_commonmarker || needs_redis {
             return Err(
                 "spin_shape: Makefile dep-patch anchors not found (scaffold \
                  Makefile changed?) and this tree carries a package"
@@ -12608,6 +12648,65 @@ mod tests {
         let without = spin_shape(tree("class QrCodeController\nend\n")).unwrap();
         assert!(get(&without, "runtime/rqrcode_facade.rb").contains("module RQRCode"));
         assert!(!get(&without, "spin.toml").contains("rqrcode"));
+    }
+
+    /// An app that names WebAuthn (passkey registration and sign-in) gets
+    /// the spinel-webauthn package the same way: façade file swapped to
+    /// `require "webauthn"`, sidecar dropped, manifest dependency declared,
+    /// the binary built by `spin build`. A mention in a comment is not a
+    /// use, and an app without one keeps the façade.
+    #[test]
+    fn spin_shape_swaps_webauthn_facade_for_the_package() {
+        let makefile = "SPINEL ?= spinel\n\
+             RBS_SRC  := $(shell find sig -type f -name '*.rbs' 2>/dev/null)\n\
+             RBS_FLAG := $(if $(wildcard sig),--rbs sig)\n\
+             $(BUILD)/blog: $(RUBY_SRC) $(RBS_SRC)\n\
+             \t@mkdir -p $(BUILD)\n\
+             \t$(SPINEL) main.rb $(RBS_FLAG) -o $@\n\
+             $(BUILD)/test/%: test/%.rb $(RUBY_SRC)\n\
+             \t$(SPINEL) --rbs sig $(SPINEL_TEST_FLAGS) $< -o $@\n\
+             SPINEL_TESTS := \\\n\
+             \ttest/models/article_test \\\n\
+             \ttest/models/comment_test \\\n\
+             \ttest/controllers/articles_controller_test \\\n\
+             \ttest/controllers/comments_controller_test\n";
+        let tree = |model: &str| {
+            vec![
+                ("Makefile".to_string(), makefile.to_string()),
+                ("main.rb".to_string(), "Main.run\n".to_string()),
+                ("app/models/credential.rb".to_string(), model.to_string()),
+                ("runtime/webauthn_facade.rb".to_string(), "module WebAuthn\nend\n".to_string()),
+                ("sig/runtime/webauthn_facade.rbs".to_string(), "module WebAuthn\nend\n".to_string()),
+            ]
+        };
+        let with = spin_shape(tree(
+            "class Credential\n  def self.handle\n    WebAuthn.generate_user_id\n  end\nend\n",
+        ))
+        .unwrap();
+        let get = |out: &Vec<(String, String)>, p: &str| out.iter().find(|(q, _)| q == p).unwrap().1.clone();
+        let facade = get(&with, "runtime/webauthn_facade.rb");
+        assert!(facade.contains("require \"webauthn\""), "{facade}");
+        assert!(!facade.contains("module WebAuthn"), "{facade}");
+        assert!(!with.iter().any(|(p, _)| p == "sig/runtime/webauthn_facade.rbs"), "sidecar must drop");
+        let manifest = get(&with, "spin.toml");
+        let lines: Vec<&str> = manifest.lines().map(str::trim).collect();
+        let header = lines.iter().position(|l| *l == "[dependencies]").unwrap_or_else(|| panic!("{manifest}"));
+        let dep = lines
+            .iter()
+            .position(|l| *l == "webauthn = { git = \"https://github.com/sology/spinel-webauthn\", ref = \"v3.4.3\" }")
+            .unwrap_or_else(|| panic!("{manifest}"));
+        assert!(header < dep, "{manifest}");
+        let mk = get(&with, "Makefile");
+        assert!(mk.contains("\t$(SPIN) build\n\tcp build/bin/blog $@"), "{mk}");
+
+        for model in [
+            "class Credential\nend\n",
+            "class Credential\n  # Registered through WebAuthn elsewhere.\nend\n",
+        ] {
+            let without = spin_shape(tree(model)).unwrap();
+            assert!(get(&without, "runtime/webauthn_facade.rb").contains("module WebAuthn"), "{model}");
+            assert!(!get(&without, "spin.toml").contains("webauthn"), "{model}");
+        }
     }
 
     /// A declared variant (`ActiveStorage::Variation.new(` in an emitted
