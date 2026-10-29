@@ -40,7 +40,9 @@
 //! - `expect { }.to raise_error` (any `Exception`, a class, a literal
 //!   message, or both), `not_to raise_error`, and `change { value }` /
 //!   `change(receiver, :message)` bare or with `by`, `by_at_least`,
-//!   `by_at_most`, `from`, `to`.
+//!   `by_at_most`, `from`, `to`;
+//! - on a request spec's `response`: `have_http_status`, `redirect_to`,
+//!   and the `Rack::Response::Helpers` status predicates (`be_successful`).
 
 use crate::det::HashMap;
 
@@ -196,6 +198,9 @@ struct Ctx<'a> {
     described: Option<&'a [String]>,
     /// Matchers the suite defines itself (`RSpec::Matchers.define`).
     custom_matchers: &'a [String],
+    /// A bare `response` is the integration session's last response (a
+    /// request spec that defines no `response` of its own).
+    session_response: bool,
 }
 
 /// One example group on the way down: what it adds to the groups around it.
@@ -586,7 +591,10 @@ impl Reader<'_> {
             }
         }
 
-        let ctx = Ctx { described: described.as_deref(), custom_matchers: &self.config.custom_matchers };
+        let session_response = spec_type.as_deref() == Some("request")
+            && !lets.iter().any(|(n, _, _)| n == "response")
+            && !defs.iter().any(|d| d.name.as_str() == "response");
+        let ctx = Ctx { described: described.as_deref(), custom_matchers: &self.config.custom_matchers, session_response };
         let rewrite = |e: &Expr| -> Result<Expr, String> { desugar(e, &ctx) };
         let mut helpers = Vec::new();
         for (let_name, body, span) in &lets {
@@ -819,7 +827,9 @@ impl SpecConfig {
         // call it makes (`expect`, `described_class`) is then an analysis
         // error in every module that reaches it.
         let matchers = self.custom_matchers.clone();
-        let ctx = Ctx { described: None, custom_matchers: &matchers };
+        // Helper modules are mostly included into request specs; outside
+        // one, a helper reading `response` fails there as it would anyway.
+        let ctx = Ctx { described: None, custom_matchers: &matchers, session_response: true };
         let methods = self.helper_defs.iter_mut().chain(self.support_modules.iter_mut().flat_map(|lc| lc.methods.iter_mut()));
         for m in methods {
             if let Ok(body) = desugar(&m.body, &ctx) {
@@ -1303,6 +1313,11 @@ fn expectation(expr: &Expr, ctx: &Ctx<'_>) -> Result<Option<Expr>, String> {
         }
         _ => return Err("this form of `expect`".into()),
     };
+    if ctx.session_response && is_bare_call(&actual, "response") {
+        if let Some(assertion) = response_matcher(span, matcher, positive, ctx)? {
+            return Ok(Some(assertion));
+        }
+    }
     let conditions = matcher_conditions(matcher, actual, ctx)?;
     // `include(a, b)` holds when every value is included; its negation
     // when none is, so each value is its own assertion either way.
@@ -1314,6 +1329,149 @@ fn expectation(expr: &Expr, ctx: &Ctx<'_>) -> Result<Option<Expr>, String> {
         asserts.pop().unwrap()
     } else {
         Expr::new(span, ExprNode::Seq { exprs: asserts })
+    }))
+}
+
+fn is_bare_call(expr: &Expr, name: &str) -> bool {
+    matches!(&*expr.node, ExprNode::Send { recv: None, method, args, block: None, .. } if method.as_str() == name && args.is_empty())
+}
+
+/// rspec-rails' response matchers, on a request spec's `response`:
+///
+/// - `have_http_status(x)` is the harness's `assert_response(x)` where
+///   Rails' rules are rspec-rails' (all but `:redirect`); otherwise, and
+///   for `not_to`, it compares `response.status` by rspec-rails'
+///   rules: an Integer exactly, a generic type by the Rack predicate it
+///   names (`:success` / `:successful`, `:redirect`, `:missing` /
+///   `:not_found`, `:error` / `:server_error`), any other Symbol through
+///   the status code table. A status held in a variable goes to
+///   `assert_response` too (if it holds `:redirect`, Rails' 3xx range
+///   answers); in `not_to` it is refused;
+/// - `redirect_to(x)` is `assert_redirected_to(x)`, which rspec-rails
+///   delegates to;
+/// - `be_<predicate>` for the status predicates of
+///   `Rack::Response::Helpers` (`be_successful`, `be_not_found`, ...) is
+///   that predicate's status test.
+///
+/// `Ok(None)` for any other matcher, read as on any value.
+fn response_matcher(span: Span, matcher: &Expr, positive: bool, ctx: &Ctx<'_>) -> Result<Option<Expr>, String> {
+    let ExprNode::Send { recv: None, method, args, block: None, .. } = &*matcher.node else {
+        return Ok(None);
+    };
+    let args = args.iter().map(|a| desugar(a, ctx)).collect::<Result<Vec<_>, _>>()?;
+    let status = || send(Some(send(None, "response", Vec::new(), span)), "status", Vec::new(), span);
+    let int = |n: i64| Expr::new(span, ExprNode::Lit { value: Literal::Int { value: n } });
+    let between = |lo: i64, hi: i64| {
+        Expr::new(
+            span,
+            ExprNode::BoolOp {
+                op: crate::expr::BoolOpKind::And,
+                surface: Default::default(),
+                left: send(Some(status()), ">=", vec![int(lo)], span),
+                right: send(Some(status()), "<=", vec![int(hi)], span),
+            },
+        )
+    };
+    let one_of = |codes: &[i64]| {
+        let list = Expr::new(
+            span,
+            ExprNode::Array { elements: codes.iter().map(|c| int(*c)).collect(), style: Default::default() },
+        );
+        send(Some(list), "include?", vec![status()], span)
+    };
+    let check = |cond: Expr| send(None, if positive { "assert" } else { "refute" }, vec![cond], span);
+    let name = method.as_str();
+    Ok(Some(match name {
+        "have_http_status" => {
+            let [expected] = args.as_slice() else {
+                return Err("`have_http_status` without exactly one argument".into());
+            };
+            // rspec-rails sends the generic types to the response's Rack
+            // predicates (`successful?`, `redirect?`, `not_found?`,
+            // `server_error?`); `redirect?` is the five redirect codes, not
+            // the 3xx range Rails' own `assert_response :redirect` checks.
+            let generic = |sym: &str| match sym {
+                "success" | "successful" => Some(between(200, 299)),
+                "redirect" => Some(one_of(&[301, 302, 303, 307, 308])),
+                "missing" | "not_found" => Some(one_of(&[404])),
+                "error" | "server_error" => Some(between(500, 599)),
+                _ => None,
+            };
+            // Where Rails' rules are rspec-rails' own, the harness's
+            // `assert_response` (every lane already runs it) answers.
+            let assert_response = |arg: Expr| send(None, "assert_response", vec![arg], span);
+            let sym = |name: &str| Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(name) } });
+            if positive {
+                match &*expected.node {
+                    ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "redirect" => {}
+                    ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "successful" => {
+                        return Ok(Some(assert_response(sym("success"))));
+                    }
+                    ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "server_error" => {
+                        return Ok(Some(assert_response(sym("error"))));
+                    }
+                    _ => return Ok(Some(assert_response(expected.clone()))),
+                }
+            }
+            match &*expected.node {
+                ExprNode::Lit { value: Literal::Int { value } } => check(send(Some(status()), "==", vec![int(*value)], span)),
+                ExprNode::Lit { value: Literal::Sym { value } } => match generic(value.as_str()) {
+                    Some(cond) => check(cond),
+                    None => {
+                        let codes = Expr::new(
+                            span,
+                            ExprNode::Const { path: vec![Symbol::from("ActionController"), Symbol::from("STATUS_CODES")] },
+                        );
+                        let code = send(Some(codes), "[]", vec![expected.clone()], span);
+                        check(send(Some(status()), "==", vec![code], span))
+                    }
+                },
+                _ => return Err("`not_to have_http_status` with a status that is not a literal".into()),
+            }
+        }
+        "redirect_to" => {
+            if !positive {
+                return Err("`not_to redirect_to`".into());
+            }
+            let [expected] = args.as_slice() else {
+                return Err("`redirect_to` without exactly one argument".into());
+            };
+            send(None, "assert_redirected_to", vec![expected.clone()], span)
+        }
+        _ if args.is_empty() => {
+            // Rack::Response::Helpers.
+            let cond = match name.strip_prefix("be_").unwrap_or_default() {
+                "informational" => between(100, 199),
+                "successful" => between(200, 299),
+                "redirection" => between(300, 399),
+                "client_error" => between(400, 499),
+                "server_error" => between(500, 599),
+                "invalid" => {
+                    let below = send(Some(status()), "<", vec![int(100)], span);
+                    let above = send(Some(status()), ">=", vec![int(600)], span);
+                    Expr::new(span, ExprNode::BoolOp { op: crate::expr::BoolOpKind::Or, surface: Default::default(), left: below, right: above })
+                }
+                "ok" => one_of(&[200]),
+                "created" => one_of(&[201]),
+                "accepted" => one_of(&[202]),
+                "no_content" => one_of(&[204]),
+                "moved_permanently" => one_of(&[301]),
+                "redirect" => one_of(&[301, 302, 303, 307, 308]),
+                "bad_request" => one_of(&[400]),
+                "unauthorized" => one_of(&[401]),
+                "forbidden" => one_of(&[403]),
+                "not_found" => one_of(&[404]),
+                "method_not_allowed" => one_of(&[405]),
+                "not_acceptable" => one_of(&[406]),
+                "request_timeout" => one_of(&[408]),
+                "precondition_failed" => one_of(&[412]),
+                "unprocessable" => one_of(&[422]),
+                "empty" => one_of(&[201, 204, 304]),
+                _ => return Ok(None),
+            };
+            check(cond)
+        }
+        _ => return Ok(None),
     }))
 }
 
@@ -2008,6 +2166,42 @@ end
         let src = "describe Article do\n  it \"x\" do\n    expect(Article.new).to be_tidy\n  end\nend\n";
         let err = ingest_spec_files_with(src.as_bytes(), "/app/spec/models/article_spec.rb", &config).unwrap_err();
         assert!(err.to_string().contains("custom matcher `be_tidy`"), "{err}");
+    }
+
+    fn request_body(body: &str) -> Result<String, String> {
+        let src = format!("RSpec.describe \"Articles\", type: :request do\n  it \"x\" do\n    {body}\n  end\nend\n");
+        ingest_spec_files(src.as_bytes(), "/app/spec/requests/articles_spec.rb")
+            .map(|tms| format!("{:?}", tms[0].tests[0].body))
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn response_matchers_in_request_specs() {
+        // Rails' rules are rspec-rails' here: the harness's assertion.
+        let body = request_body("expect(response).to have_http_status(:ok)").unwrap();
+        assert!(body.contains("assert_response") && body.contains("\"ok\""), "{body}");
+        let body = request_body("expect(response).to have_http_status(:successful)").unwrap();
+        assert!(body.contains("assert_response") && body.contains("\"success\""), "{body}");
+        // `:redirect` is Rack's `redirect?`: five codes, not 3xx.
+        let body = request_body("expect(response).to have_http_status(:redirect)").unwrap();
+        assert!(!body.contains("assert_response") && body.contains("307") && body.contains("308") && !body.contains("304"), "{body}");
+        let body = request_body("expect(response).not_to have_http_status(404)").unwrap();
+        assert!(body.contains("refute") && body.contains("status") && body.contains("404"), "{body}");
+        let body = request_body("expect(response).to be_successful").unwrap();
+        assert!(body.contains("status") && body.contains("200") && body.contains("299"), "{body}");
+        let body = request_body("expect(response).to redirect_to(articles_path)").unwrap();
+        assert!(body.contains("assert_redirected_to") && body.contains("articles_path"), "{body}");
+        let err = request_body("expect(response).not_to redirect_to(articles_path)").unwrap_err();
+        assert!(err.contains("not_to redirect_to"), "{err}");
+    }
+
+    // Only a request spec's own `response` is the session's.
+    #[test]
+    fn response_matchers_elsewhere_are_refused() {
+        let src = example("expect(response).to have_http_status(:ok)");
+        assert!(ingest_spec_files(src.as_bytes(), "/app/spec/models/article_spec.rb").is_err());
+        let src = "RSpec.describe \"Articles\", type: :request do\n  let(:response) { fetch }\n  it \"x\" do\n    expect(response).to have_http_status(:ok)\n  end\nend\n";
+        assert!(ingest_spec_files(src.as_bytes(), "/app/spec/requests/articles_spec.rb").is_err());
     }
 
     #[test]

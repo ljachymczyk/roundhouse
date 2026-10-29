@@ -128,6 +128,15 @@ The supported subset:
   also compares the value's `hash` before and after; roundhouse does not,
   so another object changed in place with an unchanged `==` is not seen
   as a change.
+- in a request spec (`type: :request`, or `spec/requests` with
+  `infer_spec_type_from_file_location!`), the integration session's
+  `get`, `post` and the other verbs, and on its `response`:
+  `have_http_status` (an Integer, a status Symbol, or the generic
+  `:success` / `:successful`, `:redirect`, `:missing` / `:not_found`,
+  `:error` / `:server_error`, as rspec-rails reads them: `:redirect` is
+  the five redirect codes Rack's `redirect?` names, not every 3xx),
+  `redirect_to`, and the status predicates of `Rack::Response::Helpers`
+  (`be_successful`, `be_ok`, `be_not_found`, `be_redirect`, ...).
 
 Roundhouse reads `spec/spec_helper.rb` and `spec/rails_helper.rb`, and
 the `spec/support/` files they load with the generated
