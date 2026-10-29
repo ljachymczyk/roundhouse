@@ -1,7 +1,7 @@
 use super::emit_and_run;
 
 // RSpec's verdict on CRuby is the expectation: the spec is written to pass
-// unchanged under `rspec` in the generated blog (7 examples). The
+// unchanged under `rspec` in the generated blog (8 examples). The
 // emitted tests must pass on the same app, and fail where RSpec fails.
 const SPEC: &str = r#"require "rails_helper"
 
@@ -69,26 +69,65 @@ RSpec.describe Article, type: :model do
       expect { article.valid? }.not_to change { Article.count }
     end
   end
+
+  describe "helper configuration" do
+    it "runs the helper's hooks and includes its modules" do
+      expect(@configured).to eq(true)
+      expect(article_title_for(article)).to eq("Getting Started")
+    end
+  end
 end
 "#;
+
+// What `rails generate rspec:install` writes, trimmed, plus a hook and an
+// included support module.
+const RAILS_HELPER: &str = r#"require "spec_helper"
+ENV["RAILS_ENV"] ||= "test"
+require_relative "../config/environment"
+abort("The Rails environment is running in production mode!") if Rails.env.production?
+require "rspec/rails"
+Dir[Rails.root.join("spec", "support", "**", "*.rb")].sort.each { |f| require f }
+
+RSpec.configure do |config|
+  config.use_transactional_fixtures = true
+  config.infer_spec_type_from_file_location!
+  config.filter_rails_from_backtrace!
+  config.before { @configured = true }
+  config.include ArticleHelpers
+end
+"#;
+
+const SPEC_HELPER: &str = r#"RSpec.configure do |config|
+  config.expect_with :rspec do |expectations|
+    expectations.include_chain_clauses_in_custom_matcher_descriptions = true
+  end
+  config.shared_context_metadata_behavior = :apply_to_host_groups
+end
+"#;
+
+const SUPPORT: &str = "module ArticleHelpers\n  def article_title_for(article)\n    article.title\n  end\nend\n";
 
 const CONFIG: &str = "test_paths:\n  - spec/models\n";
 
 fn app(spec: &str) -> emit_and_run::Overlay {
     emit_and_run::real_blog()
         .write("roundhouse.yml", CONFIG)
+        .write("spec/rails_helper.rb", RAILS_HELPER)
+        .write("spec/spec_helper.rb", SPEC_HELPER)
+        .write("spec/support/article_helpers.rb", SUPPORT)
         .write("spec/models/article_spec.rb", spec)
 }
 
 // One emitted test file per example group that owns examples, named by
 // the spec file and the group.
-const FILES: [(&str, usize); 6] = [
+const FILES: [(&str, usize); 7] = [
     ("models_article_spec", 1),
     ("models_article_without_title_spec", 1),
     ("models_article_with_short_body_spec", 1),
     ("models_article_let_spec", 1),
     ("models_article_let_spec2", 1),
     ("models_article_block_expectations_spec", 2),
+    ("models_article_helper_configuration_spec", 1),
 ];
 
 #[test]

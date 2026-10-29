@@ -129,12 +129,32 @@ The supported subset:
   so another object changed in place with an unchanged `==` is not seen
   as a change.
 
+Roundhouse reads `spec/spec_helper.rb` and `spec/rails_helper.rb`, and
+the `spec/support/` files they load with the generated
+`Dir[...support...].each { |f| require f }` line:
+
+- in `RSpec.configure`: `before` and `after` hooks (also `prepend_` and
+  `append_`), `include` of a module a support file defines,
+  `infer_spec_type_from_file_location!`, and settings that change no
+  verdict (fixture paths, ordering, backtraces, formatters, the
+  transaction mode);
+- a hook or `include` filtered by `type:` applies to that type; one
+  filtered by other metadata applies to no supported example, because
+  such examples are refused themselves;
+- methods the helper files define at the top level, for the examples
+  that call them;
+- `RSpec::Matchers.define`, so a spec that uses the custom matcher is
+  refused rather than misread.
+
+Every example starts from an emptied database with `test/fixtures`
+loaded, whatever the transaction mode. A `spec/fixtures` folder is not
+read.
+
 Anything else is refused by name: `roundhouse check` reports it, and
 `--continue` lists every refused construct and leaves out the examples
-that need it. Roundhouse does not read `spec/rails_helper.rb` or
-`spec/spec_helper.rb` yet, so configuration there (included modules,
-global hooks) does not reach the examples, and neither do test doubles,
-shared examples or `around` hooks.
+that need it. Not read yet: test doubles, shared examples and contexts,
+`around` hooks, `before(:all)` and `before(:suite)`, and modules from
+gems (`config.include FactoryBot::Syntax::Methods`).
 
 ## `extensions`
 
