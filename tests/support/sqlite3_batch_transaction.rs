@@ -64,6 +64,14 @@ class SqliteBatchProbe
     bodies = db.execute("SELECT body FROM notes ORDER BY rowid").map { |row| row[0] }
     [ committed, raised, after_raise, opened, inside, rolled, db.transaction_active?, bodies ]
   end
+
+  # After `close` the gem raises before asking SQLite (REQUIRE_OPEN_DB).
+  # Naming `SQLite3` here also makes the model require the shim.
+  def self.after_close(db)
+    db.transaction_active?.to_s
+  rescue SQLite3::Exception => e
+    e.message
+  end
 end
 "##;
 
@@ -73,11 +81,7 @@ puts SqliteBatchProbe.floats(db).inspect
 puts SqliteBatchProbe.transactions(db).inspect
 db.close
 puts db.closed?
-puts(begin
-  db.transaction_active?
-rescue SQLite3::Exception => e
-  e.message
-end)
+puts SqliteBatchProbe.after_close(db)
 "#;
 
 /// The sqlite3 gem's answers (2.10.1 on CRuby 4.0) for `SCRIPT`.
