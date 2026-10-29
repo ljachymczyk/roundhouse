@@ -66,6 +66,8 @@ const CR_DB_SOURCE: &str = include_str!("../../runtime/crystal/db.cr");
 // (stored text → Time, the `parse_db_time` intrinsic target) plus the
 // `JsonBuilder.encode_datetime(Time?)` overload.
 const CR_DATETIME_SOURCE: &str = include_str!("../../runtime/crystal/datetime.cr");
+const CR_I18N_HOST_SOURCE: &str = include_str!("../../runtime/crystal/i18n_host.cr");
+const CR_CORE_ERRORS_SOURCE: &str = include_str!("../../runtime/crystal/core_errors.cr");
 const CR_HTTP_SOURCE: &str = include_str!("../../runtime/crystal/http.cr");
 const CR_PARAM_VALUE_SOURCE: &str = include_str!("../../runtime/crystal/param_value.cr");
 const CR_PARAMS_SOURCE: &str = include_str!("../../runtime/crystal/params.cr");
@@ -141,6 +143,14 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     files.push(EmittedFile {
         path: PathBuf::from("src/datetime.cr"),
         content: CR_DATETIME_SOURCE.to_string(),
+    });
+    files.push(EmittedFile {
+        path: PathBuf::from("src/i18n_host.cr"),
+        content: CR_I18N_HOST_SOURCE.to_string(),
+    });
+    files.push(EmittedFile {
+        path: PathBuf::from("src/core_errors.cr"),
+        content: CR_CORE_ERRORS_SOURCE.to_string(),
     });
     files.push(EmittedFile {
         path: PathBuf::from("src/http.cr"),
@@ -671,10 +681,8 @@ fn emit_main_cr(app: &App) -> EmittedFile {
     s.push_str("  controllers: {\n");
     for c in &app.controllers {
         let class_name = c.name.0.as_str();
-        let stem = crate::naming::snake_case(
-            class_name.strip_suffix("Controller").unwrap_or(class_name),
-        );
-        writeln!(s, "    :{} => {},", stem, class_name).unwrap();
+        // Not the class's own snake_case: the router looks a controller up by its route symbol (`:admin__posts`).
+        writeln!(s, "    :{} => {},", controller_symbol(class_name), class_name).unwrap();
     }
     s.push_str("  } of Symbol => ActionController::Base.class,\n");
     s.push_str(")\n");
@@ -772,7 +780,7 @@ fn emit_test_setup_cr(
 /// `src/lower/routes_to_library/mod.rs::controller_symbol`.
 fn controller_symbol(class_name: &str) -> String {
     let base = class_name.strip_suffix("Controller").unwrap_or(class_name);
-    crate::naming::underscore(base).replace('/', "_")
+    crate::naming::underscore(base).replace('/', "__")
 }
 
 fn emit_app_cr(emitted: &[EmittedFile]) -> EmittedFile {

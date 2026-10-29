@@ -3,7 +3,7 @@
 //! flattened; model named rest/block declarations are not fully retained.
 //! Do not silently forward into those approximations or an unknown callee.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::diagnostic::Diagnostic;
@@ -13,7 +13,9 @@ use crate::ident::{ClassId, Symbol};
 use crate::span::Span;
 use crate::ty::Ty;
 
+mod anonymous;
 mod constructor;
+pub(crate) use anonymous::restore_anonymous_forward_contracts;
 pub(crate) use constructor::ConstructorContract;
 
 pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
@@ -49,7 +51,7 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
                 Some(
                     "full declarations of this method overlap an ingest-time call rewrite whose source dispatch is not retained",
                 )
-            } else if !contracts.verified_hierarchy(owner, &mut HashSet::new()) {
+            } else if !contracts.verified_hierarchy(owner, &mut HashSet::default()) {
                 Some("forwarding declarations in reopened class fragments are not verified")
             } else if method.receiver == MethodReceiver::Class
                 && app.models.iter().any(|m| &m.name == owner)
@@ -197,7 +199,7 @@ fn walk(
             .params
             .iter()
             .any(|p| p.keyword && p.rest && p.name.as_str().is_empty() && !p.forwarding);
-        let resolved = destination(app, contracts, Some((owner, enclosing)), e);
+        let resolved = destination(app, contracts, Some((owner, enclosing)), e, None);
         let reason = if !source_ok {
             Some("anonymous keyword forwarding has no enclosing anonymous keyword-rest declaration")
         } else if enclosing.unsupported_formals.is_some()
@@ -207,7 +209,7 @@ fn walk(
                 enclosing.name_span,
                 enclosing.receiver,
             )
-            || !contracts.verified_hierarchy(owner, &mut HashSet::new())
+            || !contracts.verified_hierarchy(owner, &mut HashSet::default())
         {
             Some("anonymous keyword forwarding source declaration cannot be verified")
         } else {
@@ -240,7 +242,7 @@ fn walk(
             contract_error(
                 Some((owner, enclosing)),
                 e,
-                destination(app, contracts, Some((owner, enclosing)), e)
+                destination(app, contracts, Some((owner, enclosing)), e, None)
                     .map(|resolved| (resolved.method, resolved.model)),
                 contracts,
             )
@@ -348,6 +350,7 @@ fn destination<'a>(
     contracts: &SourceContractIndex<'a>,
     context: Option<(&ClassId, &MethodDef)>,
     e: &Expr,
+    resolver: Option<&super::body::ConstResolver>,
 ) -> Option<ResolvedDestination<'a>> {
     let owner_dependent = match &*e.node {
         ExprNode::Send { recv: None, .. } | ExprNode::Super { .. } => true,
@@ -366,6 +369,17 @@ fn destination<'a>(
                 Some(ExprNode::Const { .. }) => MethodReceiver::Class,
                 _ => MethodReceiver::Instance,
             };
+            // Held for the lookup below: the const arm returns a reference
+            // into this value, and the other arms borrow `ty` or the owner.
+            // Before typing, `ty` is empty. The same resolver the body typer
+            // uses names the class; a fragment counter does not.
+            let written_const = match recv.as_ref() {
+                Some(r) if r.ty.is_none() => resolver.and_then(|resolver| match &*r.node {
+                    ExprNode::Const { path } => resolver.namespace(r.span, path).cloned(),
+                    _ => None,
+                }),
+                _ => None,
+            };
             let class = match recv {
                 None => context.map(|(owner, _)| owner),
                 Some(r) if matches!(&*r.node, ExprNode::SelfRef) => context.map(|(owner, _)| owner),
@@ -376,6 +390,7 @@ fn destination<'a>(
                         // Do not admit the base contract for that source name.
                         constant_names_class(r, id).then_some(id)
                     }
+                    (ExprNode::Const { .. }, None) => written_const.as_ref(),
                     (_, Some(Ty::Class { id, .. })) => Some(id),
                     _ => None,
                 },
@@ -415,7 +430,7 @@ fn destination<'a>(
                     owner,
                     &enclosing.name,
                     enclosing.receiver,
-                    &mut HashSet::new(),
+                    &mut HashSet::default(),
                 )
                 .map(|(method, model)| ResolvedDestination {
                     method,
@@ -530,12 +545,12 @@ fn virtual_destinations<'a>(
     let mut candidates = Vec::new();
     for child in
         contracts.virtual_owners.iter().copied().filter(|child| {
-            *child != owner && descends(contracts, child, owner, &mut HashSet::new())
+            *child != owner && descends(contracts, child, owner, &mut HashSet::default())
         })
     {
         // Completeness depends on the descendant's entire reachable lookup
         // chain, including reopened included modules.
-        if !contracts.verified_hierarchy(child, &mut HashSet::new()) {
+        if !contracts.verified_hierarchy(child, &mut HashSet::default()) {
             return Err(
                 "forwarding virtual dispatch through reopened fragments cannot be verified",
             );
@@ -626,7 +641,7 @@ fn keyword_calls_with_index(
                 // scanning receiver provenance and hierarchies for each of
                 // their keyword calls in a large application.
                 if matches!(&*e.node, ExprNode::Super { .. })
-                    && destination(app, contracts, context, e).is_none()
+                    && destination(app, contracts, context, e, None).is_none()
                 {
                     // An absent full selector does not prove that erasing **
                     // matches an external parent's native keyword ABI.
@@ -635,7 +650,7 @@ fn keyword_calls_with_index(
                     KeywordPolicy::Legacy
                 }
             } else {
-                let resolved = destination(app, contracts, context, e);
+                let resolved = destination(app, contracts, context, e, None);
                 if resolved
                     .as_ref()
                     .is_some_and(|d| d.method.params.iter().any(|p| p.forwarding))
@@ -674,7 +689,7 @@ fn keyword_calls_with_index(
         e.node
             .for_each_child(&mut |c| visit(app, contracts, context, c, plans, fallback));
     }
-    let mut plans = HashMap::new();
+    let mut plans = HashMap::default();
     for (owner, method) in methods(app).chain(actions.iter().map(|(c, m)| (c, m))) {
         visit(
             app,
@@ -741,19 +756,48 @@ fn has_source_packet(args: &[Expr]) -> bool {
     })
 }
 
+/// A constant's written name: `::Shop::Refund` is `Shop::Refund` (the leading
+/// `::` is an empty first segment, not part of the name).
+fn constant_spelling(expr: &Expr) -> Option<String> {
+    let ExprNode::Const { path } = &*expr.node else {
+        return None;
+    };
+    Some(
+        path.iter()
+            .map(|p| p.as_str())
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join("::"),
+    )
+}
+
+/// Whether a constant spells `class` or a `::`-suffix of it: its written
+/// name (`constant_spelling`) is the whole class name, or what follows a
+/// `::` in it. Matched from the end, so nothing is built per class asked.
 fn constant_names_class(expr: &Expr, class: &ClassId) -> bool {
     let ExprNode::Const { path } = &*expr.node else {
         return false;
     };
-    // `::Shop::Refund` names `Shop::Refund`: the leading `::` is an empty
-    // first segment, not part of the name.
-    let spelling = path
+    let mut rest = class.0.as_str();
+    let mut segments = path
         .iter()
         .map(|p| p.as_str())
         .filter(|p| !p.is_empty())
-        .collect::<Vec<_>>()
-        .join("::");
-    class.0.as_str() == spelling || class.0.as_str().ends_with(&format!("::{spelling}"))
+        .rev()
+        .peekable();
+    while let Some(segment) = segments.next() {
+        let Some(before) = rest.strip_suffix(segment) else {
+            return false;
+        };
+        rest = before;
+        if segments.peek().is_some() {
+            let Some(before) = rest.strip_suffix("::") else {
+                return false;
+            };
+            rest = before;
+        }
+    }
+    rest.is_empty() || rest.ends_with("::")
 }
 
 /// Narrow source-side provenance: a built-in constructor, or its single
@@ -782,7 +826,7 @@ fn constructed_instance(
                     class,
                     &Symbol::from("new"),
                     MethodReceiver::Class,
-                    &mut HashSet::new(),
+                    &mut HashSet::default(),
                 )
                 .is_none()
     };
@@ -840,7 +884,19 @@ struct SourceContractIndex<'a> {
     modules: HashSet<ClassId>,
     data_factories: HashSet<ClassId>,
     unmodeled_constructor_lookup: HashSet<ClassId>,
-    fragments: HashMap<ClassId, usize>,
+    /// The owners whose class-side `new` itself may be replaced: the part
+    /// of `unmodeled_constructor_lookup` an own `initialize` cannot
+    /// shadow (`constructor::index_unmodeled_lookup_mutations`).
+    unmodeled_new_lookup: HashSet<ClassId>,
+    /// Owners whose own plain `initialize` shadows any a mixin supplies
+    /// (`constructor::shadows_supplied_initialize`).
+    shadowing_initializers: HashSet<ClassId>,
+    /// Owners a fragment declares a method of again, or whose mixins more than one fragment adds.
+    redefined: HashSet<ClassId>,
+    including_fragments: HashMap<ClassId, usize>,
+    /// The fragment being read for each owner, and the one each method was declared in.
+    current_fragment: HashMap<ClassId, usize>,
+    declared_in: HashMap<(ClassId, Symbol, bool), usize>,
     instance: HashMap<(ClassId, Symbol), (&'a MethodDef, bool)>,
     class: HashMap<(ClassId, Symbol), (&'a MethodDef, bool)>,
     virtual_owners: Vec<&'a ClassId>,
@@ -852,6 +908,18 @@ struct SourceContractIndex<'a> {
     unretained_models: HashSet<(Span, ClassId)>,
 }
 
+/// Whether a branch of `defs` (or of a conditional nested in it) defines `initialize` or `self.new`.
+fn conditionally_constructs(defs: &crate::dialect::ConditionalDefinitions) -> bool {
+    defs.arms.iter().any(|arm| {
+        arm.methods.iter().any(|m| {
+            matches!(
+                (m.name.as_str(), m.receiver),
+                ("initialize", MethodReceiver::Instance) | ("new", MethodReceiver::Class)
+            )
+        }) || arm.nested.iter().any(conditionally_constructs)
+    })
+}
+
 impl<'a> SourceContractIndex<'a> {
     /// Build source lookup and collect only selectors that need preservation
     /// checks: full forwarders and declarations reached by source argument
@@ -859,20 +927,25 @@ impl<'a> SourceContractIndex<'a> {
     /// inherited contracts selected through sends or explicit packet `super`.
     fn new(app: &'a App, actions: &'a [(ClassId, MethodDef)]) -> Self {
         let mut index = Self {
-            parents: HashMap::new(),
-            includes: HashMap::new(),
-            modules: HashSet::new(),
-            data_factories: HashSet::new(),
-            unmodeled_constructor_lookup: HashSet::new(),
-            fragments: HashMap::new(),
-            instance: HashMap::new(),
-            class: HashMap::new(),
+            parents: HashMap::default(),
+            includes: HashMap::default(),
+            modules: HashSet::default(),
+            data_factories: HashSet::default(),
+            unmodeled_constructor_lookup: HashSet::default(),
+            unmodeled_new_lookup: HashSet::default(),
+            shadowing_initializers: HashSet::default(),
+            redefined: HashSet::default(),
+            including_fragments: HashMap::default(),
+            current_fragment: HashMap::default(),
+            declared_in: HashMap::default(),
+            instance: HashMap::default(),
+            class: HashMap::default(),
             virtual_owners: Vec::new(),
-            full_selectors: HashSet::new(),
-            unretained: HashSet::new(),
-            unretained_models: HashSet::new(),
+            full_selectors: HashSet::default(),
+            unretained: HashSet::default(),
+            unretained_models: HashSet::default(),
         };
-        let mut class_owners = HashSet::new();
+        let mut class_owners = HashSet::default();
         for class in classes(app) {
             class_owners.insert(class.name.clone());
             if class.is_module {
@@ -887,9 +960,19 @@ impl<'a> SourceContractIndex<'a> {
                 class.includes.iter().cloned(),
             );
             index.add_methods(&class.name, class.methods.iter(), false);
+            // Not one branch's contract for all: a constructor a load-time conditional defines differs by which branch ran.
+            if class.conditional_definitions.iter().any(conditionally_constructs) {
+                index.redefined.insert(class.name.clone());
+            }
             index.virtual_owners.push(&class.name);
         }
+        // Not verified when two kinds of source declare one owner (a model and a library class): which file the emit writes last decides the constructor.
+        let mut kinds: HashMap<ClassId, usize> = HashMap::default();
+        for name in &class_owners {
+            *kinds.entry(name.clone()).or_default() += 1;
+        }
         for model in &app.models {
+            *kinds.entry(model.name.clone()).or_default() += 1;
             index.add_fragment(
                 &model.name,
                 model.parent.as_ref(),
@@ -901,6 +984,7 @@ impl<'a> SourceContractIndex<'a> {
             index.virtual_owners.push(&model.name);
         }
         for module in &app.test_modules {
+            *kinds.entry(module.name.clone()).or_default() += 1;
             index.add_fragment(
                 &module.name,
                 module.parent.as_ref(),
@@ -915,7 +999,13 @@ impl<'a> SourceContractIndex<'a> {
         // Controllers' spliced concern methods are already among their
         // actions, so the includes add nothing a lookup could find.
         for controller in &app.controllers {
+            *kinds.entry(controller.name.clone()).or_default() += 1;
             index.add_fragment(&controller.name, controller.parent.as_ref(), std::iter::empty());
+        }
+        for (owner, n) in kinds {
+            if n > 1 {
+                index.redefined.insert(owner);
+            }
         }
         for (owner, method) in actions {
             index.add_methods(owner, std::iter::once(method), false);
@@ -968,7 +1058,7 @@ impl<'a> SourceContractIndex<'a> {
                     for name in &names {
                         for receiver in [MethodReceiver::Instance, MethodReceiver::Class] {
                             if let Some((method, _)) =
-                                index.declaration(&model.name, name, receiver, &mut HashSet::new())
+                                index.declaration(&model.name, name, receiver, &mut HashSet::default())
                             {
                                 selected.push(method);
                             }
@@ -991,9 +1081,13 @@ impl<'a> SourceContractIndex<'a> {
         parent: Option<&'a ClassId>,
         includes: impl Iterator<Item = ClassId>,
     ) {
-        *self.fragments.entry(owner.clone()).or_default() += 1;
+        *self.current_fragment.entry(owner.clone()).or_default() += 1;
         if let Some(parent) = parent {
             self.parents.entry(owner.clone()).or_insert(parent);
+        }
+        let includes: Vec<ClassId> = includes.collect();
+        if !includes.is_empty() {
+            *self.including_fragments.entry(owner.clone()).or_default() += 1;
         }
         self.includes
             .entry(owner.clone())
@@ -1013,7 +1107,21 @@ impl<'a> SourceContractIndex<'a> {
                 MethodReceiver::Class => &mut self.class,
             };
             declarations.insert((owner.clone(), method.name.clone()), (method, model));
+            // Not a redefinition within one class body: Ruby keeps the last, whatever loads first.
+            let fragment = self.current_fragment.get(owner).copied().unwrap_or(0);
+            let key = (owner.clone(), method.name.clone(), method.receiver == MethodReceiver::Class);
+            if self.declared_in.insert(key, fragment).is_some_and(|prev| prev != fragment) {
+                self.redefined.insert(owner.clone());
+            }
         }
+    }
+
+    /// A second source fragment can replace the keyword contract the
+    /// first fragment declared. Anonymous packets have no keys to
+    /// re-bind, so a reopened owner stays refused.
+    // Not every second fragment: rotp's `class OTP; class URI` only nests a class, and replaces nothing whichever file loads first.
+    fn reopened(&self, owner: &ClassId) -> bool {
+        self.redefined.contains(owner) || self.including_fragments.get(owner).copied().unwrap_or(0) > 1
     }
 
     fn parent(&self, owner: &ClassId) -> Option<&'a ClassId> {
@@ -1071,14 +1179,14 @@ impl<'a> SourceContractIndex<'a> {
                 .parent(owner)
                 .and_then(|parent| reaches(index, parent, selector, span, receiver, seen))
         }
-        reaches(self, owner, selector, span, receiver, &mut HashSet::new()).unwrap_or(false)
+        reaches(self, owner, selector, span, receiver, &mut HashSet::default()).unwrap_or(false)
     }
 
     fn verified_hierarchy(&self, owner: &ClassId, seen: &mut HashSet<ClassId>) -> bool {
         if !seen.insert(owner.clone()) {
             return true;
         }
-        (self.fragments.get(owner).copied().unwrap_or(0) <= 1 || self.modules.contains(owner))
+        (!self.reopened(owner) || self.modules.contains(owner))
             && self
                 .parent(owner)
                 .is_none_or(|parent| self.verified_hierarchy(parent, seen))
@@ -1095,7 +1203,7 @@ impl<'a> SourceContractIndex<'a> {
         receiver: MethodReceiver,
         seen: &mut HashSet<ClassId>,
     ) -> Option<(&'a MethodDef, bool)> {
-        if !self.verified_hierarchy(owner, &mut HashSet::new()) || !seen.insert(owner.clone()) {
+        if !self.verified_hierarchy(owner, &mut HashSet::default()) || !seen.insert(owner.clone()) {
             return None;
         }
         let declarations = match receiver {
@@ -1136,7 +1244,7 @@ impl<'a> SourceContractIndex<'a> {
         name: &Symbol,
         receiver: MethodReceiver,
     ) -> Option<(&'a MethodDef, bool)> {
-        self.declaration(owner, name, receiver, &mut HashSet::new())
+        self.declaration(owner, name, receiver, &mut HashSet::default())
             .or_else(|| {
                 (name.as_str() == "new" && receiver == MethodReceiver::Class
                     && !self.data_factories.contains(owner))
@@ -1145,7 +1253,7 @@ impl<'a> SourceContractIndex<'a> {
                             owner,
                             &Symbol::from("initialize"),
                             MethodReceiver::Instance,
-                            &mut HashSet::new(),
+                            &mut HashSet::default(),
                         )
                     })
                     .flatten()

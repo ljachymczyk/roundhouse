@@ -28,6 +28,7 @@
 //!   cross-target-safe. Each target's test_helper handles them; Ruby's
 //!   TestBase provides both.)
 //!   - `assert_predicate o, :sym`       → `raise "…" if !o.sym` (sym from Symbol literal)
+//!   - `flunk msg`                      → `raise msg` (Minitest's "Epic Fail!" without one)
 //!   - `assert_difference("X.m"[, d]) { body }` → before/after capture
 //!   - `assert_no_difference("X.m") { body }`   → same, delta 0
 //!
@@ -175,6 +176,17 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
         "assert" if !args.is_empty() => {
             let cond = args[0].clone();
             Some(raise_if(span, not_expr(span, cond), "assertion failed".to_string()))
+        }
+        // `flunk(msg = "Epic Fail!")`: an unconditional failure carrying
+        // the test's own message, which is the whole point of the call
+        // (`flunk("@args instance variable is not defined")`). Typed by
+        // the harness signatures and defined by no harness, it used to
+        // pass `check` and die as `undefined method 'flunk'`.
+        "flunk" if args.len() <= 1 => {
+            let msg = args.first().cloned().unwrap_or_else(|| {
+                Expr::new(span, ExprNode::Lit { value: Literal::Str { value: "Epic Fail!".into() } })
+            });
+            Some(Expr::new(span, ExprNode::Raise { value: msg }))
         }
         "assert_not" | "refute" if !args.is_empty() => {
             let cond = args[0].clone();
@@ -596,11 +608,14 @@ fn lower_difference(
     if args.is_empty() {
         return None;
     }
-    let ExprNode::Lit { value: Literal::Str { value: expr_str } } = &*args[0].node else {
-        return None;
-    };
-    let probe = parse_const_dot_method(expr_str, span)?;
-    let delta: i64 = if method == "assert_no_difference" {
+    // Rails' first argument is one expression, an Array of them, or a
+    // Hash of expression => difference (activesupport 8.1.4); an
+    // expression is a `"Const.method"` String or a lambda. Each is
+    // checked on its own, with the shared difference unless the Hash
+    // names one. After a Hash the next argument is the message; after
+    // anything else it is the difference, then the message.
+    let hash_form = method == "assert_difference" && matches!(&*args[0].node, ExprNode::Hash { .. });
+    let default_delta: i64 = if hash_form || method == "assert_no_difference" {
         0
     } else if args.len() >= 2 {
         match &*args[1].node {
@@ -610,6 +625,41 @@ fn lower_difference(
     } else {
         1
     };
+    let probe_of = |e: &Expr| -> Option<(Expr, String)> {
+        match &*e.node {
+            ExprNode::Lit { value: Literal::Str { value } } => {
+                Some((parse_const_dot_method(value, span)?, value.clone()))
+            }
+            ExprNode::Lambda { params, body, .. } if params.is_empty() => {
+                Some((body.clone(), "expression".to_string()))
+            }
+            _ => None,
+        }
+    };
+    let mut probes: Vec<(Expr, String, i64)> = Vec::new();
+    match &*args[0].node {
+        // No expressions (`[]`, or `{}` for `assert_difference`): Rails
+        // runs the block and checks nothing.
+        ExprNode::Array { elements, .. } if elements.is_empty() => {}
+        ExprNode::Hash { entries, .. } if hash_form && entries.is_empty() => {}
+        ExprNode::Array { elements, .. } if !elements.is_empty() => {
+            for el in elements {
+                let (probe, label) = probe_of(el)?;
+                probes.push((probe, label, default_delta));
+            }
+        }
+        ExprNode::Hash { entries, .. } if hash_form && !entries.is_empty() => {
+            for (k, v) in entries {
+                let (probe, label) = probe_of(k)?;
+                let ExprNode::Lit { value: Literal::Int { value } } = &*v.node else { return None };
+                probes.push((probe, label, *value));
+            }
+        }
+        _ => {
+            let (probe, label) = probe_of(&args[0])?;
+            probes.push((probe, label, default_delta));
+        }
+    }
     // Block body — unwrap the Lambda's inner body. If no block given,
     // there's nothing to do between captures; bail and let the typer
     // surface it.
@@ -617,47 +667,62 @@ fn lower_difference(
         Some(ExprNode::Lambda { body, .. }) => body.clone(),
         _ => return None,
     };
+    if probes.is_empty() {
+        return Some(block_body);
+    }
 
-    let before_name = Symbol::from("__diff_before");
-    let after_name = Symbol::from("__diff_after");
-    let before_assign = Expr::new(
-        span,
-        ExprNode::Assign {
-            target: LValue::Var { id: VarId(0), name: before_name.clone() },
-            value: probe.clone(),
-        },
-    );
-    let after_assign = Expr::new(
-        span,
-        ExprNode::Assign {
-            target: LValue::Var { id: VarId(0), name: after_name.clone() },
-            value: probe.clone(),
-        },
-    );
-    let actual_diff = send_method(
-        span,
-        Expr::new(span, ExprNode::Var { id: VarId(0), name: after_name }),
-        "-",
-        vec![Expr::new(span, ExprNode::Var { id: VarId(0), name: before_name })],
-    );
-    let mismatch = send_method(
-        span,
-        actual_diff,
-        "!=",
-        vec![Expr::new(span, ExprNode::Lit { value: Literal::Int { value: delta } })],
-    );
-    let msg = format!("{} didn't change by {}", expr_str, delta);
-    let check = raise_if(span, mismatch, msg);
-
+    // A nested assertion (`assert_difference … do assert_difference …
+    // do … end end`) is lowered first, inside this block: its `__diff_*`
+    // locals are already there, so this one takes a fresh prefix rather
+    // than overwrite them. An unnested one keeps `__diff_`.
+    let mut taken: Vec<String> = Vec::new();
+    fn diff_locals(e: &Expr, out: &mut Vec<String>) {
+        match &*e.node {
+            ExprNode::Var { name, .. } | ExprNode::Assign { target: LValue::Var { name, .. }, .. }
+                if name.as_str().starts_with("__diff") =>
+            {
+                out.push(name.as_str().to_string())
+            }
+            _ => {}
+        }
+        e.node.for_each_child(&mut |c| diff_locals(c, out));
+    }
+    diff_locals(&block_body, &mut taken);
+    let prefix = (1..)
+        .map(|n: usize| if n == 1 { "__diff".to_string() } else { format!("__diff{n}") })
+        .find(|p| !taken.iter().any(|t| t.starts_with(&format!("{p}_"))))
+        .unwrap();
+    let name = |kind: &str, i: usize| {
+        if probes.len() == 1 { Symbol::from(format!("{prefix}_{kind}")) } else { Symbol::from(format!("{prefix}_{kind}_{i}")) }
+    };
+    let var = |n: Symbol| Expr::new(span, ExprNode::Var { id: VarId(0), name: n });
+    let assign = |n: Symbol, value: Expr| {
+        Expr::new(span, ExprNode::Assign { target: LValue::Var { id: VarId(0), name: n }, value })
+    };
+    let mut stmts: Vec<Expr> = probes
+        .iter()
+        .enumerate()
+        .map(|(i, (probe, _, _))| assign(name("before", i), probe.clone()))
+        .collect();
     // Inline block body — flatten if it's already a Seq so the
     // outer Seq stays single-level.
-    let mut stmts: Vec<Expr> = vec![before_assign];
     match &*block_body.node {
         ExprNode::Seq { exprs } => stmts.extend(exprs.iter().cloned()),
         _ => stmts.push(block_body.clone()),
     }
-    stmts.push(after_assign);
-    stmts.push(check);
+    for (i, (probe, _, _)) in probes.iter().enumerate() {
+        stmts.push(assign(name("after", i), probe.clone()));
+    }
+    for (i, (_, label, delta)) in probes.iter().enumerate() {
+        let actual_diff = send_method(span, var(name("after", i)), "-", vec![var(name("before", i))]);
+        let mismatch = send_method(
+            span,
+            actual_diff,
+            "!=",
+            vec![Expr::new(span, ExprNode::Lit { value: Literal::Int { value: *delta } })],
+        );
+        stmts.push(raise_if(span, mismatch, format!("{label} didn't change by {delta}")));
+    }
     Some(Expr::new(span, ExprNode::Seq { exprs: stmts }))
 }
 
@@ -840,7 +905,7 @@ mod array_literal_tests {
 
     #[test]
     fn a_scalar_actual_is_left_alone() {
-        let actual = call(var("message"), "ids", Some(crate::ty::Ty::Array { elem: Box::new(crate::ty::Ty::Int) }));
+        let actual = call(var("message"), "ids", Some(crate::ty::Ty::Array { elem: std::sync::Arc::new(crate::ty::Ty::Int) }));
         let out = materialised_for_array_literal(&arr(vec![var("one")]), actual);
         assert_eq!(method_of(&out), "to_a", "an Array-typed call is still asked: `Array#to_a` is identity, and the analyzer's Array is sometimes a relation");
         let actual = call(var("message"), "title", Some(crate::ty::Ty::Nil));
@@ -849,7 +914,7 @@ mod array_literal_tests {
         let out = materialised_for_array_literal(&var("expected"), call(var("m"), "mentionees", None));
         assert_eq!(method_of(&out), "mentionees", "an expected side of unknown type is left alone");
         let mut typed = var("messages");
-        typed.ty = Some(crate::ty::Ty::Array { elem: Box::new(crate::ty::Ty::Untyped) });
+        typed.ty = Some(crate::ty::Ty::Array { elem: std::sync::Arc::new(crate::ty::Ty::Untyped) });
         let out = materialised_for_array_literal(&typed, call(var("m"), "search", None));
         assert_eq!(method_of(&out), "to_a", "a local the typer knows holds an Array counts as the literal does");
     }

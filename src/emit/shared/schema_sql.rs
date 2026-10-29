@@ -18,7 +18,7 @@
 use std::fmt::Write;
 
 use crate::schema::{
-    Column, ColumnType, ForeignKey, GeneratedColumnStorage, Index, MigrationStep, ReferentialAction, Schema, Table,
+    Column, ColumnType, ForeignKey, GeneratedColumnStorage, Index, MigrationStep, Schema, Table,
 };
 
 /// The SQL engine a schema renders for: how it spells identifiers,
@@ -34,7 +34,56 @@ pub enum Dialect {
     Postgres,
 }
 
+thread_local! {
+    static CURRENT: std::cell::Cell<Dialect> = const { std::cell::Cell::new(Dialect::Sqlite) };
+}
+
 impl Dialect {
+    /// The dialect the emit in progress writes SQL in: SQLite unless a
+    /// target that runs the app's own database chose another for the
+    /// duration of its emit ([`Dialect::scope`]).
+    pub fn current() -> Dialect {
+        CURRENT.with(|current| current.get())
+    }
+
+    /// Run `f` with SQL lowered and rendered in this dialect, restoring
+    /// the previous one after, also when `f` unwinds.
+    pub fn scope<R>(self, f: impl FnOnce() -> R) -> R {
+        struct Restore(Dialect);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CURRENT.with(|current| current.set(self.0));
+            }
+        }
+        let _restore = Restore(CURRENT.with(|current| current.replace(self)));
+        f()
+    }
+
+    /// The dialect the Ruby target's emit runs an app's database in: the
+    /// adapter of the primary `config/database.yml` configures for the
+    /// environment the emitted tests run in (`test`, else the first
+    /// environment with a primary). PostgreSQL when that is postgresql,
+    /// SQLite otherwise, as before the file was read.
+    pub fn for_app(app: &crate::App) -> Dialect {
+        let primary = app.databases.iter().filter(|d| d.primary);
+        let chosen = primary.clone().find(|d| d.env == "test").or_else(|| primary.clone().next());
+        match chosen.map(|d| &d.adapter) {
+            Some(crate::database::DatabaseAdapter::Postgresql) => Dialect::Postgres,
+            _ => Dialect::Sqlite,
+        }
+    }
+
+    /// A literal boolean: SQLite stores 1/0; PostgreSQL's boolean takes
+    /// no integer.
+    pub fn boolean(self, value: bool) -> &'static str {
+        match (self, value) {
+            (Dialect::Sqlite, true) => "1",
+            (Dialect::Sqlite, false) => "0",
+            (Dialect::Postgres, true) => "TRUE",
+            (Dialect::Postgres, false) => "FALSE",
+        }
+    }
+
     /// One physical identifier, preserving its spelling.
     ///
     /// SQLite keeps ordinary names bare (`naming::sql_ident`). Postgres
@@ -90,13 +139,17 @@ impl Dialect {
     /// `INSERT` — which in Rails get the DATABASE's default. (A record
     /// gets the same value from the model layer either way.) Only the
     /// unambiguous literal kinds render: a number on a numeric column, a
-    /// boolean, a string on a string column. Anything else — a date, a
-    /// JSON or binary value, a default ingest could not read — is left to
+    /// boolean, a string on a string column, or serialized JSON. Anything
+    /// else — a date or binary value, a default ingest could not read — is left to
     /// the model layer, as before.
     fn column_default(self, col: &Column) -> Option<String> {
-        let raw = col.default.as_deref()?;
+        let raw = col.stored_default()?;
         if col.generated.is_some() {
             return None;
+        }
+        if col.array_stored {
+            // `default: []`, the only array default ingest keeps.
+            return Some(format!("'{}'", raw.replace('\'', "''")));
         }
         match &col.col_type {
             ColumnType::Integer | ColumnType::BigInt => {
@@ -114,6 +167,10 @@ impl Dialect {
             },
             ColumnType::String { .. } | ColumnType::Text => {
                 Some(format!("'{}'", raw.replace('\'', "''")))
+            }
+            ColumnType::Json | ColumnType::Jsonb => {
+                serde_json::from_str::<serde_json::Value>(raw).ok()
+                    .map(|_| format!("'{}'", raw.replace('\'', "''")))
             }
             _ => None,
         }
@@ -162,12 +219,16 @@ impl Dialect {
 /// existing callers; an invalid generated-column schema reports an
 /// Unsupported diagnostic and returns no partial DDL.
 pub fn render_schema_statements(schema: &Schema) -> Vec<String> {
-    match render_schema_statements_for(schema, Dialect::Sqlite) {
+    let dialect = Dialect::current();
+    match render_schema_statements_for(schema, dialect) {
         Ok(statements) => statements,
         Err(error) => {
             let _ = crate::emit::diagnostics::report_unsupported(
                 crate::span::Span::synthetic(),
-                "sqlite",
+                match dialect {
+                    Dialect::Sqlite => "sqlite",
+                    Dialect::Postgres => "postgresql",
+                },
                 "generated schema",
                 error,
             );
@@ -188,7 +249,14 @@ pub fn render_schema_statements_for(schema: &Schema, dialect: Dialect) -> Result
     validate_schema_for_dialect(schema, dialect)?;
     let mut out: Vec<String> = Vec::new();
     for (_name, table) in &schema.tables {
-        out.push(create_table_sql(table, dialect, true, false)?);
+        // Not on PostgreSQL yet: Rails adds its constraints with ALTER TABLE, and the fixture loader there must disable triggers to load out of order.
+        if dialect == Dialect::Sqlite {
+            let mut loaded = table.clone();
+            loaded.foreign_keys.retain(|fk| schema.tables.contains_key(&fk.to_table.0));
+            out.push(create_table_sql(&loaded, dialect, true, true)?);
+        } else {
+            out.push(create_table_sql(table, dialect, true, false)?);
+        }
     }
     for (_name, table) in &schema.tables {
         for idx in &table.indexes {
@@ -202,8 +270,8 @@ pub fn render_schema_statements_for(schema: &Schema, dialect: Dialect) -> Result
 /// (idempotent at boot); a migration's `create_table` leaves it off, so
 /// creating a table that exists fails as it does under Rails.
 /// `foreign_keys` writes the table's FOREIGN KEY clauses, as Rails' SQLite
-/// adapter creates them: a migration keeps them, the schema load does not
-/// (unchanged from before migrations were rendered).
+/// adapter creates them. The SQLite schema load passes only the keys whose
+/// table the schema has.
 pub fn create_table_sql(table: &Table, dialect: Dialect, if_not_exists: bool, foreign_keys: bool) -> Result<String, String> {
     let ine = if if_not_exists { "IF NOT EXISTS " } else { "" };
     // A virtual table is built by its MODULE, not from a column
@@ -249,7 +317,14 @@ pub fn create_table_sql(table: &Table, dialect: Dialect, if_not_exists: bool, fo
 
 /// A non-key column as it appears in CREATE TABLE and `ADD COLUMN`.
 pub fn column_definition_sql(col: &Column, dialect: Dialect) -> String {
-    let mut line = format!("{} {}", dialect.ident(col.name.as_str()), dialect.column_type(&col.col_type));
+    // A stored array column holds the Array as JSON text
+    // (`lower::array_columns`).
+    let col_type = if col.array_stored {
+        dialect.column_type(&ColumnType::Text)
+    } else {
+        dialect.column_type(&col.col_type)
+    };
+    let mut line = format!("{} {}", dialect.ident(col.name.as_str()), col_type);
     if let Some(generated) = &col.generated {
         line.push_str(" GENERATED ALWAYS AS (");
         line.push_str(&generated.expression);
@@ -278,22 +353,23 @@ fn foreign_key_sql(fk: &ForeignKey, dialect: Dialect) -> String {
         dialect.ident(fk.to_table.0.as_str()),
         dialect.ident(fk.to_column.as_str())
     );
-    let action = |a: &ReferentialAction| match a {
-        ReferentialAction::NoAction => None,
-        ReferentialAction::Restrict => Some("RESTRICT"),
-        ReferentialAction::Cascade => Some("CASCADE"),
-        ReferentialAction::SetNull => Some("SET NULL"),
-        ReferentialAction::SetDefault => Some("SET DEFAULT"),
-    };
-    if let Some(a) = action(&fk.on_delete) {
-        s.push_str(" ON DELETE ");
-        s.push_str(a);
-    }
-    if let Some(a) = action(&fk.on_update) {
-        s.push_str(" ON UPDATE ");
-        s.push_str(a);
+    for (verb, action) in [("DELETE", &fk.on_delete), ("UPDATE", &fk.on_update)] {
+        if let Some(sql) = referential_action_sql(action) {
+            s.push_str(&format!(" ON {verb} {sql}"));
+        }
     }
     s
+}
+
+fn referential_action_sql(action: &crate::schema::ReferentialAction) -> Option<&'static str> {
+    use crate::schema::ReferentialAction::*;
+    match action {
+        NoAction => None,
+        Restrict => Some("RESTRICT"),
+        Cascade => Some("CASCADE"),
+        SetNull => Some("SET NULL"),
+        SetDefault => Some("SET DEFAULT"),
+    }
 }
 
 /// One index's CREATE statement.
@@ -552,7 +628,7 @@ fn is_integer(ct: &ColumnType) -> bool {
 /// through both stacks.
 fn sqlite_type(ct: &ColumnType) -> &'static str {
     match ct {
-        ColumnType::Integer | ColumnType::BigInt => "INTEGER",
+        ColumnType::Integer | ColumnType::BigInt | ColumnType::Interval => "INTEGER",
         ColumnType::Float | ColumnType::Decimal { .. } => "REAL",
         ColumnType::Boolean => "INTEGER",
         ColumnType::Binary => "BLOB",
@@ -596,6 +672,7 @@ fn postgres_type(ct: &ColumnType) -> String {
         ColumnType::Json => "json".into(),
         ColumnType::Jsonb => "jsonb".into(),
         ColumnType::Uuid => "uuid".into(),
+        ColumnType::Interval => "interval".into(),
     }
 }
 
@@ -622,11 +699,13 @@ mod tests {
             generated: None,
             generated_text_compatible: None,
             generated_int4_compatible: None,
+            array: false,
+            array_stored: false,
         }
     }
 
     fn table(name: &str, columns: Vec<Column>, indexes: Vec<Index>) -> Table {
-        Table { name: Symbol::from(name), columns, indexes, foreign_keys: Vec::new(), virtual_module: None }
+        Table { name: Symbol::from(name), columns, indexes, foreign_keys: Vec::new(), virtual_module: None, known_keyless: false }
     }
 
     fn schema_of(tables: Vec<Table>) -> Schema {
@@ -945,6 +1024,7 @@ end
             (ColumnType::Json, "json"),
             (ColumnType::Jsonb, "jsonb"),
             (ColumnType::Uuid, "uuid"),
+            (ColumnType::Interval, "interval"),
             // Not something Rails emits (it rejects a scale without a
             // precision): the scale is dropped rather than a precision
             // invented.

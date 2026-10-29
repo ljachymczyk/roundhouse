@@ -61,11 +61,17 @@ pub fn real_blog() -> Overlay {
     Overlay { base: roundhouse::fixtures::real_blog().to_path_buf(), scratch_base: false, edits: Vec::new() }
 }
 
+/// Start from `fixtures/tiny-blog-uuid`: `posts.id` a uuid and
+/// `comments.post_id` a uuid foreign key.
+pub fn tiny_blog_uuid() -> Overlay {
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/tiny-blog-uuid");
+    Overlay { base, scratch_base: false, edits: Vec::new() }
+}
+
 /// Start from an empty tree and `write` the app file by file, for a
 /// shape the blog cannot be edited into, such as an app with no views.
 pub fn empty_app() -> Overlay {
     let base = scratch_dir();
-    std::fs::create_dir_all(&base).expect("mkdir");
     Overlay { base, scratch_base: true, edits: Vec::new() }
 }
 
@@ -77,7 +83,7 @@ pub struct Overlay {
 }
 
 enum Edit {
-    Write { path: String, content: String },
+    Write { path: String, content: Vec<u8> },
     Replace { path: String, find: String, replace: String },
     Remove { path: String },
 }
@@ -85,7 +91,14 @@ enum Edit {
 impl Overlay {
     /// Add a file, or replace one outright.
     pub fn write(mut self, path: &str, content: &str) -> Self {
-        self.edits.push(Edit::Write { path: path.into(), content: content.into() });
+        self.edits.push(Edit::Write { path: path.into(), content: content.as_bytes().to_vec() });
+        self
+    }
+
+    /// `write` for content that is not UTF-8, such as an image under
+    /// `public/`: ingest carries it as a binary asset, not source.
+    pub fn write_bytes(mut self, path: &str, content: &[u8]) -> Self {
+        self.edits.push(Edit::Write { path: path.into(), content: content.to_vec() });
         self
     }
 
@@ -125,13 +138,24 @@ impl Overlay {
         self.run_test_with(&["--enable-frozen-string-literal"], test_path)
     }
 
+    /// `run_test` with more environment for the process, such as the
+    /// `DATABASE_URL` of an app whose database is PostgreSQL.
+    pub fn run_test_env(self, test_path: &str, env: &[(&str, &str)]) -> Run {
+        self.run_test_with_env(&["--enable-frozen-string-literal"], test_path, env)
+    }
+
     fn run_test_with(self, flags: &[&str], test_path: &str) -> Run {
+        self.run_test_with_env(flags, test_path, &[])
+    }
+
+    fn run_test_with_env(self, flags: &[&str], test_path: &str, env: &[(&str, &str)]) -> Run {
         let (emitted, errors) = self.emit_tree(BuildTarget::Ruby);
         let output = ruby()
             .args(flags)
             .args(["-Itest", "-I."])
             .arg(test_path)
             .current_dir(&emitted)
+            .envs(env.iter().copied())
             .output()
             .expect("spawn ruby");
         let command: Vec<&str> =
@@ -143,6 +167,12 @@ impl Overlay {
     /// required and the default adapter configured on an in-memory
     /// database before the script's first line.
     pub fn run_ruby(self, script: &str) -> Run {
+        self.run_ruby_env(script, &[])
+    }
+
+    /// [`Overlay::run_ruby`] with more environment for the process, such
+    /// as `RUBYLIB` naming a gem the emitted tree loads natively.
+    pub fn run_ruby_env(self, script: &str, env: &[(&str, &str)]) -> Run {
         let (emitted, errors) = self.emit_tree(BuildTarget::Ruby);
         // `ruby -e` reads its script in the locale's encoding, so under
         // `LANG=C` any non-ASCII literal is a syntax error. The magic
@@ -155,6 +185,7 @@ impl Overlay {
             .arg(&script)
             .current_dir(&emitted)
             .env("BLOG_DB", ":memory:")
+            .envs(env.iter().copied())
             .output()
             .expect("spawn ruby");
         Run::new("ruby -e <script>".into(), emitted, errors, output)
@@ -164,6 +195,21 @@ impl Overlay {
     /// The consumer boots libraries, not the HTTP server or a database.
     pub fn run_spinel(self, script: &str) -> Run {
         self.run_spinel_with_flags(script, &[])
+    }
+
+    /// `run_spinel` with a database: before the script's first line,
+    /// configure an in-memory SQLite database and load the schema with the
+    /// harness-standard boot (`Db.configure` / `Db.exec` / assign adapter),
+    /// matching emitted `test/test_helper.rb` and the BOOT pastes in sibling
+    /// Spinel suites. Plain `run_spinel` boots libraries only, so any query
+    /// there reads an unconfigured adapter. (CRuby `run_ruby` instead calls
+    /// `Main.configure_default_adapter!`, which uses the SqliteAdapter
+    /// spelling; Spinel contract consumers do not load `main.rb`.)
+    pub fn run_spinel_with_db(self, script: &str) -> Run {
+        let script = format!(
+            "Db.configure(\":memory:\")\nSchema.statements.each {{ |sql| Db.exec(sql) }}\nActiveRecord.adapter = SqliteAdapter\n{script}"
+        );
+        self.run_spinel_with_flags(&script, &[])
     }
 
     /// Also enforce the emitted sidecars, as the shipped Makefile does.
@@ -215,7 +261,8 @@ impl Overlay {
         (emitted, errors)
     }
 
-    fn emit_app_tree(self, target: BuildTarget) -> (PathBuf, roundhouse::App, Vec<Diagnostic>) {
+    /// Copy the fixture and apply the edits: the scratch dir and the app in it.
+    fn materialize(self) -> (PathBuf, PathBuf) {
         let scratch = scratch_dir();
         let source = scratch.join("app");
         copy_tree(&self.base, &source);
@@ -248,10 +295,44 @@ impl Overlay {
             }
         }
 
-        let mut app = ingest_app(&source).expect("ingest the overlaid fixture");
-        let lower_diags = roundhouse::session::analyze_and_lower(&mut app);
-        let mut errors: Vec<_> = diagnose(&app)
+        (scratch, source)
+    }
+
+    /// The errors `roundhouse check` reports for the overlaid app: analysis
+    /// alone, with no lowering, so a call the lowering would answer still
+    /// reads as written.
+    pub fn check_errors(self) -> Vec<String> {
+        let (scratch, source) = self.materialize();
+        let (app, ingest_diags) = roundhouse::ingest::prism::scope(|| ingest_app(&source));
+        let mut app = app.expect("ingest the overlaid fixture");
+        roundhouse::analyze::Analyzer::new(&app).analyze(&mut app);
+        let errors = ingest_diags
             .into_iter()
+            .chain(diagnose(&app))
+            .filter(|d| d.severity == Severity::Error)
+            .map(|d| format!("{:?}: {}", d.span, d.message))
+            .collect();
+        let _ = std::fs::remove_dir_all(&scratch);
+        errors
+    }
+
+    /// The warnings ingesting the overlaid app reports.
+    pub fn ingest_warnings(self) -> Vec<String> {
+        let (scratch, source) = self.materialize();
+        let (_app, diags) = roundhouse::ingest::prism::scope(|| ingest_app(&source).expect("ingest the overlaid fixture"));
+        let _ = std::fs::remove_dir_all(&scratch);
+        diags.into_iter().filter(|d| d.severity == Severity::Warning).map(|d| d.message).collect()
+    }
+
+    fn emit_app_tree(self, target: BuildTarget) -> (PathBuf, roundhouse::App, Vec<Diagnostic>) {
+        let (scratch, source) = self.materialize();
+        // As the CLI does: an error ingest reports gates the emit too.
+        let (app, ingest_diags) = roundhouse::ingest::prism::scope(|| ingest_app(&source));
+        let mut app = app.expect("ingest the overlaid fixture");
+        let lower_diags = roundhouse::session::analyze_and_lower_for(&mut app, target);
+        let mut errors: Vec<_> = ingest_diags
+            .into_iter()
+            .chain(diagnose(&app))
             .chain(lower_diags)
             .filter(|d| d.severity == Severity::Error)
             .collect();
@@ -261,13 +342,37 @@ impl Overlay {
             roundhouse::project::target_files(&app, &source, target)
         });
         errors.extend(emit_diags.into_iter().filter(|d| d.severity == Severity::Error));
-        let files = files.expect("target files");
+        let files = match files {
+            Ok(files) => files,
+            // A refusal of the whole target (`gems::extension_gem_refusals`)
+            // is also reported as error diagnostics, whose messages the
+            // refusal joins with newlines: the tree is empty, a run in it
+            // fails, and the caller's assertions read `errors`. A refusal
+            // no run of diagnostics carries still panics.
+            Err(message) if refusal_is_carried_by(&message, &errors) => {
+                std::fs::create_dir_all(&emitted).expect("mkdir emitted");
+                return (emitted, app, errors);
+            }
+            Err(message) => panic!("target files: {message:?}"),
+        };
         roundhouse::project::write_to_dir(&files, &emitted).expect("write ruby target tree");
+        // The verbatim copy of binary assets the CLI writes after the tree.
+        roundhouse::project::write_binary_assets(&app.binary_assets, &files, &emitted)
+            .expect("write binary assets");
         (emitted, app, errors)
     }
 }
 
 /// What one emit-and-run produced.
+/// Whether `message` is the messages of a run of consecutive `errors`
+/// joined with newlines, as `project::target_files` reports a refusal. A
+/// message may hold newlines of its own (a YAML block scalar's reason), so
+/// the refusal is not split into lines.
+fn refusal_is_carried_by(message: &str, errors: &[Diagnostic]) -> bool {
+    let messages: Vec<&str> = errors.iter().map(|d| d.message.as_str()).collect();
+    (0..messages.len()).any(|start| (start + 1..=messages.len()).any(|end| messages[start..end].join("\n") == message))
+}
+
 pub struct Run {
     command: String,
     pub emitted: PathBuf,
@@ -371,13 +476,22 @@ pub fn ruby() -> Command {
 /// A fresh directory per run: tests in one binary run in parallel.
 fn scratch_dir() -> PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "roundhouse-emit-and-run-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+    loop {
+        // Resolved, so paths a child Ruby reports (`__dir__` is a realpath)
+        // match on macOS, where $TMPDIR sits under /var -> /private/var.
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "roundhouse-emit-and-run-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        // Combined suites contain independent copies of this module. Reserve
+        // the path atomically instead of deleting another copy's live tree.
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return dir,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("create scratch directory {}: {error}", dir.display()),
+        }
+    }
 }
 
 fn copy_tree(src: &Path, dst: &Path) {

@@ -277,7 +277,7 @@ fn rewrite_stdlib_const(name: &str) -> Option<&'static str> {
 /// still take the legacy `String + String` path — the hint is the
 /// signal that the lowerer guarantees Builder semantics are safe.
 fn try_string_builder(e: &Expr) -> Option<String> {
-    match e.hint? {
+    match e.hint().as_ref()? {
         IrHint::MutableStringLiteral => None, // emitted as the plain literal
         IrHint::StringBuilderInit => {
             if let ExprNode::Assign {
@@ -813,6 +813,25 @@ fn emit_bool_op(
         BoolOpKind::Or => "||",
         BoolOpKind::And => "&&",
     };
+    // Not the empty literal's own default: `x || {}` answers x's type, which a `{} of String => String` would widen
+    if matches!(op, BoolOpKind::Or) {
+        let left_ty = match &left.ty {
+            Some(Ty::Union { variants }) => variants.iter().find(|v| !matches!(v, Ty::Nil)).cloned(),
+            other => other.clone(),
+        };
+        let empty = match (&*right.node, &left_ty) {
+            (ExprNode::Hash { entries, .. }, Some(Ty::Hash { key, value })) if entries.is_empty() && !key.is_open() && !value.is_open() => {
+                Some(format!("{{}} of {} => {}", super::ty::crystal_ty(key), super::ty::crystal_ty(value)))
+            }
+            (ExprNode::Array { elements, .. }, Some(Ty::Array { elem })) if elements.is_empty() && !elem.is_open() => {
+                Some(format!("[] of {}", super::ty::crystal_ty(elem)))
+            }
+            _ => None,
+        };
+        if let Some(empty) = empty {
+            return format!("{} {op_s} {empty}", emit_or_left(left));
+        }
+    }
     // Hash#[] safety bridge for `||`-default idiom: Ruby's
     // `hash[k] || default` returns the default for missing keys
     // because Hash#[] returns nil there. Crystal's strict Hash#[]
@@ -822,18 +841,23 @@ fn emit_bool_op(
     // `||` falls through to the default. Only the read-form `[]` is
     // rewritten — `[]=` and other methods keep their shape.
     if matches!(op, BoolOpKind::Or) {
-        if let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*left.node {
-            if method.as_str() == "[]" && !args.is_empty() {
-                let recv_ty = recv.ty.as_ref().map(unwrap_nilable_union);
-                if matches!(recv_ty, Some(crate::ty::Ty::Hash { .. })) {
-                    let recv_s = emit_expr(recv);
-                    let arg_strs: Vec<String> = args.iter().map(emit_expr).collect();
-                    return format!("{}[{}]? {} {}", recv_s, arg_strs.join(", "), op_s, emit_expr(right));
-                }
+        return format!("{} {} {}", emit_or_left(left), op_s, emit_expr(right));
+    }
+    format!("{} {} {}", emit_expr(left), op_s, emit_expr(right))
+}
+
+/// The left side of `||`, a Hash read as `hash[k]?` so a missing key is nil and the default runs.
+fn emit_or_left(left: &Expr) -> String {
+    if let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*left.node {
+        if method.as_str() == "[]" && !args.is_empty() {
+            let recv_ty = recv.ty.as_ref().map(unwrap_nilable_union);
+            if matches!(recv_ty, Some(crate::ty::Ty::Hash { .. })) {
+                let arg_strs: Vec<String> = args.iter().map(emit_expr).collect();
+                return format!("{}[{}]?", emit_expr(recv), arg_strs.join(", "));
             }
         }
     }
-    format!("{} {} {}", emit_expr(left), op_s, emit_expr(right))
+    emit_expr(left)
 }
 
 fn emit_string_interp(parts: &[InterpPart]) -> String {
@@ -1299,10 +1323,9 @@ pub(super) fn emit_send_base(
             }
         })
         .collect();
-    // Ruby → Crystal method-name translations. Crystal stdlib
-    // collections (Array, String, Hash) use `size` not `length`;
-    // Ruby has both as aliases. Translate at the call site so
-    // emitted code is Crystal-idiomatic.
+    // Ruby → Crystal method-name translations. `length` → `size`
+    // (Array, String, and Hash) is the string kernel's Crystal
+    // spelling, applied by name below.
     // Ruby's `raise Klass, "msg"` is a 2-arg form that Crystal doesn't
     // accept (Crystal's `raise` is single-arg: an Exception or a
     // String). Translate `raise X, "msg"` to `raise X.new("msg")`
@@ -1407,35 +1430,6 @@ pub(super) fn emit_send_base(
             }
         }
     }
-    // Ruby `Time` stdlib → Crystal `Time` stdlib bridges.
-    //
-    // - `Time.now.utc` (Ruby: current time, then convert to UTC) →
-    //   `Time.utc` (Crystal: class method returning current UTC time).
-    //   Detected as the outer `.utc` Send whose receiver is `Time.now`.
-    // - `<expr>.iso8601` (Ruby: ISO-8601 string) → `<expr>.to_rfc3339`
-    //   (Crystal's spelling of the same format).
-    // Both come from `runtime/ruby/active_record/base.rb`'s
-    // `fill_timestamps` chain `Time.now.utc.iso8601`. Spinel/Ruby pass
-    // through; only Crystal needs the rewrite since its stdlib uses
-    // different method names.
-    if method.as_str() == "utc" && args.is_empty() {
-        if let Some(r) = recv {
-            if let ExprNode::Send { recv: Some(inner), method: inner_m, args: inner_args, .. } = &*r.node {
-                if inner_m.as_str() == "now" && inner_args.is_empty() {
-                    if let ExprNode::Const { path } = &*inner.node {
-                        if path.last().map(|s| s.as_str()) == Some("Time") {
-                            return "Time.utc".to_string();
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if method.as_str() == "iso8601" && args.is_empty() {
-        if let Some(r) = recv {
-            return format!("{}.to_rfc3339", emit_expr(r));
-        }
-    }
     // Ruby `JSON.generate(obj)` → Crystal `obj.to_json`. Both produce
     // a JSON String from a serializable value, but Crystal exposes
     // the API as an instance method rather than a module function.
@@ -1459,7 +1453,6 @@ pub(super) fn emit_send_base(
         Some(r) if matches!(&*r.node, ExprNode::Const { path } if path.last().map(|s| s.as_str()) == Some("Base64"))
     );
     let m = match method.as_str() {
-        "length" => "size",
         // Ruby `Array#count` (no args) → element count. Crystal's
         // `Enumerable#count` requires either an item to match or a
         // block — `arr.count` (no args) doesn't compile. Rewrite to
@@ -1480,13 +1473,6 @@ pub(super) fn emit_send_base(
         // `key?` explicitly as part of their API, so skip the
         // rewrite when the receiver is one of those.
         "key?" if !is_framework_hash_recv(recv) => "has_key?",
-        // Crystal: starts_with? / ends_with? / includes? (note plural).
-        // `include?` is method-only — the bare `include` Ruby keyword
-        // for module mixin lowers to `LibraryClass::includes`, not
-        // a Send, so it's never seen here.
-        "start_with?" => "starts_with?",
-        "end_with?" => "ends_with?",
-        "include?" => "includes?",
         // Ruby `Regexp#match?(str)` → Crystal `Regex#matches?(str)`
         // (note plural). Both predicate-only forms — return Bool.
         // No receiver-type narrowing here: the only Ruby class with
@@ -1500,7 +1486,13 @@ pub(super) fn emit_send_base(
         "decode64" if base64_recv => "decode",
         "urlsafe_encode64" if base64_recv => "urlsafe_encode",
         "urlsafe_decode64" if base64_recv => "urlsafe_decode",
-        other => other,
+        // String-kernel renames (`length` → `size`, `include?` →
+        // `includes?`, `start_with?` → `starts_with?`, `end_with?` →
+        // `ends_with?`) and every kernel name Crystal already spelled
+        // the same way. The old match applied these to every receiver,
+        // so the lookup is by name. `include` the mixin keyword is not
+        // a Send.
+        name => crate::catalog::string_kernel::crystal_name(name).unwrap_or(name),
     };
     // Ruby's `String#to_sym` dynamically creates Symbols; Crystal
     // doesn't allow runtime Symbol creation. Drop the call entirely
@@ -1901,6 +1893,11 @@ pub(super) fn emit_literal(l: &Literal) -> String {
         // also interpolates #{...}; literal data must stay literal.
         Literal::Str { value } => format!("{value:?}").replace("#{", "\\#{"),
         Literal::Sym { value } => format!(":{value}"),
+        // Crystal's `m` modifier is documented as "multiline mode (`.`
+        // will match newlines)" — unlike most PCRE-family engines
+        // (and Rust's/Go's RE2), Crystal's own `m` already means
+        // Ruby's `m` (dot-matches-newline), so the flag letter passes
+        // through verbatim correctly, same as `i`.
         Literal::Regex { pattern, flags } => format!(
             "/{}/{flags}",
             crate::emit::shared::regex_literal::escape_regex_delimiters(pattern)
@@ -1983,7 +1980,7 @@ mod equal_identity_tests {
     }
 
     fn class(name: &str) -> Ty {
-        Ty::Class { id: crate::ident::ClassId(Symbol::from(name)), args: vec![] }
+        Ty::Class { id: crate::ident::ClassId(Symbol::from(name)), args: vec![].into() }
     }
 
     fn send(recv: Expr, arg: Expr) -> Expr {

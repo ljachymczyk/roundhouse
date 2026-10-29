@@ -40,7 +40,7 @@
 //! `@bots = Current.account.bots` in the app for no reader that needs
 //! it.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::dialect::ControllerBodyItem;
@@ -50,7 +50,7 @@ use crate::ty::Ty;
 
 pub fn apply_relation_ivar_materialize(app: &mut App) {
     for controller in &mut app.controllers {
-        let mut ivars: HashMap<Symbol, Ty> = HashMap::new();
+        let mut ivars: HashMap<Symbol, Ty> = HashMap::default();
         for item in &controller.body {
             if let ControllerBodyItem::Action { action, .. } = item {
                 crate::analyze::extract_ivar_assignments(&action.body, &mut ivars);
@@ -87,7 +87,7 @@ fn rewrite(expr: &mut Expr, mixed: &[Symbol]) {
             return;
         }
         let Some(Ty::Relation { of }) = value.ty.as_ref() else { return };
-        let elem = Ty::Class { id: of.clone(), args: vec![] };
+        let elem = Ty::Class { id: of.clone(), args: vec![].into() };
         let inner = std::mem::replace(value, Expr::new(span, ExprNode::Lit { value: Literal::Nil }));
         let mut materialised = Expr::new(
             span,
@@ -99,7 +99,7 @@ fn rewrite(expr: &mut Expr, mixed: &[Symbol]) {
                 parenthesized: false,
             },
         );
-        materialised.ty = Some(Ty::Array { elem: Box::new(elem) });
+        materialised.ty = Some(Ty::Array { elem: std::sync::Arc::new(elem) });
         *value = materialised;
         // The assignment's own type follows its value.
         expr.ty = value.ty.clone();

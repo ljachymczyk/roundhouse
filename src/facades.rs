@@ -154,18 +154,6 @@ pub const EXTRAS_FACADES: &[Facade] = &[
         lifted_by_sql_functions: &[],
         lifted_by_constants: &[],
     },
-    // Preview Campfire's WAL checkpoint thread — File flock /
-    // connection_db_config / FileUtils, none of which Spinel models.
-    // Puma starts it on CRuby; Spinel HTTP does not use Puma. Stub
-    // keeps app/models.rb loading without refusing AOT.
-    Facade {
-        stem: "app/models/sqlite_wal_checkpoint",
-        class_name: "SqliteWalCheckpoint",
-        rb: include_str!("../runtime/spinel/facades/sqlite_wal_checkpoint.rb"),
-        rbs: include_str!("../runtime/spinel/facades/sqlite_wal_checkpoint.rbs"),
-        lifted_by_sql_functions: &[],
-        lifted_by_constants: &[],
-    },
 ];
 
 /// The façade contracts, parsed into analysis signatures, for those
@@ -177,12 +165,12 @@ pub const EXTRAS_FACADES: &[Facade] = &[
 /// onto its hardcoded catalog (see `analyzer_rbs_signatures_overlay_the_hardcoded_catalog`).
 pub fn signatures_for(
     app: &crate::App,
-) -> std::collections::HashMap<crate::ClassId, std::collections::HashMap<crate::Symbol, crate::Ty>>
+) -> crate::det::HashMap<crate::ClassId, crate::det::HashMap<crate::Symbol, crate::Ty>>
 {
-    let mut out: std::collections::HashMap<
+    let mut out: crate::det::HashMap<
         crate::ClassId,
-        std::collections::HashMap<crate::Symbol, crate::Ty>,
-    > = std::collections::HashMap::new();
+        crate::det::HashMap<crate::Symbol, crate::Ty>,
+    > = crate::det::HashMap::default();
     for f in EXTRAS_FACADES {
         let defined = app
             .library_classes

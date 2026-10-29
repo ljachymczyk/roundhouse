@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 require "json"
 # Tep::Request -- what the handler reads off the wire.
 module Tep
@@ -16,7 +17,12 @@ module Tep
     # hashes above keep only a repeated key's last value, and cannot say
     # `ids[]=1&ids[]=2`.
     attr_accessor :raw_query, :body_fields, :json_body_params
+    # True when a JSON body does not parse: Rails raises
+    # ActionDispatch::Http::Parameters::ParseError and answers 400
+    # (`Main.request_body_params` returns nil for it).
+    attr_accessor :json_body_malformed
     attr_accessor :remote_host
+    attr_accessor :listener_transport
     attr_accessor :ivars
 
     def initialize
@@ -32,6 +38,7 @@ module Tep
       # multipart text fields stay in the String-only `body_fields` map;
       # multipart files stay in `uploads` below.
       @json_body_params = {}
+      @json_body_malformed = false
       @req_headers  = Tep.str_hash   # downcased header names; renamed
                                      # from `headers` to avoid sharing
                                      # an ivar slot with Response (spinel
@@ -43,6 +50,7 @@ module Tep
       # poly-receiver dispatch. Roundhouse uses ActionDispatch::Session.
       @raw_body     = +""             # same reasoning as req_headers
       @remote_host  = +""
+      @listener_transport = ""
       @passed       = false          # `pass` flag: skip to the next matching route
       @ivars        = Tep.str_hash   # per-request bag for `@name = ...`
                                      # set by handlers and `before` filters,
@@ -57,10 +65,12 @@ module Tep
       # and `Main.request_params` / `Main.nest_uploads` fold both into the
       # controller's params.
       @uploads      = {}
+      @upload_parts = []
     end
 
     attr_accessor :passed
     attr_accessor :uploads
+    attr_accessor :upload_parts
     def set_passed; @passed = true; end
 
     # Sinatra-compat read aliases removed in the vendored copy.
@@ -209,10 +219,11 @@ module Tep
         form.files.each do |k, v|
           @uploads[k] = v
         end
+        @upload_parts = form.file_parts
       elsif json? && @raw_body.length > 0
-        # Rails answers a malformed body 400 before the action runs;
-        # here the params stay empty and the action's own `require`
-        # refuses it.
+        # Rails answers a malformed body 400 before the action runs:
+        # the params stay empty and `json_body_malformed` makes the
+        # dispatcher answer 400 (`Main.request_body_params`).
         begin
           parsed = JSON.parse(@raw_body)
           if parsed.is_a?(Hash)
@@ -225,7 +236,7 @@ module Tep
             @json_body_params["_json"] = parsed
           end
         rescue JSON::ParserError
-          nil
+          @json_body_malformed = true
         end
       end
       nil
@@ -245,7 +256,7 @@ module Tep
         if ready == 0
           return false   # timeout -- client never finished sending
         end
-        chunk = Sock.sphttp_recv_some(client_fd, cl - @raw_body.bytesize)
+        chunk = Sock.sphttp_recv_some(client_fd, cl - @raw_body.bytesize).b
         if chunk.bytesize == 0
           return false   # peer closed mid-body
         end
@@ -274,7 +285,7 @@ module Tep
         if ready.nil?
           return false   # timeout -- client never finished sending
         end
-        chunk = Sock.sphttp_recv_some(client_fd, cl - @raw_body.bytesize)
+        chunk = Sock.sphttp_recv_some(client_fd, cl - @raw_body.bytesize).b
         if chunk.bytesize == 0
           return false   # peer closed mid-body
         end

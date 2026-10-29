@@ -210,11 +210,11 @@ fn a_modifier_if_is_not_a_conditional_visibility_declaration() {
         ("def parse(value)\n    if value\n      private :parse\n    end\n    value\n  end", true),
         ("def parse(value)\n    unless value\n      private :parse\n    else\n      value\n    end\n  end", true),
         ("if ready\n    private\n    def hidden; 1; end\n  end", false),
-        // A neighboring `def` is what makes the module surface. Without
-        // it, an accessor inside `if` would be dropped with the module
-        // and the error would never be raised.
-        ("def present; 1; end\n  if enabled\n    attr_reader :token\n  end", false),
-        ("def present; 1; end\n  unless enabled\n    attr_writer :token\n  else\n    attr_accessor :other\n  end", false),
+        // A plain accessor in a load-time conditional's branch is carried
+        // with its branch (`ConditionalDefinitions`); a class-level one
+        // is not.
+        ("def present; 1; end\n  if enabled\n    attr_reader :token\n  end", true),
+        ("def present; 1; end\n  unless enabled\n    attr_writer :token\n  else\n    attr_accessor :other\n  end", true),
         ("def present; 1; end\n  if enabled\n    cattr_reader :domain\n  end", false),
         ("def present; 1; end\n  mattr_accessor :label", true),
         ("return value if value", true),
@@ -248,13 +248,36 @@ fn a_modifier_if_is_not_a_conditional_visibility_declaration() {
     }
 }
 
+/// A model carries a marker naming a method its body does not define
+/// (generated, a superclass's or a gem's) for the lowering and the
+/// analyzer; a library class still refuses it.
+#[test]
+fn an_inherited_visibility_change_is_carried_by_a_model() {
+    for body in ["private :inherited", "private_class_method :inherited"] {
+        let source = format!("class Thing < ApplicationRecord\n{body}\nend");
+        let model = ingest_model(source.as_bytes(), "thing.rb", &Schema::default(), &Default::default())
+            .unwrap_or_else(|e| panic!("model refused {body}: {e:?}"))
+            .expect("a model");
+        assert!(
+            model.body.iter().any(|item| matches!(item,
+                roundhouse::dialect::ModelBodyItem::Unknown { expr, .. }
+                    if expr.decisions & roundhouse::expr::INHERITED_VISIBILITY != 0)),
+            "{body}"
+        );
+        assert!(ingest_library_class(source.as_bytes(), "thing.rb").is_err(), "library accepted {body}");
+    }
+    let nested = "class Thing < ApplicationRecord\nclass << self\n  private :inherited\nend\nend";
+    assert!(
+        ingest_model(nested.as_bytes(), "thing.rb", &Schema::default(), &Default::default()).is_err(),
+        "a marker in `class << self` has no statement to carry it"
+    );
+}
+
 #[test]
 fn forward_inherited_dynamic_and_ambiguous_changes_stay_errors() {
     for body in [
         "private :later\n def later; 1; end",
-        "private :inherited",
         "private_class_method :later\n def self.later; 1; end",
-        "private_class_method :inherited",
         "def same; 1; end\n def same; 2; end\n private :same",
         "def same; 1; end\n private :same\n def same; 2; end",
         "private\n def same; 1; end\n public\n def same; 2; end",
@@ -578,4 +601,18 @@ fn a_class_methods_carrier_singleton_is_refused_by_name() {
         ),
         "{error}"
     );
+}
+
+#[test]
+fn a_def_on_the_class_s_own_name_is_a_class_method() {
+    for source in [
+        "class Shape\n  def Shape.configure(x)\n    x\n  end\nend\n",
+        "module Graph\n  class Shape\n    def Shape.configure(x)\n      x\n    end\n  end\nend\n",
+    ] {
+        let classes = ingest_library_classes(source.as_bytes(), "shape.rb").expect(source);
+        let shape = classes.iter().find(|c| c.name.0.as_str().ends_with("Shape")).expect(source);
+        assert_eq!(visibility(&shape.methods, "configure", MethodReceiver::Class), MethodVisibility::Public, "{source}");
+    }
+    let foreign = "class Shape\n  def Other.configure(x)\n    x\n  end\nend\n";
+    assert!(ingest_library_classes(foreign.as_bytes(), "shape.rb").is_err(), "a def on another class stays refused");
 }

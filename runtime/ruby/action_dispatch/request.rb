@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActionDispatch::Request — the request-object surface controllers,
 # filters, and helpers reach (`request.remote_ip`, `request.referer`,
 # `request.xhr?`, `request.env[...]`, `request.get?`). Typed fields the
@@ -13,6 +14,7 @@
 # Request (CGI-env-backed, runtime/action_dispatch_request.rb) and must
 # not blend the two shapes.
 require_relative "headers"
+require_relative "request_path_parameters"
 
 module ActionDispatch
   # `request.body` — the raw body as Rails hands it back: an IO, not the
@@ -126,7 +128,8 @@ module ActionDispatch
     attr_accessor :script_name
     attr_accessor :request_method
     attr_accessor :referer
-    attr_accessor :host
+    # `host` is a method: it answers `raw_host_with_port`, while `@host`
+    # stays the Host header the dispatcher stored.
     attr_reader :format
     attr_accessor :env
     # Rails' `request_parameters`: the BODY's params alone, without the
@@ -154,6 +157,7 @@ module ActionDispatch
       @env = {}
       @request_parameters = {}
       @query_parameters = {}
+      @path_parameters = RequestPathParameters.new({})
       # `@params` too, and for a reason `@env` shows: `Request.for`
       # COPIES into both (`params.each { |k, v| r.params[k] = v }`),
       # which READS the slot before anything writes it. Unset, that read
@@ -172,6 +176,11 @@ module ActionDispatch
       # defect `@params` had, one read away from surfacing.
       @user_agent = +""
       @session_options = {}
+      # Memo for `content_security_policy`. False until the first read
+      # copies the app default; a later read returns that same object so
+      # a before_action and the header writer share the narrowed policy.
+      @csp_ready = false
+      @content_security_policy = nil
     end
 
     # Rack's per-request session options. The one key the corpus writes
@@ -222,12 +231,30 @@ module ActionDispatch
       @body
     end
 
+    # Rails checks the ordinary Rack Authorization key, legacy server
+    # spellings, and the CGI redirect fallback.
+    def authorization
+      ActionDispatch::Http::Headers.authorization(@env)
+    end
+
+    def path_parameters
+      @path_parameters
+    end
+
+    def path_parameters=(values)
+      @path_parameters = RequestPathParameters.new(values)
+    end
+
     def get?
       @request_method == "GET"
     end
 
     def post?
       @request_method == "POST"
+    end
+
+    def put?
+      @request_method == "PUT"
     end
 
     # `head?` sits beside `get?` because Rails' "is this a safe
@@ -279,16 +306,84 @@ module ActionDispatch
 
     # Rails' `request.optional_port`: the port, unless it is the
     # scheme's standard one (80, or 443 over TLS) — then nil, so a URL
-    # built from it carries no `:port`. `@host` is the Host header,
-    # port included, which is how `base_url` uses it. campfire's
-    # `default_url_options` passes it as `port:`.
+    # built from it carries no `:port`. The authority is
+    # `raw_host_with_port` (port included), which is how `base_url`
+    # uses it. campfire's `default_url_options` passes it as `port:`.
     def optional_port
-      sep = @host.rindex(":")
-      return nil if sep.nil? || @host.end_with?("]")
-      port = @host[(sep + 1)..].to_s.to_i
+      authority = raw_host_with_port
+      sep = authority.rindex(":")
+      return nil if sep.nil? || authority.end_with?("]")
+      port = authority[(sep + 1)..].to_s.to_i
       return nil if port == 0
       return nil if port == (ssl? ? 443 : 80)
       port
+    end
+
+    # Rails' `raw_host_with_port`. The last `X-Forwarded-Host` entry is
+    # the client-facing authority, and only from a loopback or private
+    # peer (the proxy in front of the app). A public client can set the
+    # header itself, so it does not override Host. A value that is not
+    # a host authority is ignored, so it cannot land in a Location or
+    # an href. `config.hosts` is not applied yet.
+    def raw_host_with_port
+      forwarded = forwarded_authority
+      return forwarded unless forwarded.empty?
+      @host.to_s
+    end
+
+    def host
+      raw_host_with_port
+    end
+
+    def host=(value)
+      @host = value.to_s
+    end
+
+    def forwarded_authority
+      return "" unless trusted_forwarded_peer?
+      forwarded = @env.fetch("HTTP_X_FORWARDED_HOST", "").to_s.split(",").last.to_s.strip
+      return "" unless host_authority?(forwarded)
+      forwarded
+    end
+
+    def trusted_forwarded_peer?
+      ip = @remote_ip.to_s
+      # An empty peer is not loopback. Spinel's socket address is still
+      # unimplemented, so `remote_ip` is "" there; trusting that would
+      # honor a client-supplied X-Forwarded-Host on every connection.
+      return false if ip.empty?
+      return true if ip == "127.0.0.1" || ip == "::1" || ip == "localhost"
+      return true if ip.start_with?("10.") || ip.start_with?("192.168.") || ip.start_with?("169.254.")
+      return true if ip.start_with?("fc") || ip.start_with?("fd") || ip.start_with?("fe80:")
+      if ip.start_with?("172.")
+        second = ip.split(".")[1].to_s.to_i
+        return true if second >= 16 && second <= 31
+      end
+      if ip.start_with?("100.")
+        second = ip.split(".")[1].to_s.to_i
+        return true if second >= 64 && second <= 127
+      end
+      false
+    end
+
+    def host_authority?(value)
+      value.match?(/\A(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(:[0-9]{1,5})?\z/)
+    end
+
+    def port
+      authority = forwarded_authority
+      if authority.empty?
+        authority = @host.to_s
+        if !@env.key?("HTTP_HOST") && (@env.key?("SERVER_NAME") || !authority.include?(":"))
+          authority = "#{authority}:#{@env.fetch("SERVER_PORT", "").to_s}"
+        end
+      end
+      sep = authority.rindex(":")
+      unless sep.nil?
+        value = authority[(sep + 1)..].to_s
+        return value.to_i if value.match?(/\A[0-9]+\z/)
+      end
+      ssl? ? 443 : 80
     end
 
     # `request.protocol` — the scheme WITH its `://`, as Rails spells it.
@@ -302,8 +397,30 @@ module ActionDispatch
     # it with an Origin the way a browser serializes one.
     def base_url
       default = ssl? ? ":443" : ":80"
-      host = @host.end_with?(default) ? @host[0, @host.length - default.length].to_s : @host
+      authority = raw_host_with_port
+      host = authority.end_with?(default) ? authority[0, authority.length - default.length].to_s : authority
       protocol + host
+    end
+
+    # `request.host_with_port` — `base_url` without the scheme. Rails
+    # drops the scheme's standard port, which `base_url` already did.
+    def host_with_port
+      b = base_url
+      p = protocol
+      return "" if b.length < p.length
+      b[p.length..].to_s
+    end
+
+    # The app's default policy, duplicated per request. Nil when the
+    # app configured none (or DISABLE_CONTENT_SECURITY_POLICY). The
+    # first read memoizes so a before_action that narrows the policy
+    # and the later header write see one object.
+    def content_security_policy
+      return @content_security_policy if @csp_ready
+      @csp_ready = true
+      src = Rails.application.content_security_policy
+      @content_security_policy = src.nil? ? nil : src.dup
+      @content_security_policy
     end
 
     # Absolute URL of this request. Feed templates interpolate it as
@@ -347,6 +464,18 @@ module ActionDispatch
 
     def params=(value)
       @params = value
+    end
+
+    # Rails' `filtered_parameters`: the request's parameters, path
+    # parameters last (with the route's controller and action), with the
+    # value of every key the app's `config.filter_parameters` names
+    # replaced by "[FILTERED]", for an app that logs them itself
+    # (`Rails.logger` does not filter; only Rails' own request log does).
+    def filtered_parameters
+      all = {}
+      @params.each { |k, v| all[k] = v }
+      @path_parameters.to_h.each { |k, v| all[k] = v }
+      ActiveSupport::ParameterFilter.new(Rails.application.config_filter_parameters).filter(all)
     end
 
     # Build a request from a CGI/Rack-shaped env hash.

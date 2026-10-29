@@ -83,10 +83,7 @@ pub(super) fn emit_module_method(m: &MethodDef) -> Result<String, String> {
     let ret_clause = render_return(m);
     let fn_name = super::expr::sanitize_ident(m.name.as_str());
     writeln!(out, "pub fn {fn_name}{params}{ret_clause} {{").unwrap();
-    let return_ty = match m.signature.as_ref() {
-        Some(Ty::Fn { ret, .. }) => Some((**ret).clone()),
-        _ => None,
-    };
+    let return_ty = effective_return_ty(m);
     let param_types = collect_param_types(m);
     let body = super::expr::with_param_types(param_types, || super::expr::with_current_return_ty(return_ty.clone(), || super::expr::with_class_method_scope(|| {
         super::expr::with_method_scope(&m.body, || {
@@ -112,8 +109,16 @@ pub(super) fn emit_module_method(m: &MethodDef) -> Result<String, String> {
     // `_adapter_insert; end` in active_record/base.rb (load-bearing
     // empty per the spinel-AOT comment) take this path.
     let body = synthesize_default_body_if_empty(body, return_ty.as_ref());
-    for line in body.lines() {
-        writeln!(out, "    {line}").unwrap();
+    // A writer is emitted void (`render_return`), so a tail that is a value is a statement there, as in emit_instance_method
+    let is_setter = is_writer_name(m.name.as_str());
+    let lines: Vec<&str> = body.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_end();
+        if is_setter && i + 1 == lines.len() && !t.ends_with(';') && !t.ends_with('{') && !t.is_empty() {
+            writeln!(out, "    {line};").unwrap();
+        } else {
+            writeln!(out, "    {line}").unwrap();
+        }
     }
     out.push_str("}\n");
     Ok(out)
@@ -257,15 +262,21 @@ fn render_return(m: &MethodDef) -> String {
     if is_writer_name(m.name.as_str()) {
         return String::new();
     }
-    match m.signature.as_ref() {
-        Some(Ty::Fn { ret, .. }) => {
-            if matches!(&**ret, Ty::Nil) {
-                String::new()
-            } else {
-                format!(" -> {}", rust_ty(ret))
-            }
-        }
+    match effective_return_ty(m) {
+        Some(ret) if !matches!(ret, Ty::Nil) => format!(" -> {}", rust_ty(&ret)),
         _ => String::new(),
+    }
+}
+
+/// The declared return type, or for a method without a signature its
+/// body's type when the typer settled one: an app method answers its
+/// body's value as Ruby's does.
+fn effective_return_ty(m: &MethodDef) -> Option<Ty> {
+    match m.signature.as_ref() {
+        Some(Ty::Fn { ret, .. }) => Some((**ret).clone()),
+        Some(_) => None,
+        None if m.name.as_str() == "initialize" || is_writer_name(m.name.as_str()) => None,
+        None => m.body.ty.clone().filter(|t| !t.mentions_unknown() && !matches!(t, Ty::Bottom | Ty::Nil)),
     }
 }
 
@@ -495,10 +506,7 @@ pub(super) fn emit_instance_method(
     // Return arm in `emit_expr` so `return nil` in a method typed
     // `-> T?` emits as `return None` instead of bare `return` (the
     // latter is E0069 in non-Unit-returning functions).
-    let return_ty = match m.signature.as_ref() {
-        Some(Ty::Fn { ret, .. }) => Some((**ret).clone()),
-        _ => None,
-    };
+    let return_ty = effective_return_ty(m);
     // Build the param-name → declared-Ty map for the String coercion
     // logic in `emit_assign`. The body-typer doesn't always propagate
     // Option-ness from RBS to Var reads inside the body, so this is
@@ -622,7 +630,7 @@ pub(super) fn emit_instance_method(
         // the request dispatcher) — would otherwise reference
         // undeclared locals at the Self literal site. Emit a default-
         // initialized let binding for each so the literal compiles.
-        let assigned: std::collections::HashSet<String> =
+        let assigned: crate::det::HashSet<String> =
             collect_ivars_assigned_in_body(&m.body);
         for (fname, fty) in ivars {
             if !assigned.contains(fname) {
@@ -647,9 +655,9 @@ pub(super) fn emit_instance_method(
 /// to find ivars the body didn't touch so the closing `Self { ... }`
 /// literal can default-init them rather than referencing undeclared
 /// locals.
-fn collect_ivars_assigned_in_body(body: &crate::expr::Expr) -> std::collections::HashSet<String> {
+fn collect_ivars_assigned_in_body(body: &crate::expr::Expr) -> crate::det::HashSet<String> {
     use crate::expr::{ExprNode, LValue};
-    fn walk(e: &crate::expr::Expr, out: &mut std::collections::HashSet<String>) {
+    fn walk(e: &crate::expr::Expr, out: &mut crate::det::HashSet<String>) {
         match &*e.node {
             ExprNode::Assign { target: LValue::Ivar { name }, value } => {
                 out.insert(name.as_str().to_string());
@@ -705,7 +713,7 @@ fn collect_ivars_assigned_in_body(body: &crate::expr::Expr) -> std::collections:
             _ => {}
         }
     }
-    let mut out = std::collections::HashSet::new();
+    let mut out = crate::det::HashSet::default();
     walk(body, &mut out);
     out
 }
@@ -763,8 +771,8 @@ fn default_value_for_ty(ty: &Ty) -> String {
 /// into `emit_assign`'s coercion logic — the body-typer doesn't
 /// always set the Option-ness on Var reads, so the param table is
 /// the authoritative source.
-fn collect_param_types(m: &MethodDef) -> std::collections::HashMap<String, Ty> {
-    let mut out = std::collections::HashMap::new();
+fn collect_param_types(m: &MethodDef) -> crate::det::HashMap<String, Ty> {
+    let mut out = crate::det::HashMap::default();
     let Some(Ty::Fn { params, .. }) = m.signature.as_ref() else {
         return out;
     };
@@ -772,7 +780,7 @@ fn collect_param_types(m: &MethodDef) -> std::collections::HashMap<String, Ty> {
         return out;
     }
     for (p, sig_p) in m.params.iter().zip(params.iter()) {
-        out.insert(p.name.as_str().to_string(), sig_p.ty.clone());
+        out.insert(p.name.as_str().to_string(), (*sig_p.ty).clone());
     }
     out
 }
@@ -981,11 +989,11 @@ mod tests {
         let block_sig = Ty::Fn {
             params: vec![TyParam {
                 name: Symbol::new("k"),
-                ty: Ty::Str,
+                ty: Ty::Str.into(),
                 kind: ParamKind::Required,
-            }],
+            }].into(),
             block: None,
-            ret: Box::new(Ty::Nil),
+            ret: std::sync::Arc::new(Ty::Nil),
             effects: EffectSet::pure(),
         };
         let callee = MethodDef {
@@ -1000,11 +1008,11 @@ mod tests {
             signature: Some(Ty::Fn {
                 params: vec![TyParam {
                     name: Symbol::new("block"),
-                    ty: block_sig.clone(),
+                    ty: block_sig.clone().into(),
                     kind: ParamKind::Block,
-                }],
-                block: Some(Box::new(block_sig)),
-                ret: Box::new(Ty::Nil),
+                }].into(),
+                block: Some(std::sync::Arc::new(block_sig)),
+                ret: std::sync::Arc::new(Ty::Nil),
                 effects: EffectSet::pure(),
             }),
             effects: EffectSet::pure(),
@@ -1050,10 +1058,12 @@ mod tests {
             parent: None,
             parent_span: Default::default(),
             includes: vec![],
+            include_spans: Vec::new(),
             methods: vec![callee, forwarder],
             nullable_columns: Vec::new(),
             origin: None,
             constants: Vec::new(),
+            conditional_definitions: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
         };

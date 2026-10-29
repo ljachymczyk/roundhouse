@@ -2,7 +2,7 @@
 //! Singleton, superclass links), ActionMailer classes, ActiveJob classes,
 //! and Sidekiq workers. Extracted verbatim from `Analyzer::with_adapter`.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::analyze::ClassInfo;
 use crate::App;
@@ -41,7 +41,7 @@ pub(in crate::analyze) fn register(
     // `diagnose` never walks `library_classes`, which is why a gap this
     // broad stayed invisible: the strict emit reported zero errors while
     // the AOT compiler would not accept the tree.
-    let model_concerns: std::collections::HashSet<ClassId> = app
+    let model_concerns: crate::det::HashSet<ClassId> = app
         .models
         .iter()
         .flat_map(crate::analyze::model_includes)
@@ -88,7 +88,7 @@ pub(in crate::analyze) fn register(
         if lc.includes.iter().any(|i| i.0.as_str() == "Singleton") {
             cls.class_methods.entry(Symbol::from("instance")).or_insert(Ty::Class {
                 id: lc.name.clone(),
-                args: vec![],
+                args: vec![].into(),
             });
         }
         // `include Rails.application.routes.url_helpers` (recorded
@@ -136,7 +136,7 @@ pub(in crate::analyze) fn register(
             .or_insert(Ty::Nil);
         cls.instance_methods
             .entry(Symbol::from("caption"))
-            .or_insert(Ty::Union { variants: vec![Ty::Str, Ty::Nil] });
+            .or_insert(Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() });
     }
 
     // `self.becomes_from(source)` on an STI subclass — the recast
@@ -155,7 +155,7 @@ pub(in crate::analyze) fn register(
     // that synthesizes it. Nobody writes the name by hand, so a
     // registration here cannot mask a typo.
     {
-        let model_names: std::collections::HashSet<&ClassId> =
+        let model_names: crate::det::HashSet<&ClassId> =
             app.models.iter().map(|m| &m.name).collect();
         for lc in &app.library_classes {
             if !lc.parent.as_ref().is_some_and(|p| model_names.contains(p)) {
@@ -166,7 +166,7 @@ pub(in crate::analyze) fn register(
                 .or_default()
                 .class_methods
                 .entry(Symbol::from("becomes_from"))
-                .or_insert(Ty::Class { id: lc.name.clone(), args: vec![] });
+                .or_insert(Ty::Class { id: lc.name.clone(), args: vec![].into() });
         }
     }
 
@@ -205,8 +205,9 @@ pub(in crate::analyze) fn register(
         };
         let delivery_ty = Ty::Class {
             id: ClassId(Symbol::from("ActionMailer::MessageDelivery")),
-            args: vec![],
+            args: vec![].into(),
         };
+        let own_with = crate::lower::mailer_class_side::defines_with(app);
         for lc in &app.library_classes {
             if !is_mailer(&lc.name) {
                 continue;
@@ -227,6 +228,11 @@ pub(in crate::analyze) fn register(
                 cls.class_methods
                     .entry(method.name.clone())
                     .or_insert_with(|| delivery_ty.clone());
+            }
+            if !own_with.contains(lc.name.0.as_str()) {
+                cls.class_methods
+                    .entry(Symbol::from("with"))
+                    .or_insert_with(|| Ty::Class { id: lc.name.clone(), args: vec![].into() });
             }
         }
 
@@ -256,9 +262,35 @@ pub(in crate::analyze) fn register(
         delivery_cls
             .instance_methods
             .insert(Symbol::from("processed?"), Ty::Bool);
+        // What the delivered message answers (runtime/ruby/action_mailer.rb's
+        // `Message`): address headers as Arrays of bare addresses, the
+        // body, and a multipart's parts.
+        let addresses = Ty::Union { variants: vec![Ty::Array { elem: std::sync::Arc::new(Ty::Str) }, Ty::Nil].into() };
+        let part = Ty::Union {
+            variants: vec![Ty::Class { id: ClassId(Symbol::from("ActionMailer::Part")), args: vec![].into() }, Ty::Nil].into(),
+        };
+        for (m, ty) in [
+            ("to", addresses.clone()),
+            ("from", addresses.clone()),
+            ("cc", addresses.clone()),
+            ("bcc", addresses.clone()),
+            ("reply_to", addresses),
+            ("subject", Ty::Untyped),
+            ("body", Ty::Str),
+            ("multipart?", Ty::Bool),
+            ("text_part", part.clone()),
+            ("html_part", part),
+        ] {
+            delivery_cls.instance_methods.insert(Symbol::from(m), ty);
+        }
         classes
             .entry(ClassId(Symbol::from("ActionMailer::MessageDelivery")))
             .or_insert(delivery_cls);
+        let part_cls = classes.entry(ClassId(Symbol::from("ActionMailer::Part"))).or_default();
+        for m in ["body", "decoded", "mime_type"] {
+            part_cls.instance_methods.entry(Symbol::from(m)).or_insert(Ty::Str);
+        }
+
     }
 
     // ActiveJob classes: the app defines an instance
@@ -267,10 +299,10 @@ pub(in crate::analyze) fn register(
     // `set(wait: …).perform_later(…)`. Same shape as the mailer
     // block above: identify jobs by walking the parent chain to
     // `ActiveJob::Base`, then register the entries.
-    // `perform_later`/`set` return the class-typed value (`set`
-    // collapses to self under the inline semantics
-    // `lower::job_class_side` synthesizes, so the chained
-    // `perform_later` re-dispatches on the class);
+    // `set` returns the class-typed value (it collapses to self under
+    // the inline semantics `lower::job_class_side` synthesizes, so the
+    // chained `perform_later` re-dispatches on the class);
+    // `perform_later` answers nil, as that wrapper does;
     // `perform_now` returns `perform`'s declared type.
     {
         let parent_of: HashMap<&ClassId, Option<&ClassId>> = app
@@ -297,7 +329,7 @@ pub(in crate::analyze) fn register(
             if !is_job(&lc.name) {
                 continue;
             }
-            let self_ty = Ty::Class { id: lc.name.clone(), args: vec![] };
+            let self_ty = Ty::Class { id: lc.name.clone(), args: vec![].into() };
             let perform_ret = lc
                 .methods
                 .iter()
@@ -313,7 +345,8 @@ pub(in crate::analyze) fn register(
             let cls = classes.entry(lc.name.clone()).or_default();
             cls.parent = lc.parent.clone();
             for (entry, ty) in [
-                ("perform_later", self_ty.clone()),
+                // Not the job Rails answers: the wrapper `job_class_side` writes answers nil.
+                ("perform_later", Ty::Nil),
                 ("set", self_ty.clone()),
                 ("perform_now", perform_ret),
             ] {
@@ -402,19 +435,20 @@ fn ar_instance_ty(kind: crate::catalog::ReturnKind) -> Option<Ty> {
     use crate::catalog::ReturnKind;
     match kind {
         ReturnKind::Int => Some(Ty::Int),
-        ReturnKind::IntOrNil => Some(Ty::Union { variants: vec![Ty::Int, Ty::Nil] }),
+        ReturnKind::IntOrNil => Some(Ty::Union { variants: vec![Ty::Int, Ty::Nil].into() }),
         ReturnKind::Bool => Some(Ty::Bool),
         ReturnKind::Str => Some(Ty::Str),
+        ReturnKind::StrOrNil => Some(Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() }),
         ReturnKind::HashSymStr => {
-            Some(Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Str) })
+            Some(Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Str) })
         }
         ReturnKind::HashStrUntyped => {
-            Some(Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Untyped) })
+            Some(Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Untyped) })
         }
-        ReturnKind::ArrayOfSym => Some(Ty::Array { elem: Box::new(Ty::Sym) }),
-        ReturnKind::ArrayOfInt => Some(Ty::Array { elem: Box::new(Ty::Int) }),
+        ReturnKind::ArrayOfSym => Some(Ty::Array { elem: std::sync::Arc::new(Ty::Sym) }),
+        ReturnKind::ArrayOfInt => Some(Ty::Array { elem: std::sync::Arc::new(Ty::Int) }),
         ReturnKind::ClassRef(path) => {
-            Some(Ty::Class { id: ClassId(Symbol::from(path)), args: vec![] })
+            Some(Ty::Class { id: ClassId(Symbol::from(path)), args: vec![].into() })
         }
         // Self-relative, or a deliberate gradual escape.
         ReturnKind::SelfType

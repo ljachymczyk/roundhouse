@@ -10,12 +10,21 @@ pub mod app;
 pub mod builder;
 pub mod bytecode;
 pub mod catalog;
+/// Machine-readable `roundhouse check` inventory + ranked hotspot report.
+pub mod check_report;
 pub mod diagnostic;
+pub mod database;
 pub mod dialect;
+pub mod det;
+/// Shared parent/include ordering for library classes that share a file.
+pub mod library_class_order;
 pub mod effect;
 pub mod emit;
 pub mod erb;
 pub mod expr;
+/// Project extensions: gem and DSL facts an app lists in `roundhouse.yml`
+/// and keeps in its own tree, carried on [`App::extensions`].
+pub mod extensions;
 pub mod facades;
 /// The generated Rails fixtures (`fixtures/real-blog`, `fixtures/store`)
 /// the test suites read, resolved with the generating command in the
@@ -52,7 +61,12 @@ pub mod lsp;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mcp;
 pub mod naming;
+pub mod par;
 pub mod profile;
+/// Target identity and the policies lowering reads (`param_binds_enabled`,
+/// `has_runtime_relation`). Compiled for wasm: `project` is host-only, but
+/// `lower` and `emit::ruby` still name a [`build_target::BuildTarget`].
+pub mod build_target;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod project;
 /// Embedded Ruby sources for constant lookup on all targets, plus the
@@ -71,6 +85,7 @@ pub mod runtime_src;
 pub mod session;
 pub mod timings;
 pub mod treeshake;
+pub(crate) mod source_gem_shake;
 pub mod version;
 pub mod schema;
 pub mod span;
@@ -84,7 +99,8 @@ pub use dialect::{
     Action, Association, Callback, CallbackHook, Comment, Controller, ControllerBodyItem,
     Dependent, Filter, FilterKind, HttpMethod, LayoutDecl, MethodDef, MethodReceiver, Model,
     ModelBodyItem,
-    RenderTarget, ResourceScope, Route, RouteSpec, RouteTable, Scope, Validation, ValidationRule,
+    InclusionRange, RenderTarget, ResourceScope, Route, RouteSpec, RouteTable, Scope, Validation,
+    ValidationRule,
     View,
 };
 pub use effect::{Effect, EffectSet};
@@ -94,3 +110,5 @@ pub use ide::{Position, Reference, TypeAt};
 pub use schema::{Column, ColumnType, ForeignKey, Index, ReferentialAction, Schema, Table};
 pub use span::{FileId, Span};
 pub use ty::{Param, ParamKind, Row, Ty};
+
+pub mod shared;

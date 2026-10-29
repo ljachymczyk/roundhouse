@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # CRuby-only ActionDispatch::Request over the CGI env.
 #
 # The request-object surface controllers and filters reach
@@ -15,6 +16,7 @@
 # which the real ENV object would reject for non-String values.
 require "stringio"
 require_relative "action_dispatch/headers"
+require_relative "action_dispatch/request_path_parameters"
 
 module ActionDispatch
   # `ActionDispatch::TestRequest.create(env)` — see the twin in
@@ -34,11 +36,13 @@ module ActionDispatch
     # The body's params alone - see the twin in
     # runtime/ruby/action_dispatch/request.rb.
     attr_accessor :request_parameters
+    attr_reader :path_parameters
 
     def initialize(env, params = {})
       @env = env
       @params = params
       @request_parameters = {}
+      @path_parameters = RequestPathParameters.new({})
       @session_options = {}
     end
 
@@ -61,12 +65,34 @@ module ActionDispatch
       @params[key.to_s]
     end
 
+    # `request.filtered_parameters` - see the twin in
+    # runtime/ruby/action_dispatch/request.rb.
+    def filtered_parameters
+      all = {}
+      @params.each { |k, v| all[k] = v }
+      @path_parameters.to_h.each { |k, v| all[k] = v }
+      ActiveSupport::ParameterFilter.new(Rails.application.config_filter_parameters).filter(all)
+    end
+
+    def authorization
+      ActionDispatch::Http::Headers.authorization(@env)
+    end
+
+    def path_parameters=(values)
+      @path_parameters = RequestPathParameters.new(values)
+    end
+
     def request_method
       (@env["REQUEST_METHOD"] || "GET").upcase
     end
 
     def get? = request_method == "GET"
     def post? = request_method == "POST"
+    # Do not route `put?` through `request_method` — that helper upcases,
+    # while Rack/Rails compare the raw env value to literal `"PUT"` (so
+    # `"put"` must stay false). Shared `runtime/ruby` `put?` is likewise
+    # case-sensitive on `@request_method` (no upcase on assign).
+    def put? = @env["REQUEST_METHOD"] == "PUT"
     # Rails' "is this a safe request" idiom is `request.get? ||
     # request.head?`, and campfire writes exactly that in
     # `BlockBannedRequests#safe_request?`. This overlay is the Request
@@ -111,8 +137,48 @@ module ActionDispatch
     # So an app with no `domain` of its own raised NoMethodError on its
     # first absolute URL: campfire's message row, which links each
     # message by `room_at_message_url`.
+    # Rails' `raw_host_with_port`, and what `host` answers here: the Host
+    # header already included its port. The last `X-Forwarded-Host`
+    # wins only from a loopback or private peer, and only when it is a
+    # host authority. `config.hosts` is not applied yet.
     def host
+      raw_host_with_port
+    end
+
+    def raw_host_with_port
+      forwarded = forwarded_authority
+      return forwarded unless forwarded.empty?
       @env["HTTP_HOST"] || @env["SERVER_NAME"] || "localhost"
+    end
+
+    def forwarded_authority
+      return "" unless trusted_forwarded_peer?
+      forwarded = @env.fetch("HTTP_X_FORWARDED_HOST", "").to_s.split(",").last.to_s.strip
+      return "" unless host_authority?(forwarded)
+      forwarded
+    end
+
+    def trusted_forwarded_peer?
+      ip = remote_ip.to_s
+      # Empty is not loopback. A missing address must not count as the
+      # proxy in front of the app.
+      return false if ip.empty?
+      return true if ip == "127.0.0.1" || ip == "::1" || ip == "localhost"
+      return true if ip.start_with?("10.") || ip.start_with?("192.168.") || ip.start_with?("169.254.")
+      return true if ip.start_with?("fc") || ip.start_with?("fd") || ip.start_with?("fe80:")
+      if ip.start_with?("172.")
+        second = ip.split(".")[1].to_s.to_i
+        return true if second >= 16 && second <= 31
+      end
+      if ip.start_with?("100.")
+        second = ip.split(".")[1].to_s.to_i
+        return true if second >= 64 && second <= 127
+      end
+      false
+    end
+
+    def host_authority?(value)
+      value.match?(/\A(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(:[0-9]{1,5})?\z/)
     end
 
     # See the shared twin: HTTPS=on, or a TLS-terminating proxy's
@@ -124,8 +190,11 @@ module ActionDispatch
       @env["rack.url_scheme"].to_s.downcase == "https"
     end
 
+    # Memoized, as Rails' `ActionDispatch::Request#protocol` is: the env
+    # does not change under a request, and a page asks for the scheme
+    # once per absolute URL.
     def protocol
-      ssl? ? "https://" : "http://"
+      @protocol ||= ssl? ? "https://" : "http://"
     end
 
     # Twin of the shared class's: the port from the Host header, nil at
@@ -139,14 +208,55 @@ module ActionDispatch
       port
     end
 
+    def port
+      authority = forwarded_authority
+      if authority.empty?
+        authority = @env["HTTP_HOST"] || @env["SERVER_NAME"] || "localhost"
+        if !@env.key?("HTTP_HOST") && (@env.key?("SERVER_NAME") || !authority.include?(":"))
+          authority = "#{authority}:#{@env.fetch("SERVER_PORT", "").to_s}"
+        end
+      end
+      sep = authority.rindex(":")
+      unless sep.nil?
+        value = authority[(sep + 1)..].to_s
+        return value.to_i if value.match?(/\A[0-9]+\z/)
+      end
+      ssl? ? 443 : 80
+    end
+
     # Without the scheme's standard port, as the shared twin's: Rails'
     # `host_with_port` writes no `:443`/`:80`, and the CSRF check
     # compares this with an Origin a browser serializes the same way.
+    #
+    # Memoized like `protocol`: campfire's fragment keys name the base URL,
+    # once per message on a page, and each answer re-read the scheme and
+    # re-split X-Forwarded-Host from the env.
     def base_url
-      h = host
-      default = ssl? ? ":443" : ":80"
-      h = h[0, h.length - default.length] if h.end_with?(default)
-      "#{protocol}#{h}"
+      @base_url ||= begin
+        h = host
+        default = ssl? ? ":443" : ":80"
+        h = h[0, h.length - default.length] if h.end_with?(default)
+        "#{protocol}#{h}"
+      end
+    end
+
+    # Twin of the shared Request: scheme stripped, standard port already
+    # dropped by `base_url`.
+    def host_with_port
+      b = base_url
+      p = protocol
+      return "" if b.length < p.length
+      b[p.length..].to_s
+    end
+
+    # Same memo as the shared class. This overlay replaces that class on
+    # the CRuby lane, so the method has to live here too.
+    def content_security_policy
+      return @content_security_policy if defined?(@csp_ready) && @csp_ready
+      @csp_ready = true
+      src = Rails.application.content_security_policy
+      @content_security_policy = src.nil? ? nil : src.dup
+      @content_security_policy
     end
 
     def remote_ip

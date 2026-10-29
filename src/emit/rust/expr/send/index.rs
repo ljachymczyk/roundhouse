@@ -79,12 +79,8 @@ pub(super) fn try_recv_typed_method(
             // Only fires for literal negatives — dynamic negative
             // indices would need a runtime branch, which the framework
             // patterns we ship today don't require.
-            if matches!(
-                recv_ty,
-                Some(crate::ty::Ty::Array { .. })
-                    | Some(crate::ty::Ty::Str)
-                    | Some(crate::ty::Ty::Sym)
-            ) {
+            // Not a String too: a Rust str has no integer index, and the character read below answers `s[-1]`
+            if matches!(recv_ty, Some(crate::ty::Ty::Array { .. })) {
                 if let ExprNode::Lit { value: Literal::Int { value } } = &*args[0].node {
                     if *value < 0 {
                         let recv_s = emit_expr(r);
@@ -94,14 +90,19 @@ pub(super) fn try_recv_typed_method(
                         // delivers. Callers (e.g. `Base.last`'s tail
                         // wrapped in `Some(...)`) need owned T to
                         // match the `Option<T>` return type.
-                        if matches!(recv_ty, Some(crate::ty::Ty::Array { .. })) {
-                            return Some(format!(
-                                "{recv_s}[{recv_s}.len() - {abs}_usize].clone()"
-                            ));
-                        }
-                        return Some(format!("{recv_s}[{recv_s}.len() - {abs}_usize]"));
+                        return Some(format!(
+                            "{recv_s}[{recv_s}.len() - {abs}_usize].clone()"
+                        ));
                     }
                 }
+            }
+            // Not `s[i as usize]`: a Rust str indexes bytes by range, where Ruby's `s[i]` is the character at a character index (the empty String past the end, as Array#[] here answers the element without its nil)
+            if matches!(recv_ty, Some(crate::ty::Ty::Str) | Some(crate::ty::Ty::Sym)) && matches!(arg_ty, Some(crate::ty::Ty::Int)) {
+                return Some(format!(
+                    "{{ let __s: &str = &*({}); let __n = __s.chars().count() as i64; let __i: i64 = {}; let __j = if __i < 0 {{ __i + __n }} else {{ __i }}; if __j < 0 || __j >= __n {{ String::new() }} else {{ __s.chars().nth(__j as usize).map(|c| c.to_string()).unwrap_or_default() }} }}",
+                    emit_expr(r),
+                    emit_expr(&args[0])
+                ));
             }
             // Slice/Vec indexing needs `usize`. Ruby integers (including
             // numeric loop counters like `let mut i = 0_i64`) lower to
@@ -158,10 +159,14 @@ pub(super) fn try_recv_typed_method(
             // through `.get(...).unwrap_or(...)` instead — nullable
             // columns dropped the default and hit the panicking index.
             if map_holds_json_value(recv_ty) {
+                // A `Value` narrowed by `is_a?(Hash)` reads as a `serde_json::Map`, whose `get` borrows its String key.
+                let narrowed_object = matches!(&*r.node, ExprNode::Var { name, .. }
+                    if matches!(super::super::var_decl_ty(name.as_str()), Some(crate::ty::Ty::Untyped)));
+                let key = emit_expr(&args[0]);
+                let key = if narrowed_object { format!("&*{key}") } else { key };
                 return Some(format!(
-                    "{}.get({}).cloned().unwrap_or(serde_json::Value::Null)",
+                    "{}.get({key}).cloned().unwrap_or(serde_json::Value::Null)",
                     emit_expr(r),
-                    emit_expr(&args[0])
                 ));
             }
             if matches!(&*r.node, ExprNode::Const { .. }) {
@@ -192,6 +197,16 @@ pub(super) fn try_recv_typed_method(
             let recv_s = emit_expr(r);
             let start_s = emit_expr(&args[0]);
             let len_s = emit_expr(&args[1]);
+            // An Array's `[start, length]` is a new Array, or nil for a start past the end, not the String slice below
+            if matches!(r.ty.as_ref().map(peel_nil), Some(crate::ty::Ty::Array { .. })) {
+                return Some(format!(
+                    "{{ let __v = &({recv_s}); let __n = __v.len() as i64; \
+                     let mut __b = ({start_s}) as i64; if __b < 0 {{ __b += __n; }} \
+                     let __l = ({len_s}) as i64; \
+                     if __b < 0 || __b > __n || __l < 0 {{ None }} \
+                     else {{ Some(__v.iter().skip(__b as usize).take(__l as usize).cloned().collect::<Vec<_>>()) }} }}"
+                ));
+            }
             // Ruby semantics, not a raw byte range: characters, a
             // negative start counting from the end, and the slice
             // CLAMPED to the string (`"abc"[1, 10]` is "bc") — a
@@ -293,7 +308,7 @@ pub(super) fn try_recv_typed_method(
                     // RBS `[]=: (String, String?)` — rust emits
                     // `set_index(&str, Option<String>)`, not Value.
                     let opt_str = crate::ty::Ty::Union {
-                        variants: vec![crate::ty::Ty::Str, crate::ty::Ty::Nil],
+                        variants: vec![crate::ty::Ty::Str, crate::ty::Ty::Nil].into(),
                     };
                     let wrapped = super::coerce::coerce_arg_for_param_ty(&args[1], &opt_str);
                     return Some(format!(
@@ -467,7 +482,14 @@ pub(super) fn try_recv_typed_method(
             && args.len() == 2
             && matches!(r.ty.as_ref().map(peel_nil), Some(crate::ty::Ty::Hash { .. }))
         {
-            let key_s = emit_expr(&args[0]);
+            // Not the key by value: HashMap#get takes a borrow, and a computed String key is owned
+            let key_s = if args[0].ty.as_ref().is_some_and(|t| matches!(peel_nil(t), crate::ty::Ty::Str | crate::ty::Ty::Sym))
+                && !matches!(&*args[0].node, ExprNode::Lit { .. })
+            {
+                format!("&*({})", emit_expr(&args[0]))
+            } else {
+                emit_expr(&args[0])
+            };
             let default_is_nil = matches!(
                 &*args[1].node,
                 ExprNode::Lit { value: Literal::Nil }
@@ -618,6 +640,15 @@ pub(super) fn try_recv_typed_method(
         // misses those cases. Non-String receivers would already
         // fail E0599 today and surface as a clearer error after the
         // bridge fires (`&recv_s` deref against a non-String type).
+        // Ruby's whitespace, not Rust's Unicode `trim_start`; rstrip also takes the NULs
+        if matches!(method, "lstrip" | "rstrip") && args.is_empty() {
+            let recv_s = emit_expr(r);
+            return Some(if method == "lstrip" {
+                format!("{recv_s}.trim_start_matches(|c: char| \" \\t\\n\\x0b\\x0c\\r\".contains(c)).to_string()")
+            } else {
+                format!("{recv_s}.trim_end_matches(|c: char| \" \\t\\n\\x0b\\x0c\\r\\0\".contains(c)).to_string()")
+            });
+        }
         if method == "capitalize" && args.is_empty() {
             let recv_s = emit_expr(r);
             return Some(format!(

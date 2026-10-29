@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Boot chain — every `require_relative` the app needs, in the order it
 # needs them, and NOTHING that starts anything.
 #
@@ -31,15 +32,18 @@ require_relative "runtime/db"
 require_relative "runtime/base64"
 # Module-only Shellwords — packages/shellwords reopens String/Array and
 # poisons String#split (PolyArray → C compile fail). See
-# runtime/spinel/shellwords.rb; defining the module drops BUNDLED's
-# require "shellwords".
-require_relative "runtime/shellwords"
+# runtime/spinel/shellwords_spinel.rb; defining the module drops
+# BUNDLED's library row. Not named shellwords.rb: that stem on
+# runtime/ would answer a bare require and hide stdlib
+# String#shellescape on every target that shares the tree.
+require_relative "runtime/shellwords_spinel"
 require_relative "runtime/json_impl"
 # JsonBuilder — the JSON encoding primitives the Jbuilder lowerer
 # emits calls to (`Views::Articles.article_json` etc.). Separate from
 # `runtime/json.rb`'s `JSON.generate` shim: this module exposes
 # `JsonBuilder.encode_value` / `encode_string` for per-value encoding.
 require_relative "runtime/json_builder"
+require_relative "runtime/action_controller_json_render"
 # Params — narrowing accessors over the recursive request-params tree
 # (`Roundhouse::ParamValue`). The synthesized `<Resource>Params.from_raw`
 # calls these instead of open-coding `is_a?` narrowing per field, so the
@@ -66,6 +70,7 @@ require_relative "runtime/active_support_duration"
 # Blank-predicate helper for receivers `src/lower/blank.rs` had no static
 # type to ground on. Before anything that can hold a `present?` site.
 require_relative "runtime/active_support_ext"
+require_relative "runtime/active_model_validator"
 require_relative "runtime/rails"
 # `ActiveSupport::Cache::MemoryStore` (a `Rails::Cache`) and
 # `ActiveSupport::Cache.expand_cache_key`.
@@ -95,18 +100,18 @@ Rails.secret_key_base = LocalSecret.resolve(ENV["SECRET_KEY_BASE"])
 # stub reopen when the source app has none); loads right after the
 # runtime shim it reopens.
 require_relative "config/application"
-# Pin the process zone to the app's config.time_zone before anything
-# renders. Rails presents every AR temporal value in that zone
+# The app's config.time_zone becomes the runtime's default zone before
+# anything renders. Rails presents every AR temporal value in that zone
 # REGARDLESS of the host's — `parse_db_time` hydrates the stored UTC
-# instant and lands it here with `.getlocal`, so strftime/iso8601/pubDate
-# offsets match Rails on any host. `config_time_zone` is a framework
-# default in runtime/rails.rb that the app's reopen (required just above)
-# overrides when ingest found a `config.time_zone` line, so this call
-# resolves statically — no respond_to? guard, which the strict target
-# could not take anyway. Twin of the overlay main.rb's pin.
-ENV["TZ"] = ActiveSupport::RAILS_TZ_TO_IANA.fetch(
-  Rails.application.config_time_zone, Rails.application.config_time_zone
-)
+# instant and `ActiveSupport.present` lands it in this zone, so
+# strftime/iso8601/pubDate offsets match Rails on any host - while the
+# process zone stays the host's, so `Time.now` is local time as in Rails.
+# `config_time_zone` is a framework default in runtime/rails.rb that the
+# app's reopen (required just above) overrides when ingest found a
+# `config.time_zone` line, so this call resolves statically - no
+# respond_to? guard, which the strict target could not take anyway.
+# Twin of the overlay boot's.
+ActiveSupport.set_default_zone(Rails.application.config_time_zone)
 require_relative "runtime/active_record"
 # Default as_json → _as_json_only. Date-column rewrite is injected only
 # when app_uses_date (see project::spinel_files); Campfire omits Date.
@@ -166,6 +171,21 @@ require_relative "runtime/active_job"
 # ActiveJob payload codecs: after the module and its DeserializationError,
 # and after global_id_locator, whose URI parser the record reader uses.
 require_relative "runtime/active_job_serialization"
+# Sidekiq pushes for an app on queue_adapter :sidekiq: the Redis
+# connection (a raising façade unless the tree is on :sidekiq), then the
+# envelope and the after-commit hold. Before job_registry, whose COMMIT
+# and ROLLBACK edges flush and drop the held pushes.
+require_relative "runtime/sidekiq_redis"
+require_relative "runtime/sidekiq_push"
+# The app's payload jobs (generated), and the drain's payload arm.
+require_relative "runtime/job_registry"
+# The `sidekiq` role: envelope reads and dead records, then the worker
+# (a façade unless the tree is on :sidekiq).
+require_relative "runtime/sidekiq_envelope"
+require_relative "runtime/sidekiq_worker"
+# Broadcasts between processes through Redis, for config/cable.yml's
+# `adapter: redis` (a façade unless the tree is on :sidekiq).
+require_relative "runtime/redis_cable"
 # Per-request state per THREAD -- reopens Current, the view slots, the
 # broadcast log, the job queue and the store memo (see the file).
 require_relative "runtime/thread_state"
@@ -174,6 +194,9 @@ require_relative "runtime/thread_state"
 # overlay replaces it with a thread-variable memo + String.new(capacity:).
 require_relative "runtime/view_buffer_cap"
 require_relative "runtime/tep/tep"
+# Gem packages (runtime/gems/<gem>/) load right after this line, which
+# `project::apply_gem_packages` finds: they register their hooks here.
+require_relative "runtime/request_hooks"
 # Spinel-only CGI reopen: `require "cgi"` reaches spinel's bundled package
 # and this adds `parse`, which upstream moved to `cgi/core`. CRuby/JRuby use
 # the stdlib. No longer needs to follow tep — the escapes were routed to
@@ -247,13 +270,21 @@ require_relative "runtime/cable"
 # subclasses, and after broadcasts, whose `record` it calls.
 require_relative "runtime/action_cable"
 require_relative "runtime/turbo_streams"
-require_relative "config/routes"
 # Per-app Importmap override (generated by Roundhouse from the source
 # app's config/importmap.rb). Reopens the fallback module to supply
 # the source's actual pins. spinel/master fixed module-reopen with
 # same-name cmeth dispatch (matz/spinel#517), so this is now a plain
 # require_relative under both CRuby and spinel.
+#
+# BEFORE config/routes: routes requires the controllers, which reach
+# the views, and the layout hoists `javascript_importmap_tags(Importmap
+# .pins, Importmap.entry)` into a load-time constant. A call binds to
+# the method in effect where it runs (CRuby; spinel since #10422), so
+# required after routes that constant held the fallback's empty pins
+# (rubys/roundhouse#1477). The reopen answers literals and needs
+# nothing loaded first.
 require_relative "config/importmap"
+require_relative "config/routes"
 # Rails' fragment caching through the controller: reopens
 # `ActionView::ViewHelpers.fragment_read/_write`, so after every file that
 # defines them.
@@ -261,6 +292,11 @@ require_relative "runtime/action_controller_fragment_caching"
 # Rails 8.1.4's full ActionController::Head options hash is a Ruby-family
 # feature; strict non-Ruby targets keep the bounded shared implementation.
 require_relative "runtime/action_controller_head"
+# Rails' FlashHash keeps any key; the shared Flash keeps notice/alert, which every target can type.
+require_relative "runtime/flash_any_key"
+# Rails 8.1.4 `send_data(filename:)`: the Content-Disposition escaping
+# works over UTF-8 bytes, so it is a Ruby-family reopen as well.
+require_relative "runtime/action_controller_send_data"
 # The app/models.rb aggregator (generated — see apply_models_aggregator)
 # loads every model/support class. Model files only require their own
 # LOAD-time deps (superclass, class-body consts); method-body references

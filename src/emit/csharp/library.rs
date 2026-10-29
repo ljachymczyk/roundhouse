@@ -18,7 +18,8 @@
 //! classification maps drive lookup only (see `expr.rs`).
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
+use crate::det::HashSet;
 use std::path::PathBuf;
 
 use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver};
@@ -162,8 +163,8 @@ pub fn emit_test_class(
     }
 
     register_params_for(&class_name, &lc.methods);
-    super::expr::set_object_tl_fields(HashSet::new());
-    set_ivar_renames(std::collections::HashMap::new());
+    super::expr::set_object_tl_fields(HashSet::default());
+    set_ivar_renames(crate::det::HashMap::default());
 
     // Body-only ivars (e.g. `@article` assigned in `setup`) → properties so
     // reads in the test methods resolve.
@@ -202,7 +203,7 @@ pub fn emit_test_class(
     // Property registry so `self.@article` reads emit as a property name.
     let instance_props: HashSet<String> = body_ivars.keys().cloned().collect();
     set_instance_props(instance_props);
-    let prop_ty_map: std::collections::HashMap<String, Ty> =
+    let prop_ty_map: crate::det::HashMap<String, Ty> =
         inferred_ivar_types.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
     set_instance_prop_types(prop_ty_map);
     set_current_class(&class_name);
@@ -298,10 +299,10 @@ fn homogeneous_lit_type<'a>(mut elems: impl Iterator<Item = &'a Expr>) -> &'stat
 
 /// Render a Ruby `module X` (a set of class methods) as a C# `static class`.
 pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
-    set_instance_prop_types(std::collections::HashMap::new());
-    super::expr::set_object_tl_fields(HashSet::new());
-    set_instance_props(HashSet::new());
-    set_ivar_renames(std::collections::HashMap::new());
+    set_instance_prop_types(crate::det::HashMap::default());
+    super::expr::set_object_tl_fields(HashSet::default());
+    set_instance_props(HashSet::default());
+    set_ivar_renames(crate::det::HashMap::default());
     let name = methods
         .first()
         .and_then(|m| m.enclosing_class.as_ref())
@@ -332,7 +333,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
         return emit_static_class(lc, &class_name);
     }
 
-    super::expr::set_object_tl_fields(HashSet::new());
+    super::expr::set_object_tl_fields(HashSet::default());
 
     // Temporal (Date/DateTime/Time) columns: a reader whose return type is
     // `DateTimeOffset` (`Ty::Time`). These must NOT collapse into an
@@ -372,7 +373,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
                 let base = m.name.as_str().trim_end_matches('=');
                 if let Some(Ty::Fn { params, .. }) = m.signature.as_ref() {
                     if let Some(p) = params.first() {
-                        prop_types.entry(camel(base)).or_insert_with(|| p.ty.clone());
+                        prop_types.entry(camel(base)).or_insert_with(|| (*p.ty).clone());
                     }
                 }
             }
@@ -404,10 +405,8 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
 
     let parent_name = lc.parent.as_ref().map(|p| {
         let last = type_name(p.0.as_str());
-        match last.as_str() {
-            "StandardError" | "RuntimeError" => "Exception".to_string(),
-            other => other.to_string(),
-        }
+        // Not a second table: a raise and a superclass name the same Ruby class, so they map alike
+        super::expr::map_exception_class(&last)
     });
 
     let inherited: HashSet<String> = lc
@@ -428,6 +427,10 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
         None => String::new(),
     };
     let mut out = format!("public class {class_name}{parent_clause} {{\n");
+    // Not left to the implicit constructor: C# inherits none, and `raise X, "message"` builds one with the message
+    if init.is_none() && lc.parent.as_ref().is_some_and(|p| super::expr::derives_from_exception(&type_name(p.0.as_str()))) {
+        out.push_str(&format!("    public {class_name}() {{ }}\n    public {class_name}(string message) : base(message) {{ }}\n"));
+    }
 
     // Properties (auto-properties). Constructor-param-backed properties are
     // assigned in the constructor; column props are plain `public` (leaf, not
@@ -449,7 +452,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     // emits as a private renamed field (`_errors`) that every `@ivar`
     // reference rewrites to. The method keeps the public name.
     let methods_set = instance_method_names(lc);
-    let ivar_renames: std::collections::HashMap<String, String> = body_ivars
+    let ivar_renames: crate::det::HashMap<String, String> = body_ivars
         .keys()
         .filter(|n| methods_set.contains(*n))
         .map(|n| (n.clone(), format!("_{n}")))
@@ -504,7 +507,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
         .cloned()
         .collect();
     set_instance_props(instance_props);
-    let mut prop_ty_map: std::collections::HashMap<String, Ty> =
+    let mut prop_ty_map: crate::det::HashMap<String, Ty> =
         prop_types.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
     for (n, t) in &inferred_ivar_types {
         prop_ty_map.entry(n.clone()).or_insert_with(|| t.clone());
@@ -621,12 +624,12 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
 /// A Ruby `module` → C# `static class`. Class-level `attr_accessor` (from
 /// `class << self`) collapses to a static property.
 fn emit_static_class(lc: &LibraryClass, class_name: &str) -> String {
-    set_instance_prop_types(std::collections::HashMap::new());
+    set_instance_prop_types(crate::det::HashMap::default());
     // `self` in a module function is the static class itself.
     set_current_class(class_name);
-    super::expr::set_object_tl_fields(HashSet::new());
-    set_instance_props(HashSet::new());
-    set_ivar_renames(std::collections::HashMap::new());
+    super::expr::set_object_tl_fields(HashSet::default());
+    set_instance_props(HashSet::default());
+    set_ivar_renames(crate::det::HashMap::default());
     let accessor_props = class_accessor_props(&lc.methods);
     // `partial` so a hand-written C# runtime file can add native overloads to a
     // transpiled module (e.g. `JsonBuilder.EncodeDatetime(DateTimeOffset?)` in
@@ -780,7 +783,7 @@ fn member_name(m: &MethodDef) -> String {
 }
 
 fn instance_member_names(lc: &LibraryClass) -> HashSet<String> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     for m in &lc.methods {
         if m.receiver != MethodReceiver::Instance {
             continue;
@@ -998,9 +1001,12 @@ fn emit_method(m: &MethodDef, modifier: &str) -> String {
         params.push(format!("{bt} block"));
     }
 
+    // Not void for a method without a signature: an app method's answer is its body's type
     let ret_ty = match m.signature.as_ref() {
         Some(Ty::Fn { ret, .. }) => Some((**ret).clone()),
-        _ => None,
+        _ if m.name.as_str() == "initialize" => None,
+        // Not untyped when the body's type is open: a statement-only tail would then leave a value method with no return
+        _ => m.body.ty.clone().filter(|t| !t.is_open()),
     };
     let returns_value = matches!(&ret_ty, Some(t) if !matches!(t, Ty::Nil));
     let ret_decl = match &ret_ty {
@@ -1161,6 +1167,9 @@ fn wrap_return(e: &Expr) -> String {
         ExprNode::Array { elements, .. } => {
             let els: Vec<String> = elements.iter().map(emit_expr).collect();
             return format!("return new() {{ {} }};", els.join(", "));
+        }
+        ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
+            return super::expr::emit_begin_rescue(body, rescues, else_branch.as_ref(), ensure.as_ref(), &wrap_return);
         }
         // A value-position `if` → return from each branch (C# has no
         // block-valued `if`). Empty branches return the type default.
@@ -1330,7 +1339,7 @@ fn class_accessor_props(methods: &[MethodDef]) -> BTreeMap<String, Ty> {
                 if let Some(Ty::Fn { params, .. }) = m.signature.as_ref() {
                     if let Some(p) = params.first() {
                         let base = m.name.as_str().trim_end_matches('=');
-                        props.entry(camel(base)).or_insert_with(|| p.ty.clone());
+                        props.entry(camel(base)).or_insert_with(|| (*p.ty).clone());
                     }
                 }
             }

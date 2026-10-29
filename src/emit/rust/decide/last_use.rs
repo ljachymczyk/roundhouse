@@ -26,7 +26,7 @@
 //! read of each multi-read var now moves instead of cloning. Same
 //! HTTP-response semantics, byte-different emitted Rust.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::dialect::LibraryClass;
 use crate::expr::{Expr, ExprNode, InterpPart, LValue};
@@ -53,8 +53,8 @@ fn stamp_method(body: &mut Expr) {
     collect_var_reads(body, &mut seq, &mut reads);
 
     // Aggregate: read count + max sequence per name.
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    let mut last_seq: HashMap<String, usize> = HashMap::new();
+    let mut counts: HashMap<String, usize> = HashMap::default();
+    let mut last_seq: HashMap<String, usize> = HashMap::default();
     for (name, s) in &reads {
         *counts.entry(name.clone()).or_insert(0) += 1;
         last_seq
@@ -95,7 +95,7 @@ fn collect_var_reads(
             // `collect_var_read_counts`). `hint` lives on the outer
             // `Expr`, not the Send variant.
             let skip_recv = matches!(
-                e.hint,
+                e.hint(),
                 Some(crate::expr::IrHint::StringBuilderAppend)
             );
             if !skip_recv {
@@ -279,7 +279,7 @@ fn stamp_var_reads(
 ) {
     // Local copy to stamp on after recursing into children.
     let outer_skip_recv = matches!(
-        e.hint,
+        e.hint(),
         Some(crate::expr::IrHint::StringBuilderAppend)
     );
     match &mut *e.node {

@@ -1,12 +1,12 @@
 //! ActiveRecord `serialize :attr, coder: JSON` — schema-less JSON in a
 //! column (text/string/json), decoded at the public accessor boundary
-//! through [`JsonColumn`](crate) the same way a schema `t.json` column is.
+//! through [`RoundhouseJsonColumn`](crate) the same way a schema `t.json` column is.
 //!
 //! Claimed spellings: `coder: JSON`, positional `JSON`, and toplevel
 //! `::JSON` (Const path `["", "JSON"]`). Bare YAML `serialize :prefs`,
 //! custom coders, and Array/Hash positional classes stay unclaimed.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::dialect::{Model, ModelBodyItem};
 use crate::expr::{ExprNode, Literal, LValue};

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Primitive Db surface — the layer that per-model adapter code sits on
 # top of. The contract is database-agnostic; this file is the
 # SQLite-via-libsqlite3-FFI implementation, the runtime spinel-compiled
@@ -56,6 +57,7 @@ module SQL
   ffi_const :OK,   0
   ffi_const :ROW,  100
   ffi_const :DONE, 101
+  ffi_const :BUSY, 5
   # sqlite3_column_type storage classes. NULL is the one the nullable
   # reads have always needed; the rest let `column_value` hand back the
   # driver's native type instead of everything-as-text.
@@ -100,6 +102,9 @@ module SQL
   # which now runs only at pool shutdown (see DbConn#finalize_all).
   ffi_func :sqlite3_reset,             [:ptr],                                :int
   ffi_func :sqlite3_clear_bindings,    [:ptr],                                :int
+  # SQLITE_STMTSTATUS_RUN: first native steps, including replay promotions.
+  # Only the boot-time opt-in diagnostic reads this native counter.
+  ffi_func :sqlite3_stmt_status,       [:ptr, :int, :int],                     :int
   # Placeholder binding (roundhouse#12, Path A.2). `bind_int64` binds a
   # `?` param to an integer (int64 so lobsters-scale ids don't truncate);
   # `bind_text` binds the full byte length, including embedded
@@ -112,6 +117,7 @@ module SQL
   ffi_func :sqlite3_bind_int64,        [:ptr, :int, :long],                   :int
   ffi_func :sqlite3_bind_null,         [:ptr, :int],                          :int
   ffi_func :sqlite3_bind_text,         [:ptr, :int, :str, :int, :ptr],        :int
+  ffi_func :sqlite3_bind_blob,         [:ptr, :int, :str, :int, :ptr],        :int
   # `sqlite3_column_type` reports the storage class of a column in the
   # current row; 5 is SQLITE_NULL. The nullable-column reads below need
   # it because `sqlite3_column_int` cannot distinguish a stored 0 from
@@ -120,6 +126,16 @@ module SQL
   ffi_func :sqlite3_column_int,        [:ptr, :int],                          :int
   ffi_func :sqlite3_column_double,     [:ptr, :int],                          :double
   ffi_func :sqlite3_column_text,       [:ptr, :int],                          :str
+  # Not `:str` for a BLOB: it stops at the first NUL and answers a UTF-8 String, where the sqlite3 gem answers every byte as ASCII-8BIT.
+  ffi_source <<~C
+    #include <sqlite3.h>
+    const char *rh_sqlite3_column_blob(void *stmt, int i) {
+      const void *p = sqlite3_column_blob((sqlite3_stmt *)stmt, i);
+      sp_ffi_bin_len = sqlite3_column_bytes((sqlite3_stmt *)stmt, i);
+      return p ? (const char *)p : "";
+    }
+  C
+  ffi_func :rh_sqlite3_column_blob,    [:ptr, :int],                          :binstr
   ffi_func :sqlite3_column_count,      [:ptr],                                :int
   ffi_func :sqlite3_column_name,       [:ptr, :int],                          :str
   ffi_func :sqlite3_errmsg,            [:ptr],                                :str
@@ -205,6 +221,15 @@ class Stmt
     @cached = cached
     @in_use = true
     @closed = false
+    @stat_runs = 0
+  end
+
+  def cached
+    @cached
+  end
+
+  def stat_runs
+    @stat_runs
   end
 
   def sql
@@ -238,6 +263,8 @@ class Stmt
       @cached = false if rc != SQL::OK
     end
     if !@cached
+      # Read before finalize, which destroys the pointer even on failure.
+      @stat_runs = SQL.sqlite3_stmt_status(@ptr, 6, 0) if DbConn::STMT_STATS
       close_rc = SQL.sqlite3_finalize(@ptr)
       rc = close_rc if rc == SQL::OK
       # sqlite3_finalize destroys the statement even when it reports the
@@ -299,8 +326,8 @@ class QcEntry
   end
 
   # Copy the current row of a real stmt, every column, by storage class:
-  # 0 NULL, 1 INTEGER, 2 REAL, 3 TEXT (BLOB reads as text, as
-  # Db.column_value does).
+  # 0 NULL, 1 INTEGER, 2 REAL, 3 TEXT (a BLOB is kept as its binary
+  # String, as Db.column_value answers it).
   def record_row(stmt)
     i = 0
     while i < @ncols
@@ -324,7 +351,7 @@ class QcEntry
         @kinds.push(3)
         @ints.push(0)
         @floats.push(0.0)
-        v = SQL.sqlite3_column_text(stmt, i)
+        v = Db.cell_text(stmt, i)
         @texts.push(v.nil? ? "" : v)
       end
       i += 1
@@ -403,6 +430,11 @@ end
 
 class DbConn
   CAP = 128
+  # Distinct prepared SQL retained for RH_STMT_STATS. Past this, the snapshot
+  # keeps the cap and sets distinct_sql_capped instead of storing every string.
+  STAT_SQL_CAP = 4096
+  STMT_STATS_DEST = ENV.fetch("RH_STMT_STATS", "")
+  STMT_STATS = STMT_STATS_DEST != "" && STMT_STATS_DEST != "0"
 
   def initialize(dbh)
     @dbh = dbh
@@ -437,6 +469,21 @@ class DbConn
     @holds_permit = false
     # wal_autocheckpoint=0 applied (Db.checkpoint_in_background!).
     @manual_ckpt = false
+    @stat_hits = 0
+    @stat_misses = 0
+    @stat_failures = 0
+    @stat_peak = 0
+    @stat_trims = 0
+    @stat_evictions = 0
+    @stat_finalizations = 0
+    @stat_runs = 0
+    @stat_transient = 0
+    @stat_qc_hits = 0
+    @stat_qc_misses = 0
+    @stat_qc_bypasses = 0
+    @stat_sql = nil
+    @stat_sql_capped = false
+    @stat_sql = {} if STMT_STATS
   end
 
   def dbh
@@ -525,6 +572,7 @@ class DbConn
         if !e.in_use
           # Only a successful release makes a statement idle; its cursor
           # and bindings are already reset and cleared.
+          @stat_hits += 1 if STMT_STATS
           e.checkout
           @open.push(e)
           return e.ptr
@@ -577,11 +625,18 @@ class DbConn
       st = rc == SQL::OK ? SQL.read_ptr(SQL.stmt_out) : 0
     end
     if rc != SQL::OK
-      raise "Db.prepare failed (" + rc.to_s + "): " + SQL.sqlite3_errmsg(@dbh) + " — sql: " + sql
+      @stat_failures += 1 if STMT_STATS
+      Db.raise_statement_error("Db.prepare failed (" + rc.to_s + "): " + SQL.sqlite3_errmsg(@dbh) + " — sql: " + sql, rc == SQL::BUSY)
     end
     entry = Stmt.new(sql, st, cached)
     index_cached(entry) if cached
     @open.push(entry)
+    if STMT_STATS
+      @stat_misses += 1
+      @stat_transient += 1 if !cached
+      remember_stat_sql(sql)
+      @stat_peak = @entries.length if @entries.length > @stat_peak
+    end
     st
   end
 
@@ -595,6 +650,7 @@ class DbConn
       e = @open[i]
       if e.ptr == ptr
         rc = e.release
+        stats_released(e) if STMT_STATS && e.closed
         @open.delete_at(i)
         if rc != SQL::OK
           discard_closed
@@ -614,6 +670,7 @@ class DbConn
     i = 0
     while i < @open.length
       release_rc = @open[i].release
+      stats_released(@open[i]) if STMT_STATS && @open[i].closed
       rc = release_rc if rc == SQL::OK
       i += 1
     end
@@ -630,6 +687,7 @@ class DbConn
     while i >= 0
       if @entries[i].closed
         unindex_cached(@entries[i])
+        @stat_evictions += 1 if STMT_STATS
         @entries.delete_at(i)
       end
       i -= 1
@@ -650,10 +708,15 @@ class DbConn
     return nil if @entries.length <= CAP
     keep = []
     drop_before = @entries.length - CAP
+    @stat_trims += 1 if STMT_STATS
     i = 0
     while i < @entries.length
       if i < drop_before && !@entries[i].in_use
         unindex_cached(@entries[i])
+        if STMT_STATS
+          @stat_evictions += 1
+          stats_finalize(@entries[i].ptr)
+        end
         SQL.sqlite3_finalize(@entries[i].ptr)
       else
         keep.push(@entries[i])
@@ -721,9 +784,17 @@ class DbConn
   # (recording its rows as they are stepped, when the cache is on).
   # Returns 0 as "no replay" so `Db.prepare` can tell the two apart.
   def qc_lookup(sql, preparable = true)
-    return 0 if !@qc_on || sql.include?("?")
+    # SQL-only replay cannot distinguish values bound to the same shape.
+    if !@qc_on || sql.include?("?")
+      @stat_qc_bypasses += 1 if STMT_STATS
+      return 0
+    end
     e = @qc_by_sql[sql]
-    return 0 if e.nil?
+    if e.nil?
+      @stat_qc_misses += 1 if STMT_STATS
+      return 0
+    end
+    @stat_qc_hits += 1 if STMT_STATS
     @qc_cursors.push(QcCursor.new(e, preparable))
     @qc_cursors.length
   end
@@ -839,7 +910,7 @@ class DbConn
     msg = SQL.sqlite3_errmsg(@dbh)
     @qc_recording.delete(ptr)
     SQL.sqlite3_reset(ptr)
-    raise "Db.step failed (" + rc.to_s + "): " + msg
+    Db.raise_statement_error("Db.step failed (" + rc.to_s + "): " + msg, rc == SQL::BUSY)
   end
 
   def bind_checked(ptr, idx, rc)
@@ -847,7 +918,7 @@ class DbConn
     msg = SQL.sqlite3_errmsg(@dbh)
     @qc_recording.delete(ptr)
     SQL.sqlite3_reset(ptr)
-    raise "Db.bind failed (" + rc.to_s + ") at parameter " + idx.to_s + ": " + msg
+    Db.raise_statement_error("Db.bind failed (" + rc.to_s + ") at parameter " + idx.to_s + ": " + msg, rc == SQL::BUSY)
   end
 
   def qc_step?(handle)
@@ -940,12 +1011,72 @@ class DbConn
     ensure
       i = 0
       while i < @entries.length
+        stats_finalize(@entries[i].ptr) if STMT_STATS
         SQL.sqlite3_finalize(@entries[i].ptr)
         i += 1
       end
       @entries.clear
       # Bulk wipe: no per-entry unindex; the map goes with the array.
       @entry_by_sql = {}
+    end
+    nil
+  end
+
+  # Keep distinct SQL only while diagnostics are on, and only up to the cap.
+  def remember_stat_sql(sql)
+    return nil if @stat_sql[sql]
+    if @stat_sql.length >= STAT_SQL_CAP
+      @stat_sql_capped = true
+      return nil
+    end
+    @stat_sql[sql] = true
+    nil
+  end
+
+  # Stmt#release read this counter while a transient or failed cached
+  # pointer was still alive. It can now be collected without rereading it.
+  def stats_released(entry)
+    @stat_runs += entry.stat_runs
+    @stat_finalizations += 1
+    nil
+  end
+
+  def stats_finalize(ptr)
+    @stat_runs += SQL.sqlite3_stmt_status(ptr, 6, 0)
+    @stat_finalizations += 1
+    nil
+  end
+
+  # Snapshots are for an idle pool or the owning script's thread. They add
+  # no locks to a connection's exclusively leased request path.
+  def dump_stmt_stats(phase, connection)
+    return nil unless STMT_STATS
+    runs = @stat_runs
+    @entries.each { |entry| runs += SQL.sqlite3_stmt_status(entry.ptr, 6, 0) }
+    # Explicit transient reads outside a lease can remain live at snapshot.
+    @open.each do |entry|
+      runs += SQL.sqlite3_stmt_status(entry.ptr, 6, 0) if !entry.cached && !entry.closed
+    end
+    line = "RH_STMT_STATS phase=" + phase + " connection=" + connection +
+      " hits=" + @stat_hits.to_s + " misses=" + @stat_misses.to_s +
+      " prepare_failures=" + @stat_failures.to_s +
+      " entries=" + @entries.length.to_s + " peak_entries=" + @stat_peak.to_s +
+      " distinct_sql=" + @stat_sql.length.to_s +
+      " distinct_sql_capped=" + (@stat_sql_capped ? "1" : "0") +
+      " trims=" + @stat_trims.to_s + " evictions=" + @stat_evictions.to_s +
+      " finalizations=" + @stat_finalizations.to_s +
+      " transient_prepares=" + @stat_transient.to_s +
+      " qc_hits=" + @stat_qc_hits.to_s + " qc_misses=" + @stat_qc_misses.to_s +
+      " qc_bypasses=" + @stat_qc_bypasses.to_s +
+      " executions=" + runs.to_s
+    if STMT_STATS_DEST == "1"
+      $stderr.puts line
+    else
+      begin
+        File.open(STMT_STATS_DEST, "a") { |file| file.puts line }
+      rescue StandardError => e
+        $stderr.puts "RH_STMT_STATS write failed: " + e.message
+      end
     end
     nil
   end
@@ -1020,6 +1151,8 @@ class DbPool
     # on OS or power failure. That is the guarantee campfire ships with,
     # so it is the one to match.
     "PRAGMA synchronous=NORMAL",
+    # Not SQLite's default (off): Rails' DEFAULT_PRAGMAS turn it on, so a row naming a missing parent raises InvalidForeignKey.
+    "PRAGMA foreign_keys=ON",
   ].freeze
 
   def initialize(path, n)
@@ -1043,6 +1176,10 @@ class DbPool
       # should still serve, slower, rather than fail to boot — and a pragma
       # that silently did nothing is what the numbers above would reveal.
       PRAGMAS.each { |p| SQL.sqlite3_exec(dbh, p, nil, nil, nil) }
+      # The app's own `pragmas:` from config/database.yml, after PRAGMAS
+      # (generated: `project::apply_database_pragmas`).
+      # >>> generated: database-pragmas
+      # <<< generated: database-pragmas
       @conns.push(DbConn.new(dbh))
       @free.push(i)
       i += 1
@@ -1129,6 +1266,15 @@ class DbPool
       i += 1
     end
     raise error if !error.nil?
+  end
+
+  def dump_stmt_stats(phase, shard)
+    i = 0
+    while i < @conns.length
+      @conns[i].dump_stmt_stats(phase, shard.to_s + ":" + i.to_s)
+      i += 1
+    end
+    nil
   end
 end
 
@@ -1338,6 +1484,55 @@ module Db
     Thread.current[:ar_txn_depth] = value
   end
 
+  # Bit `depth - 1` of this integer is whether that frame can be joined.
+  # Same thread slot as the depth. See runtime/ruby/db.rbs.
+  def self._txn_joinable_bits
+    bits = Thread.current[:ar_txn_joinable_bits]
+    bits.nil? ? 0 : bits
+  end
+
+  def self._txn_joinable_bits=(value)
+    Thread.current[:ar_txn_joinable_bits] = value
+  end
+
+  # The open transaction's enlisted writes (connection.rb), held in the
+  # same per-thread storage as the depth.
+  def self._txn_records
+    records = Thread.current[:ar_txn_records]
+    if records.nil?
+      records = [ActiveRecord::EnlistedRecord.new(ActiveRecord::Base.new, 0)]
+      records.clear
+      Thread.current[:ar_txn_records] = records
+    end
+    records
+  end
+
+  # The work `current_transaction.after_commit` holds for the COMMIT
+  # (ActiveRecord::Base._after_commit), beside the records above. Seeded
+  # and cleared, as the records are, so the element type is the work's.
+  def self._txn_callbacks
+    work = Thread.current[:ar_txn_callbacks]
+    if work.nil?
+      work = [-> { nil }]
+      work.clear
+      Thread.current[:ar_txn_callbacks] = work
+    end
+    work
+  end
+
+  # The tables whose model is inside `Model.unscoped { … }` on this
+  # thread (relation.rb's `Relation.unscoped_tables`). Seeded and
+  # cleared, as the records are, so the element type is String.
+  def self._unscoped_tables
+    tables = Thread.current[:ar_unscoped_tables]
+    if tables.nil?
+      tables = [""]
+      tables.clear
+      Thread.current[:ar_unscoped_tables] = tables
+    end
+    tables
+  end
+
   # Request-scoped connection lease for the thread-per-connection
   # server. Leases a connection index (parking on the pool's condition
   # variable while none is free), binds its DbConn to this thread's
@@ -1359,6 +1554,37 @@ module Db
   # rebind the connection and, on release, unbind the outer lease's.
   def self.in_lease?
     !Thread.current[:db_conn].nil?
+  end
+
+  # Rails' SQLite `disable_referential_integrity`: fixtures load and tables empty in any order. Not foreign_keys=OFF alone: that pragma is a no-op inside a transaction, where defer_foreign_keys moves the check to COMMIT instead.
+  def self.without_foreign_keys
+    Db.with_connection do
+      Db.exec("PRAGMA defer_foreign_keys = ON")
+      Db.exec("PRAGMA foreign_keys = OFF")
+      result = nil
+      begin
+        result = yield
+      ensure
+        Db.exec("PRAGMA defer_foreign_keys = OFF")
+        Db.exec("PRAGMA foreign_keys = ON")
+      end
+      result
+    end
+  end
+
+  # Rails' `check_all_foreign_keys_valid!`, which its fixture loader runs after a load (`verify_foreign_keys_for_fixtures`).
+  def self.check_foreign_keys!
+    tables = []
+    Db.with_connection do
+      st = Db.prepare("PRAGMA foreign_key_check")
+      while Db.step?(st)
+        table = Db.column_text(st, 0)
+        tables << table unless tables.include?(table)
+      end
+      Db.finalize(st)
+    end
+    raise ActiveRecord::StatementInvalid, "Foreign key violations found: " + tables.join(", ") unless tables.empty?
+    nil
   end
 
   def self.with_connection
@@ -1389,32 +1615,45 @@ module Db
       request_error = e
     ensure
       cleanup_error = nil
-      # Close a leftover snapshot before rolling back an abandoned app
-      # transaction, then drain readers before eviction. Each stage runs
-      # even when an earlier cleanup failed, without replacing the request error.
-      begin
-        if conn.snap_depth > 0
-          conn.snap_depth = 1
-          read_snapshot_end
+      # `Db.close` inside the lease drops `@pools` and closes `conn`.
+      # Snapshot and rollback cleanup talk to SQLite, so skip them when
+      # this pool is no longer the live one. The lease index still goes
+      # back to the pool that issued it.
+      pool_live = false
+      if !@pools.nil?
+        pi = 0
+        while pi < @pools.length
+          pool_live = true if @pools[pi].equal?(pool)
+          pi += 1
         end
-      rescue StandardError => e
-        cleanup_error = e
       end
-      begin
-        release_abandoned_write(conn)
-      rescue StandardError => e
-        cleanup_error = e if cleanup_error.nil?
-      end
-      begin
-        conn.qc_end
-        conn.release_all
-      rescue StandardError => e
-        cleanup_error = e if cleanup_error.nil?
-      ensure
-        conn.trim!
+      if pool_live
+        begin
+          if conn.snap_depth > 0
+            conn.snap_depth = 1
+            read_snapshot_end
+          end
+        rescue StandardError => e
+          cleanup_error = e
+        end
+        begin
+          release_abandoned_write(conn)
+        rescue StandardError => e
+          cleanup_error = e if cleanup_error.nil?
+        end
+        begin
+          conn.qc_end
+          conn.release_all
+        rescue StandardError => e
+          cleanup_error = e if cleanup_error.nil?
+        ensure
+          conn.trim!
+          Thread.current[:db_conn] = nil
+        end
+      else
         Thread.current[:db_conn] = nil
-        pool.release(idx)
       end
+      pool.release(idx)
       raise cleanup_error if !cleanup_error.nil? && request_error.nil?
     end
     raise request_error if !request_error.nil?
@@ -1422,22 +1661,44 @@ module Db
   end
 
   def self.close
-    return if @pools.nil?
+    # A closed handle left in the thread slot is the next statement's
+    # connection. Schema purge closes and reopens the same path.
+    Thread.current[:db_conn] = nil
+    Thread.current[:db_pool] = nil
+    # A pin left set would `release(0)` on the pool `configure` opens next.
+    Thread.current[:db_txn_pin] = false
     error = nil
-    begin
-      i = 0
-      while i < @pools.length
-        begin
-          @pools[i].close_all
-        rescue StandardError => e
-          error = e if error.nil?
+    if !@pools.nil?
+      begin
+        i = 0
+        while i < @pools.length
+          begin
+            @pools[i].close_all
+            @pools[i].dump_stmt_stats("close", i) if DbConn::STMT_STATS
+          rescue StandardError => e
+            error = e if error.nil?
+          end
+          i += 1
         end
-        i += 1
+      ensure
+        @pools = nil
       end
-    ensure
-      @pools = nil
     end
+    # Lease cleanup skips `release_abandoned_write` once this pool is
+    # gone. An open BEGIN would otherwise leave `@permit_held` set, and
+    # the next write waits out the permit timeout.
+    release_permit
     raise error if !error.nil?
+  end
+
+  def self.dump_stmt_stats(phase = "snapshot")
+    return nil if !DbConn::STMT_STATS || @pools.nil?
+    i = 0
+    while i < @pools.length
+      @pools[i].dump_stmt_stats(phase, i)
+      i += 1
+    end
+    nil
   end
 
   # DDL + INSERT/UPDATE/DELETE. `sqlite3_exec` doesn't return rows;
@@ -1791,13 +2052,8 @@ module Db
     ptr = conn.prepare_uncached(sql)
     e = conn.qc_entry_for(ptr, sql)
     begin
-      begin
-        while conn.step_checked(ptr)
-          e.record_row(ptr)
-        end
-      rescue RuntimeError => err
-        raise ActiveRecord::RecordNotUnique, err.message if Db.unique_violation?(err.message)
-        raise err
+      while conn.step_checked(ptr)
+        e.record_row(ptr)
       end
       e.mark_eof
     ensure
@@ -1810,8 +2066,7 @@ module Db
     rc = SQL.sqlite3_exec(h, sql, nil, nil, nil)
     if rc != SQL::OK
       msg = SQL.sqlite3_errmsg(h)
-      raise ActiveRecord::RecordNotUnique, msg if Db.unique_violation?(msg)
-      raise "Db.exec failed (" + rc.to_s + "): " + msg + " — sql: " + sql
+      Db.raise_statement_error("Db.exec failed (" + rc.to_s + "): " + msg + " — sql: " + sql, rc == SQL::BUSY)
     end
     nil
   end
@@ -1833,6 +2088,16 @@ module Db
   # their own `Db` and their own mapping; this is the ruby-family half.)
   def self.unique_violation?(message)
     message.include?("UNIQUE constraint failed")
+  end
+
+  # Not the driver's own exception: Rails translates every statement error into ActiveRecord's hierarchy (sqlite3_adapter `translate_exception`), keyed on SQLite's own message as `unique_violation?` is.
+  def self.raise_statement_error(message, busy)
+    raise ActiveRecord::RecordNotUnique, message if unique_violation?(message)
+    raise ActiveRecord::NotNullViolation, message if message.include?("NOT NULL constraint failed")
+    raise ActiveRecord::InvalidForeignKey, message if message.include?("FOREIGN KEY constraint failed")
+    raise ActiveRecord::CheckViolation, message if message.include?("CHECK constraint failed")
+    raise ActiveRecord::StatementTimeout, message if busy
+    raise ActiveRecord::StatementInvalid, message
   end
 
   # Returns the stmt pointer; caller advances with `step?`, reads
@@ -1940,6 +2205,9 @@ module Db
   # No-op (single nil check) when no capture is installed.
   def self.record_query(sql)
     @query_log.push(sql) unless @query_log.nil?
+    if defined?(ActiveSupport::Notifications) && ActiveSupport::Notifications.respond_to?(:sql)
+      ActiveSupport::Notifications.sql(sql)
+    end
     if @sql_trace
       $stderr.puts "  SQL " + sql
     end
@@ -1994,8 +2262,13 @@ module Db
       return current_conn.qc_text(stmt, i) if p.nil?
       stmt = p
     end
-    s = SQL.sqlite3_column_text(stmt, i)
+    s = Db.cell_text(stmt, i)
     s.nil? ? "" : s
+  end
+
+  def self.cell_text(stmt, i)
+    return SQL.rh_sqlite3_column_blob(stmt, i) if SQL.sqlite3_column_type(stmt, i) == SQL::BLOB_TYPE
+    SQL.sqlite3_column_text(stmt, i)
   end
 
   # Raw typed column read — the driver's native value, the same contract
@@ -2049,7 +2322,7 @@ module Db
       # "builds the result String by strlen"), so nothing here reaches
       # sqlite's buffer after the call. The `+ ""` this used to carry
       # was a second copy of every text cell of every row.
-      SQL.sqlite3_column_text(stmt, i)
+      Db.cell_text(stmt, i)
     end
   end
 
@@ -2101,7 +2374,7 @@ module Db
       end
       stmt = p
     end
-    SQL.sqlite3_column_text(stmt, i)
+    Db.cell_text(stmt, i)
   end
 
   def self.column_bool_opt(stmt, i)
@@ -2199,9 +2472,14 @@ module Db
 
   def self.bind_text(stmt, idx, value)
     raise "Db.bind failed (21): cannot bind a replay cursor" if stmt.is_a?(Integer)
-    # This shim's inline writer uses TEXT regardless of Ruby encoding.
-    # Preserve all bytes at the FFI boundary, including embedded NULs.
-    current_conn.bind_checked(stmt, idx, SQL.sqlite3_bind_text(stmt, idx, value, value.bytesize, -1))
+    # Preserve all bytes at the FFI boundary, including embedded NULs. Bytes
+    # only a BLOB can hold bind as one, as the inline writer (escape_string)
+    # stores them, so a lookup meets the stored class.
+    if Db.blob_bytes?(value)
+      current_conn.bind_checked(stmt, idx, SQL.sqlite3_bind_blob(stmt, idx, value, value.bytesize, -1))
+    else
+      current_conn.bind_checked(stmt, idx, SQL.sqlite3_bind_text(stmt, idx, value, value.bytesize, -1))
+    end
   end
 
   # SQLite has no native bool — bind 0/1, matching escape_bool's inline
@@ -2226,8 +2504,21 @@ module Db
   # Same SQL-value escaping shape as the gem-backed sibling. Single-
   # quote doubling matches sqlite's literal-string syntax; non-string
   # input goes through `to_s` first (Ruby semantics).
+  #
+  # Bytes no quoted literal can carry are a BLOB literal: a NUL (the
+  # statement text ends at it) or bytes that are not UTF-8 (`gsub` refuses
+  # them). lobsters' comment `confidence_order` is three packed bytes.
   def self.escape_string(s)
-    "'" + s.to_s.gsub("'", "''") + "'"
+    str = s.to_s
+    return "X'" + str.unpack1("H*") + "'" if Db.blob_bytes?(str)
+    "'" + str.gsub("'", "''") + "'"
+  end
+
+  # Not the ASCII-8BIT tag alone: this runtime reads headers and cookies as binary, and a session token so tagged must stay the TEXT its row holds.
+  def self.blob_bytes?(str)
+    return true if str.include?("\0")
+    return !str.valid_encoding? unless str.encoding == Encoding::ASCII_8BIT
+    !str.dup.force_encoding("UTF-8").valid_encoding?
   end
 
   def self.escape_int(n)
@@ -2258,6 +2549,14 @@ module Db
     return "NULL" if ids.empty?
 
     ids.map { |i| i.to_i.to_s }.join(", ")
+  end
+
+  # The same `IN (...)` batch over string keys (a uuid primary key): each
+  # key quoted as a literal, never `to_i`'d to its leading digits.
+  def self.escape_string_list(ids)
+    return "NULL" if ids.empty?
+
+    ids.map { |i| escape_string(i.to_s) }.join(", ")
   end
 
   # SQLite stores booleans as 0/1 integers (no native bool type) —

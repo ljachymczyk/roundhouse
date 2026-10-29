@@ -289,6 +289,9 @@ fn emit_models(models: &[LibraryClass]) -> Result<String, String> {
         ("ActiveRecord.", "from app.active_record_base import ActiveRecord\n"),
         ("RecordNotFound", "from app.errors import RecordNotFound\n"),
         ("RecordInvalid", "from app.errors import RecordInvalid\n"),
+        ("ErrorDetail(", "from app.active_record_base import ErrorDetail\n"),
+        // The written-down `render json:` encoder (`lower::as_json_writer`).
+        ("JsonBuilder.", "from app import json_builder as JsonBuilder\n"),
         // The temporal intrinsics (`ActiveSupport.db_now` et al)
         // render as `Roundhouse.RhDateTime.*` — same content-scan
         // import the legacy model emit makes.
@@ -301,6 +304,8 @@ fn emit_models(models: &[LibraryClass]) -> Result<String, String> {
         // top: view_helpers.py imports only Base and the stdlib —
         // no models↔view_helpers cycle to break.
         ("ViewHelpers.", "from app.v2.view_helpers import ViewHelpers\n"),
+        ("I18n.", "from app.i18n_locale import I18n\n"),
+        ("InvalidLocale", "from app.i18n_locale import InvalidLocale\n"),
     ] {
         if body.contains(needle) {
             out.push_str(import);
@@ -357,6 +362,9 @@ fn emit_views(
         // The framework-namespace collapse renders
         // `ActionView::ViewHelpers` as bare `ViewHelpers`.
         out.push_str("from app.v2.view_helpers import ViewHelpers\n");
+    }
+    if body.contains("I18n.") {
+        out.push_str("from app.i18n_locale import I18n\n");
     }
     if body.contains("Inflector.") {
         // The inflector unit is Mode::Module (bare functions) — alias
@@ -628,16 +636,17 @@ fn emit_dispatch(
          \x20       return None\n\
          \x20   p = _nest_params(dict(params or {}))\n\
          \x20   p.update(m.path_params)\n\
-         \x20   # Format: a route-declared format wins; else the stripped\n\
-         \x20   # `.ext`; else anything the matcher's own ext-retry put in\n\
+         \x20   # Format: the stripped `.ext`; else the route's default\n\
+         \x20   # format; else anything the matcher's own ext-retry put in\n\
          \x20   # params[\"format\"].\n\
-         \x20   fmt = m.req_format or fmt or p.get(\"format\") or \"html\"\n\
+         \x20   fmt = fmt or m.req_format or p.get(\"format\") or \"html\"\n\
          \x20   c = dispatch(m.controller, m.action, params=p, flash=flash,\n\
          \x20                request_method=method, request_path=path,\n\
          \x20                request_format=fmt, query_string=qs)\n\
          \x20   location = c.location or \"\"\n\
          \x20   persisted = c.flash.to_persisted()\n\
-         \x20   if fmt != \"html\":\n\
+         \x20   # Not only the request's format: `render json:` / `render plain:` on an HTML request are not laid out either.\n\
+         \x20   if fmt != \"html\" or \"html\" not in (c.content_type or \"text/html\"):\n\
          \x20       ct = c.content_type or \"application/json; charset=utf-8\"\n\
          \x20       return _http.ActionResponse(body=c.body, status=c.status,\n\
          \x20                                   location=location,\n\

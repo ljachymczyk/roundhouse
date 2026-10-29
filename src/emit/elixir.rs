@@ -112,8 +112,9 @@ pub fn emit_overlay_files(app: &App) -> Vec<EmittedFile> {
             // `Enum.empty?` rather than a struct-method dispatch.
             fields.push((
                 "errors".to_string(),
-                crate::ty::Ty::Array { elem: Box::new(crate::ty::Ty::Str) },
+                crate::ty::Ty::Array { elem: std::sync::Arc::new(crate::ty::Ty::Str) },
             ));
+            fields.push(("error_details".to_string(), crate::lower::errors_add::error_details_ty()));
             let name = model.name.0.as_str();
             expr::register_field_types(name, &fields);
             let row_fields: Vec<(String, crate::ty::Ty)> = table
@@ -136,6 +137,12 @@ pub fn emit_overlay_files(app: &App) -> Vec<EmittedFile> {
     // (`record.dom_prefix()`) isn't a registered field, so it still
     // dispatches through `__struct__`.
     expr::register_field_names("ActiveRecord::Base", &["id".to_string()]);
+    // `ActiveRecord::ErrorDetail` is a map here, so what an `errors` iteration yields reads its keys.
+    let mut detail_fields: Vec<(String, crate::ty::Ty)> =
+        ["attribute", "kind", "message", "full_message"].iter().map(|f| (f.to_string(), crate::ty::Ty::Str)).collect();
+    detail_fields.push(("symbolic".to_string(), crate::ty::Ty::Bool));
+    detail_fields.push(("optionless".to_string(), crate::ty::Ty::Bool));
+    expr::register_field_types("ActiveRecord::ErrorDetail", &detail_fields);
 
     // Functional-target lowerings (issue #29): rewrite imperative
     // control flow (while→recursion, …) into the functional IR the
@@ -185,6 +192,10 @@ pub fn emit_overlay_files(app: &App) -> Vec<EmittedFile> {
     out.push(EmittedFile {
         path: output_path(OutputKind::HandWrittenRuntime { name: "rh_datetime.ex" }).path,
         content: include_str!("../../runtime/elixir/v2/rh_datetime.ex").to_string(),
+    });
+    out.push(EmittedFile {
+        path: output_path(OutputKind::HandWrittenRuntime { name: "i18n_host.ex" }).path,
+        content: include_str!("../../runtime/elixir/v2/i18n_host.ex").to_string(),
     });
 
     // Model-support runtime: the portable prepared-cursor DB surface the
@@ -284,6 +295,14 @@ pub fn emit_overlay_files(app: &App) -> Vec<EmittedFile> {
                         .to_string(),
                 );
             }
+            // And the multiparameter record `from_params` / `update_from_*`
+            // read (`lower::controller_to_library::params`).
+            for f in [
+                crate::lower::controller_to_library::params::multiparameter_fields_field(),
+                crate::lower::controller_to_library::params::multiparameter_unsupported_field(),
+            ] {
+                field_names.push(f.as_str().to_string());
+            }
             expr::register_field_names(&class_name, &field_names);
         }
         let (model_lcs, model_registry) =
@@ -294,7 +313,7 @@ pub fn emit_overlay_files(app: &App) -> Vec<EmittedFile> {
                 &specs,
             );
         expr::register_modules(model_lcs.iter());
-        let model_names: std::collections::HashSet<String> =
+        let model_names: crate::det::HashSet<String> =
             app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
 
         // Build the view layer (RouteHelpers + Importmap + per-resource
@@ -377,13 +396,13 @@ pub fn emit_overlay_files(app: &App) -> Vec<EmittedFile> {
                 .map(|m| {
                     let cls = crate::ty::Ty::Class {
                         id: crate::ident::ClassId(m.clone().into()),
-                        args: vec![],
+                        args: vec![].into(),
                     };
                     (crate::naming::snake_case(m), cls)
                 })
                 .flat_map(|(singular, cls)| {
                     let plural = crate::naming::pluralize_snake(&singular);
-                    let list = crate::ty::Ty::Array { elem: Box::new(cls.clone()) };
+                    let list = crate::ty::Ty::Array { elem: std::sync::Arc::new(cls.clone()) };
                     [(singular, cls), (plural, list)]
                 })
                 .collect();
@@ -417,6 +436,7 @@ pub fn emit_overlay_files(app: &App) -> Vec<EmittedFile> {
             // and would get a `create` calling an absent `new`.
             if model_names.contains(lc.name.0.as_str()) {
                 materialize_inherited(&mut lc, &base_methods);
+                crate::lower::model_to_library::primary_key_guard::fold(&mut lc.methods);
                 // Pick up per-model dual methods (the synthesized `update`,
                 // dual by tail-call propagation to `save`) for the
                 // controller field-receiver call sites (`if @article.update`).
@@ -718,7 +738,7 @@ fn emit_routes_table_file(app: &App) -> EmittedFile {
 fn class_ty(class: &str) -> crate::ty::Ty {
     crate::ty::Ty::Class {
         id: crate::ident::ClassId(crate::ident::Symbol::from(class)),
-        args: Vec::new(),
+        args: Vec::new().into(),
     }
 }
 
@@ -751,7 +771,7 @@ fn inject_module_attr(content: &str, attr_line: &str) -> String {
 /// becomes a visible `# emit_library_class FAILED` sentinel rather than
 /// a silently-dropped file, so `mix compile` surfaces the gap.
 fn emit_library_lc(lc: crate::dialect::LibraryClass, out: &mut Vec<EmittedFile>) {
-    emit_library_lc_with_duals(lc, out, &std::collections::HashSet::new());
+    emit_library_lc_with_duals(lc, out, &crate::det::HashSet::default());
 }
 
 /// Like [`emit_library_lc`], but seeds the functionalize pass with
@@ -762,7 +782,7 @@ fn emit_library_lc(lc: crate::dialect::LibraryClass, out: &mut Vec<EmittedFile>)
 fn emit_library_lc_with_duals(
     lc: crate::dialect::LibraryClass,
     out: &mut Vec<EmittedFile>,
-    external_duals: &std::collections::HashSet<String>,
+    external_duals: &crate::det::HashSet<String>,
 ) {
     for class in
         crate::lower::functionalize::functionalize_with_external_duals(vec![lc], external_duals)
@@ -817,10 +837,12 @@ fn module_funcs_to_library_class(
         parent: None,
         parent_span: Default::default(),
         includes: Vec::new(),
+        include_spans: Vec::new(),
         methods,
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     }
@@ -883,7 +905,7 @@ fn materialize_controller_inherited(
     ctrl: &mut crate::dialect::LibraryClass,
     base: &[crate::dialect::MethodDef],
 ) {
-    let defined: std::collections::HashSet<String> =
+    let defined: crate::det::HashSet<String> =
         ctrl.methods.iter().map(|m| m.name.as_str().to_string()).collect();
     let owner = ctrl.name.0.clone();
     let mut inherited: Vec<crate::dialect::MethodDef> = base
@@ -899,7 +921,7 @@ fn materialize_controller_inherited(
 }
 
 fn materialize_inherited(model: &mut crate::dialect::LibraryClass, base: &[crate::dialect::MethodDef]) {
-    let defined: std::collections::HashSet<String> =
+    let defined: crate::det::HashSet<String> =
         model.methods.iter().map(|m| m.name.as_str().to_string()).collect();
     let owner = model.name.0.clone();
     // `find_by`/`where` are dropped because Elixir rewrites their call

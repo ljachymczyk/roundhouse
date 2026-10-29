@@ -117,6 +117,7 @@ const RT_BROADCASTS_SOURCE: &str = include_str!("../../runtime/rust/broadcasts.r
 // intrinsic target) plus the `EncodeDatetime` trait that backs the
 // generic `JsonBuilder::encode_datetime`.
 const RT_RH_DATETIME_SOURCE: &str = include_str!("../../runtime/rust/rh_datetime.rs");
+const RT_I18N_HOST_SOURCE: &str = include_str!("../../runtime/rust/i18n_host.rs");
 // Phase 6 HTTP/server/cable runtime — hand-written, shared with the
 // legacy rust emitter. `server::start` mounts axum, applies schema,
 // installs middleware (layout-wrap, method-override), and serves
@@ -144,6 +145,8 @@ const RT_TEST_SUPPORT_SOURCE: &str = include_str!("../../runtime/rust/test_suppo
 /// bare references the lowerer leaves unqualified.
 const VIEW_IMPORTS: &str = "\
 #[allow(unused_imports)]
+use crate::i18n_locale::I18n;
+#[allow(unused_imports)]
 use std::fmt::Write as _;
 #[allow(unused_imports)]
 use crate::view_helpers::{self, ViewHelpers};
@@ -170,6 +173,8 @@ use crate::views::*;
 /// (Flash/Session), and the broadcasts shim. Same `#[allow(unused_
 /// imports)]` discipline as MODEL_IMPORTS / VIEW_IMPORTS.
 const CONTROLLER_IMPORTS: &str = "\
+#[allow(unused_imports)]
+use crate::i18n_locale::I18n;
 #[allow(unused_imports)]
 use crate::action_controller_base::{self, Base};
 #[allow(unused_imports)]
@@ -200,7 +205,15 @@ use crate::views::*;
 use crate::errors_ext::{raise, ArgumentError, NotImplementedError, RecordNotFound, RecordInvalid};
 ";
 
+/// The written-down `render json:` encoder (`lower::as_json_writer`) in a model's `as_json_str`.
+/// Not in MODEL_IMPORTS: a test file joins those with FRAMEWORK_TEST_IMPORTS, which import it too.
+const MODEL_JSON_IMPORT: &str = "#[allow(unused_imports)]\nuse crate::json_builder::JsonBuilder;\n";
+
 const MODEL_IMPORTS: &str = "\
+#[allow(unused_imports)]
+use crate::i18n_locale::I18n;
+#[allow(unused_imports)]
+use crate::active_record_base::ErrorDetail;
 #[allow(unused_imports)]
 use crate::param_value::ParamValue;
 #[allow(unused_imports)]
@@ -325,6 +338,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
         ("src/db.rs", RT_DB_SOURCE),
         ("src/broadcasts.rs", RT_BROADCASTS_SOURCE),
         ("src/rh_datetime.rs", RT_RH_DATETIME_SOURCE),
+        ("src/i18n_host.rs", RT_I18N_HOST_SOURCE),
         ("src/http.rs", RT_HTTP_SOURCE),
         ("src/server.rs", RT_SERVER_SOURCE),
         ("src/cable.rs", RT_CABLE_SOURCE),
@@ -522,7 +536,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     // None` and the Vec bridges don't fire.
     let (mut model_lcs, model_registry): (
         Vec<crate::dialect::LibraryClass>,
-        std::collections::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
+        crate::det::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
     ) = if !app.models.is_empty() {
         let (mut lcs, registry) = crate::lower::lower_models_with_registry_and_params(
             &app.models,
@@ -537,7 +551,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
         decide::decide_classes(&mut lcs);
         (lcs, registry)
     } else {
-        (Vec::new(), std::collections::HashMap::new())
+        (Vec::new(), crate::det::HashMap::default())
     };
 
     let route_helper_funcs = crate::lower::lower_routes_to_library_functions(app);
@@ -869,6 +883,9 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
                     "\nimpl {name} {{\n\
                         pub fn mark_persisted_bang(&mut self) {{ }}\n\
                         pub fn errors(&self) -> Vec<String> {{ crate::errors_ext::validation_errors_snapshot() }}\n\
+                        pub fn error_details(&self) -> Vec<crate::active_record_base::ErrorDetail> {{ crate::errors_ext::validation_error_details_snapshot().iter().map(|(a, k, m, f, s, o)| crate::active_record_base::ErrorDetail::new(a, k, m, f, *s, *o)).collect() }}\n\
+                        pub fn push_error_detail(error: crate::active_record_base::ErrorDetail) {{ crate::errors_ext::validation_error_details_push(error.attribute(), error.kind(), error.message(), error.full_message(), error.symbolic(), error.optionless()) }}\n\
+                        pub fn error_messages_for(&self, attribute: &str) -> Vec<String> {{ crate::errors_ext::validation_error_details_snapshot().into_iter().filter(|(a, _, _, _, _, _)| a == attribute).map(|(_, _, m, _, _, _)| m).collect() }}\n\
                         pub fn save(&mut self) -> bool {{\n\
                             crate::errors_ext::validation_errors_clear();\n\
                             self.validate();\n\
@@ -893,7 +910,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
                         pub fn destroy(&mut self) {{ {destroy_body} }}\n\
                         pub fn exists_pred(id: i64) -> bool {{ Self::_adapter_exists_by_id_pred(id) }}\n\
                         pub fn persisted_pred(&self) -> bool {{ self.id != 0 }}\n\
-                        pub fn find(id: i64) -> Self {{ Self::_adapter_find_by_id(id).expect(\"record not found\") }}\n\
+                        pub fn find(id: i64) -> Self {{ Self::_adapter_find_by_id(id).unwrap_or_else(|| crate::errors_ext::raise_msg(crate::errors_ext::RecordNotFound, format!(\"Couldn't find {name} with 'id'={{}}\", id))) }}\n\
                         pub fn count() -> i64 {{ Self::_adapter_count() }}\n\
                         pub fn all() -> Vec<{name}> {{ Self::_adapter_all() }}\n\
                         pub fn last() -> Option<{name}> {{ Self::_adapter_last() }}\n\
@@ -926,11 +943,10 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
             // `errors` send differently), this rewrite stops firing
             // and the bare `errors().push` falls through harmlessly
             // until updated.
-            let content = format!("{MODEL_IMPORTS}{body}{ar_shim}");
-            let content = content.replace(
-                "self.errors().push(",
-                "crate::errors_ext::validation_errors_push(",
-            );
+            let content = format!("{MODEL_IMPORTS}{MODEL_JSON_IMPORT}{body}{ar_shim}");
+            let content = content
+                .replace("self.errors().push(", "crate::errors_ext::validation_errors_push(")
+                .replace("self.error_details().push(", "Self::push_error_detail(");
             files.push(EmittedFile {
                 path: PathBuf::from(format!("src/models/{stem}.rs")),
                 content,
@@ -950,9 +966,10 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
         // RouteHelpers`). Append per-method delegating wrappers so
         // both call shapes resolve.
         let bare_wrappers = render_route_helpers_bare_wrappers(lc);
+        let import = if body.contains("ViewHelpers::") { "use crate::view_helpers::ViewHelpers;\n\n" } else { "" };
         files.push(EmittedFile {
             path: PathBuf::from("src/route_helpers.rs"),
-            content: format!("{body}{bare_wrappers}"),
+            content: format!("{import}{body}{bare_wrappers}"),
         });
     }
 
@@ -1075,6 +1092,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
                 // but do not embed Base — stub the two Sends so the
                 // inherited process_action compiles. Full CSRF via
                 // the http thread-local surface is a follow-on.
+                // `verify_authenticity_token` takes `&self`, not `&mut self`: the stub writes nothing, and a controller whose actions write no ivar runs `process_action` on `&self`.
                 let ac_shim = format!(
                     "\nimpl {name} {{\n\
                     \x20   pub fn render(&self, content: String) {{\n\
@@ -1102,7 +1120,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
                     \x20       let content_type = opts.get(\"content_type\").and_then(|v| v.as_str()).map(|s| s.to_string());\n\
                     \x20       crate::http::response_set_head(status, content_type);\n\
                     \x20   }}\n\
-                    \x20   pub fn verify_authenticity_token(&mut self) {{}}\n\
+                    \x20   pub fn verify_authenticity_token(&self) {{}}\n\
                     \x20   pub fn performed_pred(&self) -> bool {{ false }}\n\
                     }}\n",
                     name = lc.name.0.as_str()
@@ -1126,10 +1144,12 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
                 // into `c.flash` only when the field exists; the
                 // outgoing path is field-independent (thread-local).
                 let has_flash = body.contains("pub flash:");
+                let has_params = body.contains("pub params:");
                 let axum_wrappers = render_axum_handler_wrappers(
                     lc.name.0.as_str(),
                     &flat_routes_2c,
                     has_flash,
+                    has_params,
                     sets_action_name,
                 );
                 let content = format!("{CONTROLLER_IMPORTS}{body}{ac_shim}{axum_wrappers}");
@@ -1164,10 +1184,12 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
                     parent: None,
                     parent_span: Default::default(),
                     includes: Vec::new(),
+                    include_spans: Vec::new(),
                     methods: Vec::new(),
                     nullable_columns: Vec::new(),
                     origin: None,
                     constants: Vec::new(),
+                    conditional_definitions: Vec::new(),
                     unknown_calls: Vec::new(),
                     class_ivar_initializers: Vec::new(),
                 });
@@ -1411,7 +1433,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     if !controller_test_modules.is_empty() {
         let mut ctrl_entries: Vec<(String, String)> = Vec::new();
         for tm in &controller_test_modules {
-            let file = spec::emit_rust_test_module(tm, app);
+            let file = spec::with_route_helpers(&route_helper_funcs, || spec::emit_rust_test_module(tm, app));
             let class_name = tm.name.0.as_str().to_string();
             let stem = file
                 .path
@@ -1493,7 +1515,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     // build-site's zip writer rejects duplicate filenames, so we
     // dedupe here instead. Iterate from the end so the most recent
     // write survives.
-    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut seen: crate::det::HashSet<PathBuf> = crate::det::HashSet::default();
     let mut rev_kept: Vec<EmittedFile> = Vec::with_capacity(files.len());
     for f in files.into_iter().rev() {
         if seen.insert(f.path.clone()) {
@@ -1576,6 +1598,7 @@ fn render_axum_handler_wrappers(
     controller_name: &str,
     flat_routes: &[crate::lower::FlatRoute],
     has_flash: bool,
+    has_params: bool,
     sets_action_name: bool,
 ) -> String {
     use crate::dialect::HttpMethod;
@@ -1585,7 +1608,7 @@ fn render_axum_handler_wrappers(
     // the same action under multiple paths. The wrappers themselves
     // don't depend on the path (path params come in via extractors),
     // so one wrapper per (controller, action) suffices.
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: crate::det::HashSet<String> = crate::det::HashSet::default();
     let routes: Vec<&crate::lower::FlatRoute> = flat_routes
         .iter()
         .filter(|r| r.controller.0.as_str() == controller_name)
@@ -1602,12 +1625,14 @@ fn render_axum_handler_wrappers(
     );
     for r in routes {
         let action = r.action.as_str();
-        let method_name = if action == "new" { "new_action" } else { action };
         let path_params = &r.path_params;
-        let has_body = matches!(
-            r.method,
-            HttpMethod::Post | HttpMethod::Patch | HttpMethod::Put,
-        );
+        let carries_body = |method: &HttpMethod| matches!(method, HttpMethod::Post | HttpMethod::Patch | HttpMethod::Put);
+        // Also a body another route to the action carries, where the controller reads `params`: `get` and `post` to one action share this wrapper, and axum's `Form` reads a GET's query string.
+        let has_body = carries_body(&r.method)
+            || has_params
+                && flat_routes.iter().any(|other| {
+                    other.controller.0.as_str() == controller_name && other.action == r.action && carries_body(&other.method)
+                });
         // Path params come in as String. The handler body strips an
         // optional `.json` suffix off each one before parsing as i64
         // — for `/articles/{id}` URLs ending in `.json`, matchit's
@@ -1653,22 +1678,50 @@ fn render_axum_handler_wrappers(
         if !path_extractor.is_empty() {
             args.push(path_extractor);
         }
+        // Rails' `params` holds the query string too; only a controller that reads `params` has the field to take it.
+        if has_params {
+            args.push(
+                "axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>"
+                    .to_string(),
+            );
+        }
         if has_body {
             // Body extractor MUST be last per axum's contract (each
             // request body can only be consumed once; placing it
             // after the `Path` extractors keeps the consumption
             // ordering deterministic).
-            args.push(
-                "axum::extract::Form(form): axum::extract::Form<std::collections::HashMap<String, String>>"
-                    .to_string(),
-            );
+            if carries_body(&r.method) {
+                args.push(
+                    "axum::extract::Form(form): axum::extract::Form<std::collections::HashMap<String, String>>"
+                        .to_string(),
+                );
+            } else {
+                // Not a bare `Form`: this wrapper serves the action's other verbs too, and a DELETE with no form body would be refused before the action runs.
+                args.push(
+                    "form: Result<axum::extract::Form<std::collections::HashMap<String, String>>, axum::extract::rejection::FormRejection>"
+                        .to_string(),
+                );
+            }
         }
         let args_str = args.join(", ");
 
         let mut body = String::new();
+        if has_body && !carries_body(&r.method) {
+            body.push_str("    let form = form.map(|f| f.0).unwrap_or_default();\n");
+        }
         body.push_str("    crate::http::response_clear();\n");
+        // Not in the layout middleware: a task resumes on any worker after its await, so a thread-local reset there can miss the handler's thread
+        body.push_str("    crate::i18n_host::I18nHost::reset_request();\n");
         body.push_str("    crate::http::request_format_set(_fmt.0);\n");
-        if has_body {
+        if has_params {
+            if has_body {
+                // Query after form, as Rails' `request_parameters.merge(query_parameters)`: a shallow merge where the query wins.
+                body.push_str("    let mut params = crate::http::params_from_form(form);\n");
+                body.push_str("    params.extend(crate::http::params_from_form(query));\n");
+            } else {
+                body.push_str("    let mut params = crate::http::params_from_form(query);\n");
+            }
+        } else if has_body {
             body.push_str("    let mut params = crate::http::params_from_form(form);\n");
         } else if !path_params.is_empty() {
             body.push_str(
@@ -1692,7 +1745,7 @@ fn render_axum_handler_wrappers(
                 "    params.insert({p:?}.to_string(), serde_json::Value::from({p}));\n",
             ));
         }
-        if has_body || !path_params.is_empty() {
+        if has_params || has_body || !path_params.is_empty() {
             body.push_str(&format!(
                 "    let mut c = {controller_name} {{ params, ..Default::default() }};\n",
             ));
@@ -1707,12 +1760,11 @@ fn render_axum_handler_wrappers(
         if has_flash {
             body.push_str("    c.flash = crate::http::flash_from_request(&headers);\n");
         }
-        // The wrapper calls the action without `process_action`, so it
-        // sets `action_name` itself.
         if sets_action_name {
             body.push_str(&format!("    c.assign_action_name({action:?});\n"));
         }
-        body.push_str(&format!("    c.{method_name}();\n"));
+        // Not the action itself: Rails runs it through process_action, which carries the forgery check and the rescue_from handlers
+        body.push_str(&format!("    c.process_action({action:?});\n"));
         // Translate the thread-local response, then sweep the flash the
         // action set (FLASH_OUT) onto a Set-Cookie — empty clears it, so
         // a shown notice doesn't stick. Field-independent, so every
@@ -2274,13 +2326,13 @@ fn emit_controllers_mod_rs(entries: &[(String, String)]) -> EmittedFile {
 /// from `MethodDef.signature` when present; methods without a typed
 /// signature get an empty Tys vec and the Const-recv arity-pad path
 /// no-ops (same behavior as no entry).
-type GlobalMethodsMap = std::collections::HashMap<
+type GlobalMethodsMap = crate::det::HashMap<
     String,
-    std::collections::HashMap<String, Vec<crate::ty::Param>>,
+    crate::det::HashMap<String, Vec<crate::ty::Param>>,
 >;
-type GlobalDefaultsMap = std::collections::HashMap<
+type GlobalDefaultsMap = crate::det::HashMap<
     String,
-    std::collections::HashMap<String, Vec<Option<String>>>,
+    crate::det::HashMap<String, Vec<Option<String>>>,
 >;
 
 fn collect_global_class_methods(
@@ -2300,7 +2352,7 @@ fn collect_global_class_methods(
         lc: &LibraryClass,
         out: &mut GlobalMethodsMap,
         out_defaults: &mut GlobalDefaultsMap,
-        out_mutating: &mut std::collections::HashSet<String>,
+        out_mutating: &mut crate::det::HashSet<String>,
     ) {
         let raw = lc.name.0.as_str();
         let class_name = raw.rsplit("::").next().unwrap_or(raw).to_string();
@@ -2328,7 +2380,7 @@ fn collect_global_class_methods(
                     .iter()
                     .map(|p| Param {
                         name: Symbol::from(p.as_str()),
-                        ty: Ty::Untyped,
+                        ty: Ty::Untyped.into(),
                         kind: ParamKind::Required,
                     })
                     .collect(),
@@ -2363,9 +2415,9 @@ fn collect_global_class_methods(
         }
     }
 
-    let mut out: GlobalMethodsMap = std::collections::HashMap::new();
-    let mut out_defaults: GlobalDefaultsMap = std::collections::HashMap::new();
-    let mut out_mutating: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: GlobalMethodsMap = crate::det::HashMap::default();
+    let mut out_defaults: GlobalDefaultsMap = crate::det::HashMap::default();
+    let mut out_mutating: crate::det::HashSet<String> = crate::det::HashSet::default();
     for lc in model_lcs {
         collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating);
     }
@@ -2403,3 +2455,4 @@ fn collect_global_class_methods(
         ..EmitCtx::default()
     }
 }
+

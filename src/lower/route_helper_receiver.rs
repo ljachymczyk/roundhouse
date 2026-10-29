@@ -70,7 +70,7 @@
 use crate::app::App;
 use crate::expr::{Expr, ExprNode};
 use crate::ident::{ClassId, Symbol};
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 /// Route helpers `RouteHelpers` answers that no app route declares —
 /// mounted engines. Kept in step with the `module RouteHelpers` reopen
@@ -79,6 +79,10 @@ use std::collections::{HashMap, HashSet};
 const ENGINE_MOUNTED_HELPERS: &[&str] = &[
     "rails_blob_path",
     "rails_blob_url",
+    "rails_storage_proxy_path",
+    "rails_storage_proxy_url",
+    "rails_storage_redirect_path",
+    "rails_storage_redirect_url",
     "rails_representation_path",
     "rails_representation_url",
 ];
@@ -229,10 +233,12 @@ mod tests {
             parent: None,
             parent_span: Default::default(),
             includes: Vec::new(),
+            include_spans: Vec::new(),
             methods,
             nullable_columns: Vec::new(),
             origin: None,
             constants: Vec::new(),
+            conditional_definitions: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
         }

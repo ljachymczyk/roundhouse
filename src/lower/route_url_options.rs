@@ -124,8 +124,8 @@ pub fn apply_route_url_options_lowering(app: &mut App) {
 /// flattened routes share (lobsters' `/s/:id/(:title)` flattens to
 /// `/s/:id/:title` and `/s/:id`) answers its longest list — the helper
 /// the generator builds takes every slot.
-pub(crate) fn helper_path_params(app: &App) -> std::collections::HashMap<String, Vec<String>> {
-    let mut out: std::collections::HashMap<String, Vec<String>> = Default::default();
+pub(crate) fn helper_path_params(app: &App) -> crate::det::HashMap<String, Vec<String>> {
+    let mut out: crate::det::HashMap<String, Vec<String>> = Default::default();
     for route in super::routes::flatten_routes_for_helpers(app) {
         if !route.named {
             continue;
@@ -150,7 +150,7 @@ pub(crate) fn helper_path_params(app: &App) -> std::collections::HashMap<String,
 /// `nil`, which is what the helper's own default would have been.
 fn position_path_params(
     expr: &mut Expr,
-    params: &std::collections::HashMap<String, Vec<String>>,
+    params: &crate::det::HashMap<String, Vec<String>>,
 ) {
     expr.node.for_each_child_mut(&mut |c| position_path_params(c, params));
     rewrite_position_node(expr, params);
@@ -158,7 +158,7 @@ fn position_path_params(
 
 pub(crate) fn rewrite_position_node(
     expr: &mut Expr,
-    params: &std::collections::HashMap<String, Vec<String>>,
+    params: &crate::det::HashMap<String, Vec<String>>,
 ) {
     let span = expr.span;
     let ExprNode::Send { recv: None, method, args, block: None, .. } = &mut *expr.node else {
@@ -226,7 +226,7 @@ fn spread_options_local(arg: &Expr, index: usize, names: &[String]) -> Option<Ve
                 parenthesized: true,
             },
         );
-        e.ty = Some(crate::ty::Ty::Union { variants: vec![(**value).clone(), crate::ty::Ty::Nil] });
+        e.ty = Some(crate::ty::Ty::Union { variants: vec![(**value).clone(), crate::ty::Ty::Nil].into() });
         e
     };
     let mut out: Vec<Expr> = names[index..].iter().map(|n| read(n)).collect();
@@ -241,12 +241,12 @@ fn spread_options_local(arg: &Expr, index: usize, names: &[String]) -> Option<Ve
     Some(out)
 }
 
-fn rewrite(expr: &mut Expr, helpers: &std::collections::HashSet<String>) {
+fn rewrite(expr: &mut Expr, helpers: &crate::det::HashSet<String>) {
     expr.node.for_each_child_mut(&mut |c| rewrite(c, helpers));
     rewrite_node(expr, helpers);
 }
 
-pub(crate) fn rewrite_node(expr: &mut Expr, helpers: &std::collections::HashSet<String>) {
+pub(crate) fn rewrite_node(expr: &mut Expr, helpers: &crate::det::HashSet<String>) {
     ground_symbol_query_values(expr, helpers);
     let Some((stem, host, protocol)) = strip_host_options(expr, helpers) else {
         return;
@@ -297,7 +297,7 @@ pub(crate) fn rewrite_node(expr: &mut Expr, helpers: &std::collections::HashSet<
 /// Symbol at the call (`no implicit conversion of Symbol into String`
 /// took two of campfire's logo tests). `format:` is not here: the
 /// suffix pass ran first and consumed it.
-fn ground_symbol_query_values(expr: &mut Expr, helpers: &std::collections::HashSet<String>) {
+fn ground_symbol_query_values(expr: &mut Expr, helpers: &crate::det::HashSet<String>) {
     let ExprNode::Send { recv: None, method, args, .. } = &mut *expr.node else { return };
     if !helpers.contains(method.as_str()) {
         return;
@@ -324,10 +324,21 @@ fn ground_symbol_query_values(expr: &mut Expr, helpers: &std::collections::HashS
 /// by the strip alone and answers None.
 fn strip_host_options(
     expr: &mut Expr,
-    helpers: &std::collections::HashSet<String>,
+    helpers: &crate::det::HashSet<String>,
 ) -> Option<(String, Expr, Option<Expr>)> {
-    let ExprNode::Send { recv: None, method, args, block: None, .. } = &mut *expr.node else {
+    let ExprNode::Send { recv, method, args, block: None, .. } = &mut *expr.node else {
         return None;
+    };
+    // The explicit `Rails.application.routes.url_helpers.x_url(…)` chain
+    // (a model, a mailer, a plain class, or a controller that spells it
+    // out) is the same helper. Only its `only_path: true` form is
+    // finished here: the chain's `host:` grounding belongs to
+    // `emit::ruby::library::rewrite_url_helpers_absolute`, which needs
+    // the keys this pass would remove.
+    let chained = match recv {
+        None => false,
+        Some(r) if crate::lower::controller_to_library::rewrites::is_rails_url_helpers_chain(r) => true,
+        Some(_) => return None,
     };
     if !helpers.contains(method.as_str()) {
         return None;
@@ -336,6 +347,14 @@ fn strip_host_options(
     let ExprNode::Hash { entries, kwargs: true } = &mut *last.node else {
         return None;
     };
+    if chained
+        && !entries.iter().any(|(k, v)| {
+            matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "only_path")
+                && matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { value: true } })
+        })
+    {
+        return None;
+    }
     // Read the two that BUILD a host before dropping them: on the `_url`
     // spelling they are not dropped at all — they ARE the host half, and
     // this is the last place that knows the caller named one.
@@ -370,9 +389,13 @@ fn strip_host_options(
     // `_path` is done: the seven describe a host it does not render.
     let stem = method.as_str().strip_suffix("_url")?;
     // `x_url(…, only_path: true)` is Rails asking the URL spelling for
-    // a path, which is the `_path` helper — the strip above already
-    // made it one.
+    // a path, which is the `_path` helper: rename it to that. The strip
+    // alone left a `_url` name, and the controller and view lowerers
+    // ground every `_url` send as an absolute URL on the request's
+    // host, so `widget_url(w, only_path: true)` rendered
+    // `http://example.org/widgets/1` where Rails renders `/widgets/1`.
     if only_path {
+        *method = Symbol::from(format!("{stem}_path"));
         return None;
     }
     // `x_url(…, host: h)` names the host EXPLICITLY, and dropping it

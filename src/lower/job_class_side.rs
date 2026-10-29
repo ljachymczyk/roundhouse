@@ -58,6 +58,7 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
     }
     let workers = sidekiq_workers(app);
     let wrapped = workers_with_positional_perform(app, &workers);
+    let has_perform = workers_with_any_perform(app, &workers);
     let delay_folds = without_delayed_enqueue_overrides(app, &wrapped);
     if jobs.is_empty() && workers.is_empty() {
         return diags;
@@ -70,13 +71,47 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
     // class-side `set` answering the class object — which no target's
     // types can name (the RBS said `-> Job`, an instance, and spinel's
     // C returned an `sp_Class` through it: 13 cc errors on lobsters).
+    //
+    // Under `queue_adapter :sidekiq` the options mean something: a
+    // `perform_later` with literal `wait:`, `wait_until:` or `queue:`
+    // folds to `Job.perform_later_with(<at>, <queue>, args)` instead,
+    // and the Ruby-family push schedules the job or picks its queue
+    // (`lower::job_payload`). `at` is the epoch in seconds as a Float,
+    // 0.0 for none; `queue` a String, "" for the job's own.
+    let sidekiq = app.queue_adapter.as_deref() == Some("sidekiq");
     let mut unfolded: BTreeSet<String> = BTreeSet::new();
     let mut folded: Vec<crate::span::Span> = Vec::new();
     let mut delayed: Vec<crate::span::Span> = Vec::new();
+    let mut scheduled = SetFolds::default();
     super::for_each_hook_body(app, &mut |body| {
-        fold_set_chains(body, &jobs, &mut unfolded, &mut folded);
+        fold_set_chains(body, &jobs, &mut unfolded, &mut folded, sidekiq.then_some(&mut scheduled));
         fold_delayed_enqueues(body, &delay_folds, &mut delayed);
     });
+    for span in &scheduled.priority {
+        diags.push(crate::lower::residue_diagnostic(
+            "job_class_side",
+            "job-set-options",
+            *span,
+            "priority not modeled",
+            "`set(priority:)` is dropped: Sidekiq doesn't order jobs by it, but Rails still \
+             writes it into the payload's `priority`, which here stays null"
+                .to_string(),
+        ));
+    }
+    for span in &scheduled.rejected {
+        let mut d = crate::lower::residue_diagnostic(
+            "job_class_side",
+            "job-set-options",
+            *span,
+            "not a literal option",
+            "under queue_adapter :sidekiq a `set(...)` before `perform_later` must be literal \
+             `wait:`, `wait_until:` or `queue:` options; this one can't be honored, and the job \
+             would run early or on the wrong queue"
+                .to_string(),
+        );
+        d.severity = crate::diagnostic::Severity::Error;
+        diags.push(d);
+    }
     for span in delayed {
         diags.push(crate::lower::residue_diagnostic(
             "job_class_side",
@@ -97,12 +132,30 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
         ));
     }
 
+    // The jobs given a synthesized `perform_later`: the ones
+    // `lower::job_payload` can plan a payload for.
+    let mut payload_jobs: BTreeSet<String> = BTreeSet::new();
     for lc in app.library_classes.iter_mut() {
         let is_worker = workers.contains(lc.name.0.as_str());
         if !is_worker && !jobs.contains(lc.name.0.as_str()) {
             continue;
         }
         if is_worker {
+            // A worker with no `perform` anywhere in its own chain is an
+            // abstract base, not an entry point: strip its Sidekiq wiring
+            // quietly, as a wrapped worker's is stripped below, and
+            // generate no wrapper. A concrete subclass that defines its
+            // own positional `perform` is still wrapped (`wrapped`
+            // walks the same chain), so this only drops the base's own
+            // dead include and options.
+            if !has_perform.contains(lc.name.0.as_str()) {
+                lc.includes.retain(|inc| !SIDEKIQ_MODULES.contains(&inc.0.as_str()));
+                lc.unknown_calls.retain(|call| {
+                    !matches!(&*call.node, ExprNode::Send { recv: None, method, .. }
+                        if SIDEKIQ_CLASS_MACROS.contains(&method.as_str()))
+                });
+                continue;
+            }
             // The include and options stay on a worker no wrapper is generated for, so it reads as the unsupported class it is.
             if !wrapped.contains(lc.name.0.as_str()) {
                 let span = lc
@@ -167,7 +220,7 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
 
         let (param_tys, ret_ty): (Vec<Option<Ty>>, Option<Ty>) = match &perform.signature {
             Some(Ty::Fn { params, ret, .. }) if params.len() == perform.params.len() => (
-                params.iter().map(|p| Some(p.ty.clone())).collect(),
+                params.iter().map(|p| Some((*p.ty).clone())).collect(),
                 Some((**ret).clone()),
             ),
             _ => (vec![None; perform.params.len()], None),
@@ -193,6 +246,10 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
                         },
                     );
                     v.ty = ty.clone();
+                    if p.rest {
+                        v.ty = Some(Ty::Array { elem: std::sync::Arc::new(ty.clone().unwrap_or(Ty::Untyped)) });
+                        return Expr::new(span, ExprNode::Splat { value: v });
+                    }
                     v
                 })
                 .collect();
@@ -206,7 +263,7 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
                     parenthesized: false,
                 },
             );
-            new_call.ty = Some(Ty::Class { id: lc.name.clone(), args: vec![] });
+            new_call.ty = Some(Ty::Class { id: lc.name.clone(), args: vec![].into() });
             let mut body = Expr::new(
                 span,
                 ExprNode::Send {
@@ -418,6 +475,12 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
             w.name = Symbol::from(entry);
             w.receiver = crate::dialect::MethodReceiver::Class;
             w.body = body;
+            // Not `perform`'s signature whole: the enqueueing wrapper answers nil, whatever `perform` returns.
+            if matches!(entry, "perform_later" | "perform_async")
+                && let Some(Ty::Fn { params, block, effects, .. }) = &perform.signature
+            {
+                w.signature = Some(Ty::Fn { params: params.clone(), block: block.clone(), ret: std::sync::Arc::new(Ty::Nil), effects: effects.clone() });
+            }
             wrappers.push(w);
         }
 
@@ -436,11 +499,11 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
             w.signature = Some(Ty::Fn {
                 params: vec![crate::ty::Param {
                     name: Symbol::from("options"),
-                    ty: Ty::Untyped,
+                    ty: Ty::Untyped.into(),
                     kind: crate::ty::ParamKind::Required,
-                }],
+                }].into(),
                 block: None,
-                ret: Box::new(Ty::Untyped),
+                ret: std::sync::Arc::new(Ty::Untyped),
                 effects: crate::effect::EffectSet::pure(),
             });
             w.body = body;
@@ -451,36 +514,168 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
             ));
         }
 
+        if wrappers.iter().any(|w| w.name.as_str() == "perform_later") {
+            payload_jobs.insert(lc.name.0.as_str().to_string());
+        }
+        // `perform_later_with(at, queue, args)`, for a job a `set(...)`
+        // was folded into: `perform_later`'s body, which ignores both on
+        // every target but the Ruby family's push.
+        if scheduled.jobs.contains(lc.name.0.as_str()) && !class_side.contains("perform_later_with") {
+            if let Some(later) = wrappers.iter().find(|w| w.name.as_str() == "perform_later") {
+                wrappers.push(perform_later_with(later));
+            }
+        }
         lc.methods.extend(wrappers);
     }
+    app.job_plans = super::job_payload::plan_jobs(app, &jobs, &payload_jobs);
     diags
 }
 
+/// What the `:sidekiq` fold did: the jobs a `set(...)` was folded into
+/// `perform_later_with` for, the `priority:` options it dropped, and the
+/// `set(...)` it couldn't honor.
+#[derive(Default)]
+struct SetFolds {
+    jobs: BTreeSet<String>,
+    priority: Vec<crate::span::Span>,
+    rejected: Vec<crate::span::Span>,
+}
+
+/// `<at>` and `<queue>` for a `set(...)`'s literal options, or `None`
+/// when they aren't literal `wait:`, `wait_until:`, `queue:` and
+/// `priority:` keys. `wait:` is relative to now and `wait_until:`
+/// absolute, as Rails reads them, and `wait_until:` wins when both are
+/// given; both go through `to_f`, which an
+/// Integer, a Float, a Duration and a Time all answer. A literal
+/// `wait:` (`90`, `2.seconds`) is folded to its seconds instead.
+fn set_options(args: &[Expr], span: crate::span::Span, folds: &mut SetFolds) -> Option<(Expr, Expr)> {
+    let [opts] = args else { return None };
+    let ExprNode::Hash { entries, .. } = &*opts.node else { return None };
+    let typed = |node: ExprNode, ty: Ty| {
+        let mut e = Expr::new(span, node);
+        e.ty = Some(ty);
+        e
+    };
+    let send = |recv: Expr, method: &str, args: Vec<Expr>, ty: Ty| {
+        typed(
+            ExprNode::Send { recv: Some(recv), method: Symbol::from(method), args, block: None, parenthesized: false },
+            ty,
+        )
+    };
+    let mut at = typed(ExprNode::Lit { value: crate::expr::Literal::Float { value: 0.0 } }, Ty::Float);
+    let mut queue = typed(ExprNode::Lit { value: crate::expr::Literal::Str { value: String::new() } }, Ty::Str);
+    for (k, v) in entries {
+        let ExprNode::Lit { value: crate::expr::Literal::Sym { value: key } } = &*k.node else { return None };
+        match key.as_str() {
+            // `wait_until:` wins over `wait:` whichever comes first,
+            // as Rails' `set` reads them.
+            "wait" if !entries.iter().any(|(k, _)| is_sym(k, "wait_until")) => {
+                let time = typed(ExprNode::Const { path: vec![Symbol::from("Time")] }, Ty::Untyped);
+                let now = send(
+                    time,
+                    "now",
+                    vec![],
+                    Ty::Class { id: crate::ident::ClassId(Symbol::from("Time")), args: vec![].into() },
+                );
+                let now_f = send(now, "to_f", vec![], Ty::Float);
+                // A literal Duration (`2.seconds`, `5.minutes`) folds to
+                // its seconds here, so a target with no Duration (go)
+                // still gets a plain Float.
+                let wait_f = match super::duration::literal_seconds(v) {
+                    Some(n) => typed(ExprNode::Lit { value: crate::expr::Literal::Float { value: n as f64 } }, Ty::Float),
+                    None => send(v.clone(), "to_f", vec![], Ty::Float),
+                };
+                at = send(now_f, "+", vec![wait_f], Ty::Float);
+            }
+            "wait_until" => at = send(v.clone(), "to_f", vec![], Ty::Float),
+            "wait" => {}
+            "queue" => queue = send(v.clone(), "to_s", vec![], Ty::Str),
+            "priority" => folds.priority.push(k.span),
+            _ => return None,
+        }
+    }
+    Some((at, queue))
+}
+
+fn is_sym(e: &Expr, name: &str) -> bool {
+    matches!(&*e.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if value.as_str() == name)
+}
+
+/// `perform_later_with(at, queue, *params)`: `later`'s body with its
+/// parameters moved two places along, so the two lead. The two are
+/// renamed past any of the job's own parameter names.
+fn perform_later_with(later: &crate::dialect::MethodDef) -> crate::dialect::MethodDef {
+    fn shift(e: &mut Expr) {
+        if let ExprNode::Var { id, .. } = &mut *e.node {
+            id.0 += 2;
+        }
+        e.node.for_each_child_mut(&mut |c| shift(c));
+    }
+    let mut w = later.clone();
+    w.name = Symbol::from("perform_later_with");
+    shift(&mut w.body);
+    let own: Vec<&str> = later.params.iter().map(|p| p.name.as_str()).collect();
+    let at = Symbol::from(super::job_payload::fresh_name("at", &own).as_str());
+    let queue = Symbol::from(super::job_payload::fresh_name("queue", &own).as_str());
+    let mut params = vec![
+        crate::dialect::Param::positional(at.clone()),
+        crate::dialect::Param::positional(queue.clone()),
+    ];
+    params.extend(later.params.iter().cloned());
+    w.params = params;
+    if let Some(Ty::Fn { params: tys, block, ret, effects }) = &later.signature {
+        let mut all = vec![
+            crate::ty::Param { name: at, ty: Ty::Float.into(), kind: crate::ty::ParamKind::Required },
+            crate::ty::Param { name: queue, ty: Ty::Str.into(), kind: crate::ty::ParamKind::Required },
+        ];
+        all.extend(tys.iter().cloned());
+        w.signature = Some(Ty::Fn { params: all.into(), block: block.clone(), ret: ret.clone(), effects: effects.clone() });
+    }
+    w
+}
+
 /// Fold `Job.set(…).perform_later(args)` / `.perform_now(args)` to the
-/// class-side call; record every `Job.set` left standing.
+/// class-side call; record every `Job.set` left standing. With `sidekiq`
+/// (the `:sidekiq` folds), a `perform_later`'s options are kept instead,
+/// as `Job.perform_later_with(<at>, <queue>, args)`.
 fn fold_set_chains(
     e: &mut Expr,
     jobs: &BTreeSet<String>,
     unfolded: &mut BTreeSet<String>,
     folded: &mut Vec<crate::span::Span>,
+    mut sidekiq: Option<&mut SetFolds>,
 ) {
     let job_of = |r: &Expr| -> Option<String> {
         let ExprNode::Const { path } = &*r.node else { return None };
         let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
         jobs.contains(&name).then_some(name)
     };
-    if let ExprNode::Send { recv: Some(inner), method, .. } = &mut *e.node {
+    if let ExprNode::Send { recv: Some(inner), method, args, .. } = &mut *e.node {
         if matches!(method.as_str(), "perform_later" | "perform_now") {
             let job_recv = match &*inner.node {
-                ExprNode::Send { recv: Some(j), method: set, block: None, .. }
+                ExprNode::Send { recv: Some(j), method: set, args: set_args, block: None, .. }
                     if set.as_str() == "set" && job_of(j).is_some() =>
                 {
-                    Some(j.clone())
+                    Some((j.clone(), set_args.clone()))
                 }
                 _ => None,
             };
-            if let Some(j) = job_recv {
-                folded.push(inner.span);
+            if let Some((j, set_args)) = job_recv {
+                match sidekiq.as_deref_mut() {
+                    Some(folds) if method.as_str() == "perform_later" => {
+                        match set_options(&set_args, inner.span, folds) {
+                            Some((at, queue)) => {
+                                folds.jobs.insert(job_of(&j).unwrap());
+                                *method = Symbol::from("perform_later_with");
+                                let mut all = vec![at, queue];
+                                all.append(args);
+                                *args = all;
+                            }
+                            None => folds.rejected.push(inner.span),
+                        }
+                    }
+                    _ => folded.push(inner.span),
+                }
                 *inner = j;
             }
         }
@@ -492,7 +687,7 @@ fn fold_set_chains(
             }
         }
     }
-    e.node.for_each_child_mut(&mut |c| fold_set_chains(c, jobs, unfolded, folded));
+    e.node.for_each_child_mut(&mut |c| fold_set_chains(c, jobs, unfolded, folded, sidekiq.as_deref_mut()));
 }
 
 /// The modules whose `include` makes a class a Sidekiq worker.
@@ -505,7 +700,7 @@ const SIDEKIQ_CLASS_MACROS: &[&str] = &["sidekiq_options", "sidekiq_retry_in", "
 /// Library classes that include a Sidekiq worker module, or descend from
 /// one that does (mastodon's `UpdateDistributionWorker < RawDistributionWorker`).
 fn sidekiq_workers(app: &App) -> BTreeSet<String> {
-    let by_name: std::collections::HashMap<&str, &crate::dialect::LibraryClass> =
+    let by_name: crate::det::HashMap<&str, &crate::dialect::LibraryClass> =
         app.library_classes.iter().map(|lc| (lc.name.0.as_str(), lc)).collect();
     let mut out = BTreeSet::new();
     for lc in &app.library_classes {
@@ -523,7 +718,7 @@ fn sidekiq_workers(app: &App) -> BTreeSet<String> {
 }
 
 fn workers_with_positional_perform(app: &App, workers: &BTreeSet<String>) -> BTreeSet<String> {
-    let by_name: std::collections::HashMap<&str, &crate::dialect::LibraryClass> =
+    let by_name: crate::det::HashMap<&str, &crate::dialect::LibraryClass> =
         app.library_classes.iter().map(|lc| (lc.name.0.as_str(), lc)).collect();
     let mut out = BTreeSet::new();
     for name in workers {
@@ -546,8 +741,96 @@ fn workers_with_positional_perform(app: &App, workers: &BTreeSet<String>) -> BTr
     out
 }
 
+/// Whether `name`'s own class chain (itself, then ancestors) defines an
+/// instance `perform` at all, regardless of its parameter shape —
+/// including one provided by an included module rather than the class
+/// body itself. Library classes never get concern methods spliced into
+/// `methods` the way models and controllers do (`ingest::app`'s
+/// `splice_concerns_into_models`/`_controllers` has no library-class
+/// twin), so a worker's own `perform` from a mixin is invisible unless
+/// this walks `includes` too.
+///
+/// Tells an abstract base worker (no `perform` anywhere — never an
+/// entry point) apart from one whose `perform` exists somewhere (on
+/// itself, an ancestor, or a mixin) but isn't positional — that case
+/// still goes through `workers_with_positional_perform` and the
+/// existing "without a positional perform" refusal, exactly as before;
+/// this function does not widen wrapping to mixin-provided `perform`s,
+/// only widens what counts as "a perform exists".
+///
+/// An explicit superclass that isn't in `app.library_classes` is
+/// treated the same as an unresolved include: it may provide
+/// `perform`, so the worker is not stripped as abstract.
+fn workers_with_any_perform(app: &App, workers: &BTreeSet<String>) -> BTreeSet<String> {
+    let by_name: crate::det::HashMap<&str, &crate::dialect::LibraryClass> =
+        app.library_classes.iter().map(|lc| (lc.name.0.as_str(), lc)).collect();
+
+    fn defines_instance_perform(c: &crate::dialect::LibraryClass) -> bool {
+        c.methods.iter().any(|m| {
+            m.receiver == crate::dialect::MethodReceiver::Instance && m.name.as_str() == "perform"
+        })
+    }
+
+    // Whether an include target provides `perform`: the Sidekiq marker
+    // modules that make the class a worker in the first place never
+    // do, so they're excluded up front — otherwise every worker would
+    // read as "maybe performs" through its own `include Sidekiq::
+    // Worker`. Any OTHER include that resolves to an ingested library
+    // class answers via its own methods or (transitively) its own
+    // includes. An include this app never ingested — a gem module, or
+    // any other name ingest didn't resolve to a library class — is
+    // unknown, so this is conservative: it may as well provide
+    // `perform`, so the class takes the existing refusal path rather
+    // than being silently stripped.
+    fn include_provides_perform(
+        id: &crate::ident::ClassId,
+        by_name: &crate::det::HashMap<&str, &crate::dialect::LibraryClass>,
+        seen: &mut crate::det::HashSet<crate::ident::ClassId>,
+    ) -> bool {
+        if SIDEKIQ_MODULES.contains(&id.0.as_str()) {
+            return false;
+        }
+        if !seen.insert(id.clone()) {
+            return false;
+        }
+        let Some(c) = by_name.get(id.0.as_str()).copied() else {
+            return true;
+        };
+        defines_instance_perform(c)
+            || c.includes.iter().any(|inc| include_provides_perform(inc, by_name, seen))
+    }
+
+    let mut out = BTreeSet::new();
+    for name in workers {
+        let mut cur = by_name.get(name.as_str()).copied();
+        let mut seen = crate::det::HashSet::default();
+        for _ in 0..32 {
+            let Some(c) = cur else { break };
+            let found = defines_instance_perform(c)
+                || c.includes.iter().any(|inc| include_provides_perform(inc, &by_name, &mut seen));
+            if found {
+                out.insert(name.clone());
+                break;
+            }
+            // No parent declared → end of chain (true abstract base if
+            // nothing above provided perform). An explicit parent that
+            // isn't ingested is unknown — same conservatism as an
+            // unresolved include: count as a possible perform provider.
+            let Some(parent) = c.parent.as_ref() else {
+                break;
+            };
+            if !by_name.contains_key(parent.0.as_str()) {
+                out.insert(name.clone());
+                break;
+            }
+            cur = by_name.get(parent.0.as_str()).copied();
+        }
+    }
+    out
+}
+
 fn without_delayed_enqueue_overrides(app: &App, wrapped: &BTreeSet<String>) -> BTreeSet<String> {
-    let by_name: std::collections::HashMap<&str, &crate::dialect::LibraryClass> =
+    let by_name: crate::det::HashMap<&str, &crate::dialect::LibraryClass> =
         app.library_classes.iter().map(|lc| (lc.name.0.as_str(), lc)).collect();
     wrapped
         .iter()

@@ -57,7 +57,8 @@
 //!   pass for consumers after analysis; no round reads them.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
+use crate::det::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -127,8 +128,8 @@ impl Loop {
 
 /// The inputs `analyze` computes once and hands every typing pass.
 pub(super) struct RoundInputs<'a> {
-    pub dynamic_render_ivars: &'a std::collections::HashSet<Symbol>,
-    pub existing_view_names: &'a std::collections::HashSet<Symbol>,
+    pub dynamic_render_ivars: &'a crate::det::HashSet<Symbol>,
+    pub existing_view_names: &'a crate::det::HashSet<Symbol>,
     pub module_methods: &'a HashMap<ClassId, Vec<MethodDef>>,
     pub module_includes: &'a HashMap<ClassId, Vec<ClassId>>,
     pub parent_link_by_name: &'a HashMap<ClassId, Option<ClassId>>,
@@ -251,7 +252,7 @@ type IrRow = (u32, u32, u32, u64, u64);
 
 fn ir_rows(e: &Expr, out: &mut Vec<IrRow>) {
     let ty = e.ty.as_ref().map_or(0, type_hash);
-    let note = hash_of((e.decisions, e.diagnostic.as_ref().map(annotation_hash)));
+    let note = hash_of((e.decisions, e.diagnostic().as_ref().map(annotation_hash)));
     out.push((e.span.file.0, e.span.start, e.span.end, ty, note));
     e.node.for_each_child(&mut |c| ir_rows(c, out));
 }
@@ -601,7 +602,7 @@ mod tests {
     use crate::ident::TyVar;
 
     fn union(variants: Vec<Ty>) -> Ty {
-        Ty::Union { variants }
+        Ty::Union { variants: variants.into() }
     }
 
     #[test]
@@ -632,7 +633,7 @@ class SamplesController < ActionController::Base
   end
 end
 "#);
-            let tree = HashMap::from([(
+            let tree = crate::vfs::FileTree::from_iter([(
                 std::path::PathBuf::from("app/controllers/samples_controller.rb"),
                 source.into_bytes(),
             )]);
@@ -699,14 +700,14 @@ end
             let resolution = ControllerResolution {
                 filter_chain: vec![ResolvedFilter {
                     filter, defined_in: id.clone(), included_via: id.clone(),
-                    assigns: HashMap::new(), effects: Default::default(),
+                    assigns: HashMap::default(), effects: Default::default(),
                 }],
                 layout: Some(Symbol::from("layouts/application")),
             };
             let app = App::default();
             let mut analyzer = Analyzer::new(&app);
             analyzer.view_seeds = Some(ViewSeeds {
-                controller_resolutions: HashMap::from([(id, resolution)]),
+                controller_resolutions: HashMap::from_iter([(id, resolution)]),
                 ..ViewSeeds::default()
             });
             analyzer.state_fp(&app).digests()["view_seeds"].clone()
@@ -718,20 +719,20 @@ end
 
     #[test]
     fn type_hash_tells_containers_apart() {
-        let arr = Ty::Array { elem: Box::new(Ty::Int) };
-        let hash = Ty::Hash { key: Box::new(Ty::Int), value: Box::new(Ty::Int) };
+        let arr = Ty::Array { elem: std::sync::Arc::new(Ty::Int) };
+        let hash = Ty::Hash { key: std::sync::Arc::new(Ty::Int), value: std::sync::Arc::new(Ty::Int) };
         assert_ne!(type_hash(&arr), type_hash(&hash));
-        assert_ne!(type_hash(&arr), type_hash(&Ty::Array { elem: Box::new(Ty::Str) }));
+        assert_ne!(type_hash(&arr), type_hash(&Ty::Array { elem: std::sync::Arc::new(Ty::Str) }));
     }
 
     #[test]
     fn untyped_is_found_at_any_depth() {
         let deep = Ty::Hash {
-            key: Box::new(Ty::Str),
-            value: Box::new(Ty::Array { elem: Box::new(union(vec![Ty::Int, Ty::Untyped])) }),
+            key: std::sync::Arc::new(Ty::Str),
+            value: std::sync::Arc::new(Ty::Array { elem: std::sync::Arc::new(union(vec![Ty::Int, Ty::Untyped])) }),
         };
         assert!(holds_untyped(&deep));
-        assert!(!holds_untyped(&Ty::Array { elem: Box::new(Ty::Int) }));
+        assert!(!holds_untyped(&Ty::Array { elem: std::sync::Arc::new(Ty::Int) }));
     }
 
     #[test]

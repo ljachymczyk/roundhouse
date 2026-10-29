@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Top-level entry point for the CRuby (Puma/Rack) target.
 #
 # Dispatch lives in `Main.dispatch_core`, which returns a response
@@ -32,6 +33,9 @@
 require_relative "boot"
 
 module Main
+  # The framework class used by the nominal ParseError fallback.
+  FrameworkParseError = ActionDispatch::Http::Parameters::ParseError
+
   # Dispatch one request to a response descriptor — the single source
   # of routing / controller / flash / redirect logic. Returns the
   # 10-tuple `[status, body, content_type, location, set_cookies,
@@ -62,6 +66,21 @@ module Main
     @route_table ||= [RouteTable.root] + RouteTable.table + ActiveStorage::Routes.table
   end
 
+  # A 404 the app did not rescue (no route, ActionNotFound,
+  # RecordNotFound), answered as Rails' production exceptions app
+  # (ActionDispatch::PublicExceptions) does: `{"status":404,"error":
+  # "Not Found"}` when the request's format is JSON
+  # (ActionDispatch::MimeNegotiation.json_format?), the HTML page
+  # otherwise. The spinel twin is `Main.render_not_found`.
+  def self.not_found_response(format_param, path, request, env)
+    extension = path.end_with?(".json") ? "json" : ""
+    if ActionDispatch::MimeNegotiation.json_format?(format_param, extension,
+         request.fetch(:accept, "").to_s, env["HTTP_X_REQUESTED_WITH"].to_s, env["CONTENT_TYPE"].to_s)
+      return [404, %({"status":404,"error":"Not Found"}), "application/json; charset=UTF-8", nil, {}, {}, {}, {}, {}]
+    end
+    [404, "<h1>404 Not Found</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
+  end
+
   def self.dispatch_core(env, stdin)
     # Rails wraps every request in the AR query cache: identical
     # SELECTs within one request replay the first result; any write
@@ -86,6 +105,13 @@ module Main
   def self.dispatch_core_inner(env, stdin)
     ActionView::ViewHelpers.reset_slots!
     Broadcasts.reset_log!
+    # config.assume_ssl, same as the spinel dispatcher: the Rack env is
+    # what `request.ssl?` and the Secure cookie flag both read.
+    if AppEnvironment.serving_assume_ssl?
+      env["HTTPS"] = "on"
+      env["HTTP_X_FORWARDED_PROTO"] = "https"
+      env["rack.url_scheme"] = "https"
+    end
 
     request = CgiIo.parse_request(env, stdin)
     # Browser forms can only GET/POST; a hidden `_method` field carries
@@ -122,7 +148,9 @@ module Main
     matched = ActionDispatch::Router.match(request[:method], request_path,
                            route_table)
     if matched.nil?
-      return [404, "<h1>404 Not Found</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
+      # No route: the format is the `?format=` param, a trusted Accept,
+      # or the path's extension (Main.not_found_response).
+      return not_found_response(request[:params]["format"].to_s, request_path, request, env)
     end
     # A `(.:format)` EXTENSION the router stripped off the path
     # (`/rooms/3/refresh.turbo_stream`). The `.json` sniff above runs
@@ -142,10 +170,16 @@ module Main
     request_format = :xml if path_format == "xml"
     # `/service-worker.js`: campfire's raw service-worker template.
     request_format = :js if path_format == "js"
-    # A route-forced format (`get "/rss" => "home#index", :format =>
-    # "rss"`) overrides the path-suffix sniff — the URL has no
-    # extension but the route pins the response format.
-    request_format = matched.req_format unless matched.req_format.nil?
+    # A route's default format (`get "/rss" => "home#index", :format =>
+    # "rss"`, `defaults: { format: :json }`) fills in what the request
+    # left out, as in Rails: it applies only when the path carried no
+    # extension, and is then written to `params[:format]` too (as a
+    # String, which the action reads). `/widgets/1.html` keeps html on a
+    # route defaulting to json.
+    if path_format.empty? && !matched.req_format.nil?
+      request_format = matched.req_format
+      matched.path_params["format"] = matched.req_format.to_s
+    end
 
     # `--target futamura`'s whole-route bridge serves only the actions
     # the analysis cleared (src/emit/futamura/routes.rb); any other
@@ -156,6 +190,13 @@ module Main
     if !allowed.nil? && !allowed.include?("#{matched.controller}##{matched.action}")
       env["roundhouse.declined"] = true
       return [404, "", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
+    end
+
+    # A JSON body that does not parse: Rails' params parser raises
+    # ParseError and the request is answered 400 before any action runs
+    # (the spinel twin: `Main.request_params` returning nil).
+    if request[:bad_request]
+      return [400, "<h1>400 Bad Request</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
     end
 
     controller = Main.instantiate_controller(matched.controller)
@@ -214,10 +255,12 @@ module Main
     inbound_flash = {}
     host_flash = env["roundhouse.flash"]
     if host_flash.nil?
-      %w[notice alert].each do |kind|
-        name = "flash_#{kind}"
-        value = ActionDispatch::SignedCookie.verified(cookies[name.to_sym].to_s, name)
-        inbound_flash[kind] = value unless value.empty?
+      # Every `flash_<key>` cookie, not only notice/alert: lobsters' layout shows `flash[:error]` / `[:success]`.
+      cookies.each do |cname, cvalue|
+        name = cname.to_s
+        next unless name.start_with?("flash_")
+        value = ActionDispatch::SignedCookie.verified(cvalue.to_s, name)
+        inbound_flash[name.delete_prefix("flash_")] = value unless value.empty?
       end
     else
       host_flash.each { |k, v| inbound_flash[k.to_s] = v }
@@ -236,12 +279,19 @@ module Main
     # comma is read as html.
     accept = request.fetch(:accept, "").to_s
     controller.accepts_any_format = !accept.include?(",") && accept.split(";", 2)[0].to_s.strip == "*/*"
+    # Rails' `Vary: Accept` on a render whose format came from the Accept
+    # header (runtime/action_dispatch/mime_negotiation.rb), as the spinel
+    # dispatcher decides it.
+    controller.vary_on_accept = ActionDispatch::MimeNegotiation.should_apply_vary_header?(
+      accept, env["HTTP_X_REQUESTED_WITH"].to_s, env["CONTENT_TYPE"].to_s,
+      merged.key?("format") || !matched.req_format.nil?)
     # The full request object (CRuby overlay class) — filters read
     # `request.remote_ip` / `request.env` / `request[:format]`. `env.to_h`
     # detaches a plain mutable Hash (callers write scratch keys the real
     # ENV would reject); params delegation gets the same merged hash the
     # controller sees.
     controller.request = ActionDispatch::Request.new(env.to_h, merged)
+    controller.request.path_parameters = Main.route_parameters(controller, matched)
     # The body's params alone, for ParamsWrapper (`Params.wrap`).
     controller.request.request_parameters = request[:body_params]
     # Same object, module-reachable — helpers are module functions with
@@ -254,10 +304,19 @@ module Main
     begin
       controller.process_action(matched.action)
     rescue ActiveRecord::RecordNotFound, ActionController::RoutingError, AbstractController::ActionNotFound
-      return [404, "<h1>404 Not Found</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
-    rescue ActionController::ParameterMissing, ActionController::BadRequest
-      # `params.expect` / `params.require` refused the request and the app
-      # did not rescue it: Rails' rescue_responses answer :bad_request.
+      # The routed format (extension, route default) is the `format`
+      # param; an html one may still name `?format=`.
+      format_param = request_format == :html ? merged["format"].to_s : request_format.to_s
+      return not_found_response(format_param, request_path, request, env)
+    rescue ActionController::ParameterMissing, ActionController::BadRequest,
+           ActionDispatch::Http::Parameters::ParseError => error
+      # The app's handlers have already run. Rails' rescue_responses map
+      # an unhandled ParseError to :bad_request by its exact class name;
+      # an application subclass has no default mapping.
+      # Bind the built-ins so application instance/class overrides cannot
+      # turn a subclass into the framework's exact exception class.
+      raise if Kernel.instance_method(:is_a?).bind_call(error, FrameworkParseError) &&
+               !Kernel.instance_method(:instance_of?).bind_call(error, FrameworkParseError)
       return [400, "<h1>400 Bad Request</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
     rescue ActiveRecord::RecordInvalid, ActiveRecord::RecordNotSaved, ActionController::InvalidAuthenticityToken
       # Not a 500: Rails' rescue_responses answer these with 422.
@@ -279,17 +338,15 @@ module Main
       # The host keeps the flash in its own session; hand back what
       # survives this request (nothing, once displayed).
       env["roundhouse.flash.out"] = persisted
-    elsif persisted.key?("notice")
-      out_cookies[:flash_notice] = ActionDispatch::SignedCookie.sign(persisted["notice"], "flash_notice")
-    elsif cookies.key?(:flash_notice)
-      out_cookies[:flash_notice] = nil
-    end
-    if !host_flash.nil?
-      # Handed back above, with the notice.
-    elsif persisted.key?("alert")
-      out_cookies[:flash_alert] = ActionDispatch::SignedCookie.sign(persisted["alert"], "flash_alert")
-    elsif cookies.key?(:flash_alert)
-      out_cookies[:flash_alert] = nil
+    else
+      persisted.each do |kind, value|
+        name = "flash_#{kind}"
+        out_cookies[name.to_sym] = ActionDispatch::SignedCookie.sign(value, name)
+      end
+      cookies.each_key do |cname|
+        name = cname.to_s
+        out_cookies[name.to_sym] = nil if name.start_with?("flash_") && !persisted.key?(name.delete_prefix("flash_"))
+      end
     end
     # Cookies the action wrote (`cookies[:k] = v` / `cookies.permanent`)
     # ride out alongside the flash cookies. Flag maps stay off the
@@ -327,6 +384,12 @@ module Main
     # header store, right before it is copied below — a no-op unless
     # the action or one of its filters touched the store.
     controller.commit_cache_control!
+    # Rails' Rack::ETag and Rack::ConditionalGet
+    # (action_controller/conditional_get.rb): the body ETag, the default
+    # Cache-Control, and a 304 for a matching If-None-Match, on the
+    # controller's status, body and headers before they are read below.
+    controller.commit_conditional_get!(env["REQUEST_METHOD"].to_s, env["HTTP_IF_NONE_MATCH"].to_s)
+    controller.commit_default_headers!
     # Headers the action set beyond Content-Type/Location — a
     # `Content-Disposition` on a download, the Cache-Control a blob
     # route asks for — ride as the tuple's sixth element.
@@ -339,7 +402,7 @@ module Main
     end
     if is_redirect
       [controller.status,
-       %(<a href="#{controller.location}">Redirecting</a>),
+       %(<a href="#{ActionView::ViewHelpers.html_escape(controller.location.to_s)}">Redirecting</a>),
        "text/html; charset=utf-8", controller.location, out_cookies, extra_headers, secure_cookies, samesite_cookies, httponly_cookies, expires_cookies]
     else
       # The controller body IS the full page: the Ruby emit path's
@@ -396,6 +459,7 @@ module Main
   # entry per cookie) and reuses `CgiIo.url_encode` so values match the
   # CGI path exactly.
   def self.run_rack(env)
+    started = ActionDispatch::Runtime.clock_time
     status, body, content_type, location, set_cookies, extra_headers, secure_cookies, samesite_cookies, httponly_cookies, expires_cookies =
       dispatch_core(env, env["rack.input"] || StringIO.new(""))
     headers = {}
@@ -423,6 +487,12 @@ module Main
       end
     end
     headers["set-cookie"] = cookies unless cookies.empty?
+    # Rails' ActionDispatch::RequestId and Rack::Runtime around the whole
+    # request (runtime/action_dispatch/request_id.rb), as the spinel
+    # dispatcher stamps them: X-Request-Id always, X-Runtime unless the
+    # app set one. config.ru serves static and public files before this.
+    headers["x-request-id"] = ActionDispatch::RequestId.make(env["HTTP_X_REQUEST_ID"].to_s)
+    headers["x-runtime"] = ActionDispatch::Runtime.header_value(started) unless headers.key?("x-runtime")
     [status, headers, [body]]
   end
 
@@ -437,6 +507,19 @@ module Main
     when :comments then CommentsController.new
     else ActiveStorage::Routes.instantiate_controller(sym)
     end
+  end
+
+  # Rails' `request.path_parameters`: the route's captures, with the
+  # controller and action the request was dispatched to. The
+  # controller's own `path_parameters` and params keep the captures alone.
+  def self.route_parameters(controller, matched)
+    out = {}
+    matched.path_params.each { |k, v| out[k] = v }
+    # The dispatched controller and action win over a capture of the same
+    # name: Rails dispatches by these two, so they name what ran.
+    out["controller"] = controller.controller_path
+    out["action"] = matched.action.to_s
+    out
   end
 
   # First-time setup. Idempotent: skips when already configured (so

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # View helpers — module functions invoked from Views::* render methods.
 #
 # Surface tracks what real-blog actually uses (cf. fixtures/real-blog/
@@ -120,8 +121,15 @@ module ActionView
     # Monomorphic String. Skip gsub when already safe (ERB::Util).
     # Probe with `include?`, not `match?(re)` — Rust/Python have no
     # portable match? emit.
+    #
+    # A safe input is answered as a fresh String (`+ ""`). Returning
+    # `s` kept the caller's handle; Spinel's share analysis then
+    # refused ERB sites that pass `filename.to_s` / `extension` into
+    # the escape (campfire's `active_storage/blobs/_blob`, #9258):
+    # the same characters can still be appended under another name.
+    # The escape's job is text for embedding, not a shared buffer.
     def self.html_escape(s)
-      return s unless s.include?("&") || s.include?("<") || s.include?(">") || s.include?("\"") || s.include?("'")
+      return s + "" unless s.include?("&") || s.include?("<") || s.include?(">") || s.include?("\"") || s.include?("'")
       s.gsub(HTML_ESCAPE_PATTERN, HTML_ESCAPES)
     end
 
@@ -139,7 +147,7 @@ module ActionView
     BUILDER_TEXT_PATTERN = /[&<>]/.freeze
 
     def self.builder_text(s)
-      return s unless s.include?("&") || s.include?("<") || s.include?(">")
+      return s + "" unless s.include?("&") || s.include?("<") || s.include?(">")
       s.gsub(BUILDER_TEXT_PATTERN, BUILDER_TEXT_ESCAPES)
     end
 
@@ -157,7 +165,7 @@ module ActionView
     BUILDER_ATTR_PATTERN = /[&<>"\n\r]/.freeze
 
     def self.builder_attr(s)
-      return s unless s.include?("&") || s.include?("<") || s.include?(">") || s.include?("\"") || s.include?("\n") || s.include?("\r")
+      return s + "" unless s.include?("&") || s.include?("<") || s.include?(">") || s.include?("\"") || s.include?("\n") || s.include?("\r")
       s.gsub(BUILDER_ATTR_PATTERN, BUILDER_ATTR_ESCAPES)
     end
 
@@ -173,6 +181,16 @@ module ActionView
     # marked safe on the overlay so this call passes it through.
     def self.h(value)
       html_escape(value.to_s)
+    end
+
+    # One attribute of a `tag.*` / `content_tag` call whose value is known
+    # only at run time, as Rails' `tag_options` renders it: ` key="value"`,
+    # escaped, or nothing at all when the value is nil. A call, so the
+    # value expression runs once (`lower::view_to_library::attr_parts`,
+    # `push_escaped_attr`); an inline `nil?` guard ran it twice. Same
+    # shape as `to_query_value`, which the strict targets already compile.
+    def self.tag_attr(key, value)
+      value.nil? ? "" : " #{key}=\"#{html_escape(value.to_s)}\""
     end
 
     # Percent-encoding for a QUERY-STRING VALUE — what Rails' `url_for`
@@ -211,6 +229,38 @@ module ActionView
 
     URL_ESCAPE_PATTERN = /[\x00\r\n !"\#$%&'()*+,\/:;<=>?@\[\\\]^`{|}]/.freeze
 
+    # ERB::Util.url_encode, a view's `u(x)`: every byte but the unreserved
+    # ones (A-Z a-z 0-9 _ . ~ -) as `%XX`, uppercase, so a space is `%20`
+    # and a multibyte character is its UTF-8 bytes. Not `url_encode`
+    # below, which is CGI.escape (`+` for a space) for query strings.
+    # Concat, not `<<`, as in render_attrs: `out << s` lowers as `.add` /
+    # write-into-`&str` on Kotlin/C#/Rust/Python/Elixir.
+    def self.erb_url_encode(s)
+      # Not `b.chr` / `format("%%%02X", b)`, nor a constant table, `bytes.each` or `str[i]`: no strict target answers the first two, Rust reads a constant through a lock, a block's byte as `&mut` and indexes no `str` by an Integer.
+      hex = "0123456789ABCDEF"
+      printable = " !\"\#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+      bytes = s.bytes
+      out = ""
+      i = 0
+      while i < bytes.length
+        b = erb_url_byte(bytes, i)
+        if (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) ||
+           b == 45 || b == 46 || b == 95 || b == 126
+          out = out + printable[b - 32, 1].to_s
+        else
+          out = out + "%" + hex[b / 16, 1].to_s + hex[b % 16, 1].to_s
+        end
+        i += 1
+      end
+      out
+    end
+
+    # Not `bytes[i]` inline, nor `bytes[i] || 0`: the inline read types as Integer | nil, which Elixir refuses arithmetic on, and Rust's Vec<i64> has no `unwrap_or`.
+    def self.erb_url_byte(bytes, i)
+      raise ArgumentError, "erb_url_byte: index outside the bytes" if i < 0 || i >= bytes.length
+      bytes[i]
+    end
+
     # Same include? probe as html_escape (no portable match? emit).
     def self.url_encode(s)
       return s unless needs_url_escape?(s)
@@ -247,6 +297,78 @@ module ActionView
     end
 
     def self.fragment_write(_key, value, _ttl)
+      value
+    end
+
+    # A `<% cache record do %>` block, keyed as Rails' CacheHelper keys
+    # it: `[template, record]`, combined by the controller
+    # (`lower::view_to_library::walker`, `emit_cached_fragment`). Here
+    # caching is off; the ruby family and spinel reopen both.
+    def self.fragment_read_record(_template, _record)
+      nil
+    end
+
+    def self.fragment_write_record(_template, _record, value, _ttl)
+      value
+    end
+
+    # A `render collection:, cached: ->(item) { key }` reads and writes
+    # each element's fragment through these four
+    # (`lower::view_to_library::partial`, `wrap_keyed_cached_collection`).
+    # Here caching is off, so the lowering takes its uncached branch;
+    # the ruby family and spinel reopen them with the controller's
+    # `perform_caching`, `combined_fragment_cache_key` and `cache_store`.
+    def self.collection_caching?
+      false
+    end
+
+    def self.collection_fragment_key(partial, _key)
+      partial
+    end
+
+    def self.collection_fragment_read(_name)
+      nil
+    end
+
+    def self.collection_fragment_write(_name, value)
+      value
+    end
+
+    # Every element's fragment in one lookup, as Rails' collection
+    # renderer asks its `collection_cache.read_multi`: the hits in the
+    # order of `names`, `nil` for a miss.
+    def self.collection_fragment_read_multi(names)
+      names.map { |name| ActionView::ViewHelpers.collection_fragment_read(name) }
+    end
+
+    # Told once a cached collection has rendered: the partial's template
+    # (`app/views/messages/_message.html.erb`) and what the store
+    # answered for each element. Rails reports the same facts as its
+    # `render_collection.action_view` event; nothing listens here, and
+    # the ruby family's test support reports them.
+    def self.collection_rendered(_identifier, _hits)
+      nil
+    end
+
+    # A jbuilder template wrapped in `json.cache! key do … end` reads and
+    # writes its JSON through these (`lower::jbuilder_to_library`,
+    # `walk_cached_template`). Caching is off here, so the lowering
+    # renders the block; the ruby family and spinel reopen them with the
+    # controller and Jbuilder's own `_read_fragment_cache` /
+    # `_write_fragment_cache`.
+    def self.jbuilder_caching?
+      false
+    end
+
+    def self.jbuilder_cache_key(template, _key)
+      template
+    end
+
+    def self.jbuilder_fragment_read(_key)
+      nil
+    end
+
+    def self.jbuilder_fragment_write(_key, value)
       value
     end
 
@@ -353,11 +475,33 @@ module ActionView
         s.include?("}")
     end
 
-    def self.truncate(s, length: 30, omission: "...")
+    # `separator:` cuts at the last occurrence of `separator` at or
+    # before the omission-adjusted cutoff, so a truncated string doesn't
+    # split mid-word — ActiveSupport's `String#truncate`
+    # (active_support/core_ext/string/filters.rb) algorithm, read off
+    # the installed gem and confirmed against Rails 8.1.4's own output
+    # (rubys/roundhouse#812). `omission:` alone (no separator) is
+    # unchanged from before.
+    def self.truncate(s, length: 30, omission: "...", separator: nil)
       return s if s.length <= length
       cutoff = length - omission.length
-      cutoff = 0 if cutoff < 0
+      return omission if cutoff <= 0
+      unless separator.nil?
+        found = rindex_at_or_before(s, separator, cutoff)
+        cutoff = found if found >= 0
+      end
       "#{s[0, cutoff]}#{omission}"
+    end
+
+    # Not `s.rindex(sub, pos)`, which no strict target's runtime answers, and -1 rather than nil, which Go and C# do not narrow from a local.
+    def self.rindex_at_or_before(s, sub, pos)
+      i = s.length - sub.length
+      i = pos if pos < i
+      while i >= 0
+        return i if s[i, sub.length] == sub
+        i -= 1
+      end
+      -1
     end
 
     # Rails 8.1.4's ActionView::TextHelper#word_wrap for positive widths.
@@ -794,54 +938,47 @@ module ActionView
       ActionController.masked_authenticity_token
     end
   
-    # Empty in dev mode without a CSP nonce configured, mirroring Rails'
-    # behavior and the other targets' runtimes (Rust / Python / Elixir
-    # all return "" here). Production deployment with CSP wired would
-    # plug a real nonce in.
+    # Empty when no policy is configured. The ruby family reopens this
+    # in `view_helpers_ext.rb` and emits the meta tag Rails'
+    # `csp_meta_tag` emits once `Rails.application.content_security_policy`
+    # is set (the object a request duplicates). Strict targets have no
+    # request in a view helper, so they stay empty — the same split as
+    # `url_for_path`.
     def self.csp_meta_tag
       ""
     end
   
     def self.stylesheet_link_tag(name, opts = EMPTY_HTML_OPTS)
-      href = "/assets/#{name}.css"
+      href = digested_asset_path("#{name}.css")
       attrs = render_attrs({ rel: "stylesheet", href: href }.merge(opts.to_h))
       "<link#{attrs}>"
     end
 
     # `<script src>` include for a JS source. The source resolves through
-    # the same undigested `/assets/<name>.js` convention as
-    # `javascript_path` (see the `image_path` note on why no digests);
-    # absolute paths and URLs pass verbatim. Rails takes a Symbol source
+    # the same emitted asset table as `image_path`.
+    # Absolute paths and URLs pass verbatim. Rails takes a Symbol source
     # too, and a value can hold one, so the source becomes a String here.
     def self.javascript_include_tag(source, opts = EMPTY_HTML_OPTS)
       source_s = source.to_s
       name = source_s.include?(".") ? source_s : "#{source_s}.js"
-      src = name.start_with?("/") || name.include?("://") ? name : "/assets/#{name}"
+      src = name.start_with?("/") || name.include?("://") ? name : digested_asset_path(name)
       attrs = render_attrs({ src: src }.merge(opts.to_h))
       "<script#{attrs}></script>"
     end
 
     # Asset path for an image source. `skip_pipeline: true` (and any
     # already-absolute or protocol-relative source) returns the source
-    # verbatim — Rails bypasses the pipeline for those, and the lobsters
-    # benchmark (production, `config.assets.compile = false`, no manifest)
-    # has no digests to apply anyway, so the undigested `/assets/<name>`
-    # prefix below matches its Rails output. Fingerprinting belongs to an
-    # app that actually precompiles assets, not here.
+    # verbatim, since neither belongs to the emitted logical-asset table.
     def self.image_path(source, skip_pipeline: false)
       return source if skip_pipeline
       return source if source.start_with?("/")
       return source if source.include?("://")
-      "/assets/#{source}"
+      digested_asset_path(source)
     end
 
     # `asset_path` — the GENERAL one. In Rails `image_path` is
-    # `asset_path(source, type: :image)`, so the body above is this body
-    # with a type that only ever picked a subdirectory in the
-    # sprockets-era layout; under Propshaft (and under the
-    # no-manifest benchmark posture both share) the answer is the same
-    # `/assets/<source>`, so the two are spelled out separately rather
-    # than one delegating and paying a kwarg forward.
+    # `asset_path(source, type: :image)`; Propshaft uses a logical name
+    # independent of the asset type.
     #
     # campfire reaches it for the /sounds/*.mp3 a `/play` message
     # renders — `asset_path(sound.asset_path)` inside
@@ -851,6 +988,10 @@ module ActionView
       return source if skip_pipeline
       return source if source.start_with?("/")
       return source if source.include?("://")
+      digested_asset_path(source)
+    end
+
+    def self.digested_asset_path(source)
       "/assets/#{source}"
     end
 
@@ -874,7 +1015,7 @@ module ActionView
       return source if skip_pipeline
       return source if source.start_with?("/")
       return source if source.include?("://")
-      "/assets/#{source}"
+      digested_asset_path(source)
     end
 
     # `path_to_javascript "application"` → the asset path for a JS source.
@@ -887,7 +1028,7 @@ module ActionView
       return source if source.start_with?("/")
       return source if source.include?("://")
       name = source.include?(".") ? source : "#{source}.js"
-      "/assets/#{name}"
+      digested_asset_path(name)
     end
 
     # Alias of `path_to_javascript`. Inlined rather than delegating, so no
@@ -899,7 +1040,7 @@ module ActionView
       return source if source.start_with?("/")
       return source if source.include?("://")
       name = source.include?(".") ? source : "#{source}.js"
-      "/assets/#{name}"
+      digested_asset_path(name)
     end
 
     # `<img>` tag for a source path + attribute opts. The source flows

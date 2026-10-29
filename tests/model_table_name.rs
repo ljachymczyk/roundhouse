@@ -34,7 +34,7 @@ fn tree(source: &str) -> HashMap<PathBuf, Vec<u8>> {
 fn assert_unbound(files: HashMap<PathBuf, Vec<u8>>) {
     let source = &files[&PathBuf::from("app/models/item.rb")];
     let parsed = ruby_prism::parse(source);
-    let parse_errors: Vec<_> = parsed.errors().map(|e| e.message().to_string()).collect();
+    let parse_errors: Vec<_> = parsed.errors().map(|e| String::from_utf8_lossy(e.message()).into_owned()).collect();
     assert!(parse_errors.is_empty(), "invalid repro: {parse_errors:?}");
     drop(parsed);
 
@@ -91,7 +91,7 @@ end
         assert_eq!(
             model.attributes.fields[&Symbol::from("optional_label")],
             Ty::Union {
-                variants: vec![Ty::Str, Ty::Nil]
+                variants: vec![Ty::Str, Ty::Nil].into()
             },
             "the override does not erase column nullability"
         );

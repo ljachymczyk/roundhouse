@@ -37,20 +37,20 @@ pub fn specialize(app: &App, files: &mut Vec<(String, String)>) -> Result<Report
     for c in &app.controllers {
         for item in &c.body {
             if let ControllerBodyItem::Action { action, .. } = item {
-                spec.method_body(&action.body, &mut sites, &mut residue);
+                spec.method_body(None, &action.body, &mut sites, &mut residue);
             }
         }
     }
     for m in &app.models {
         for item in &m.body {
             if let ModelBodyItem::Method { method, .. } = item {
-                spec.method_body(&method.body, &mut sites, &mut residue);
+                spec.method_body(Some(m.name.0.as_str()), &method.body, &mut sites, &mut residue);
             }
         }
     }
     for lc in &app.library_classes {
         for method in &lc.methods {
-            spec.method_body(&method.body, &mut sites, &mut residue);
+            spec.method_body(None, &method.body, &mut sites, &mut residue);
         }
     }
 
@@ -138,13 +138,18 @@ pub struct WholeRoute {
     pub lowered: App,
     pub files: Vec<(String, String)>,
     pub diags: Vec<crate::diagnostic::Diagnostic>,
+    /// Recorded ingest gaps as `(file, message)` — survey mode's
+    /// `IngestError::Unsupported` entries, which carry no span and never
+    /// become a diagnostic, but whose file still belongs to a route
+    /// (`routes::plan`'s gap blocking turns them back into one).
+    pub gaps: Vec<(String, String)>,
 }
 
 /// Add whole-route replacement to `files`: the lowered tree, the bridge,
 /// and an initializer naming the actions `routes::plan` cleared. With no
 /// action cleared nothing is added, and the app stays plain Rails.
 pub fn whole_route(files: &mut Vec<(String, String)>, wr: &WholeRoute) -> Result<routes::RoutePlan, String> {
-    let plan = routes::plan(&wr.lowered, &wr.diags);
+    let plan = routes::plan(&wr.lowered, &wr.diags, &wr.gaps);
     if plan.actions.is_empty() {
         return Ok(plan);
     }

@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActiveJob payloads on the Ruby-family lanes: job arguments written in
 # ActiveJob's wire format, and read back when the drain runs the job.
 #
@@ -214,28 +215,6 @@ module ActiveJob
       "Error while trying to deserialize arguments: " + detail
     end
 
-    # One record locator per model a job parameter names, GENERATED —
-    # `project::apply_job_registry` rewrites the span between the
-    # markers from `App::job_plans`. Each takes the declared model or
-    # any of its STI subclasses (their names are literals here, never
-    # resolved from the wire), finds on the declared model, and raises
-    # DeserializationError when the row is gone:
-    #
-    #   def self.locate_room_at(args, i)
-    #     parts = gid_parts(args[i])
-    #     name = parts[1]
-    #     unless name == "Room" || name == "Rooms::Open"
-    #       raise ActiveJob::DeserializationError, deserialize_message("unexpected model " + name)
-    #     end
-    #     record = Room.find_by(id: GlobalID::Locator.cast_id(parts[2]))
-    #     raise ActiveJob::DeserializationError, missing_record_message(name, parts[2]) if record.nil?
-    #     record
-    #   end
-    #
-    # Empty for an app with no payload jobs.
-    # >>> generated: job-locators
-    # <<< generated: job-locators
-
     # `{"_aj_serialized": serializer, "value": v}` -> v, checking the
     # serializer is the one the parameter's type expects.
     def self.serialized_value(value, serializer)
@@ -299,6 +278,15 @@ module ActiveJob
     # app that changes either is a known gap). `job_id` is a fresh v4
     # UUID, as `SecureRandom.uuid` gives Rails.
     def self.build(job_class, queue_name, arguments_json)
+      build_at(job_class, queue_name, 0.0, arguments_json)
+    end
+
+    # `build` for a job scheduled at `at` (epoch seconds; 0.0 when it
+    # isn't scheduled). Rails writes `scheduled_at.utc.iso8601(9)` from
+    # an exact Time; this derives it from the Float epoch, so the digits
+    # below about a microsecond are float noise.
+    def self.build_at(job_class, queue_name, at, arguments_json)
+      scheduled = at > 0.0 ? Arguments.str(Time.at(at).utc.iso8601(9)) : "null"
       "{\"job_class\":" + Arguments.str(job_class) +
         ",\"job_id\":" + Arguments.str(SecureRandom.uuid) +
         ",\"provider_job_id\":null" +
@@ -310,7 +298,7 @@ module ActiveJob
         ",\"locale\":\"en\"" +
         ",\"timezone\":\"UTC\"" +
         ",\"enqueued_at\":" + Arguments.str(Time.now.utc.iso8601(9)) +
-        ",\"scheduled_at\":null}"
+        ",\"scheduled_at\":" + scheduled + "}"
     end
   end
 end

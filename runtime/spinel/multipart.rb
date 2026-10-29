@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # `multipart/form-data` for the ruby family: the parser, and the
 # `ActionDispatch::Http::UploadedFile` a file part becomes.
 #
@@ -84,15 +85,25 @@ module ActionDispatch
     end
 
     module Multipart
+      class FilePart
+        attr_reader :name, :file
+
+        def initialize(name, file)
+          @name = name
+          @file = file
+        end
+      end
+
       # The parsed body: text fields by full name (`message[body]`),
       # files by full name. Two typed hashes rather than one mixed one,
       # so each serving path can nest them into its own params shape.
       class Form
-        attr_reader :fields, :files
+        attr_reader :fields, :files, :file_parts
 
         def initialize
           @fields = {}
           @files = {}
+          @file_parts = []
         end
 
         def add_field(name, value)
@@ -102,6 +113,7 @@ module ActionDispatch
 
         def add_file(name, file)
           @files[name] = file
+          @file_parts.push(FilePart.new(name, file))
           nil
         end
       end

@@ -6,7 +6,7 @@ use crate::ty::Ty;
 
 #[allow(dead_code)]
 pub fn apply_attribute_alias_lowering(app: &mut App) {
-    let models: std::collections::HashSet<String> = app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
+    let models: crate::det::HashSet<String> = app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
     for model in &mut app.models {
         for item in &mut model.body {
             use crate::dialect::{Association, ModelBodyItem};
@@ -15,6 +15,14 @@ pub fn apply_attribute_alias_lowering(app: &mut App) {
                 ModelBodyItem::Scope { scope, .. } => rewrite(&mut scope.body, &models, true),
                 ModelBodyItem::Callback { callback, .. } => {
                     if let Some(cond) = &mut callback.condition {
+                        rewrite(cond, &models, true);
+                    }
+                }
+                ModelBodyItem::Validation { validation, .. } => {
+                    if let Some(cond) = &mut validation.if_cond {
+                        rewrite(cond, &models, true);
+                    }
+                    if let Some(cond) = &mut validation.unless_cond {
                         rewrite(cond, &models, true);
                     }
                 }
@@ -36,12 +44,12 @@ pub fn apply_attribute_alias_lowering(app: &mut App) {
     }
 }
 
-fn rewrite(expr: &mut Expr, models: &std::collections::HashSet<String>, in_model: bool) {
+fn rewrite(expr: &mut Expr, models: &crate::det::HashSet<String>, in_model: bool) {
     expr.node.for_each_child_mut(&mut |c| rewrite(c, models, in_model));
     rewrite_node(expr, models, in_model);
 }
 
-pub(crate) fn rewrite_node(expr: &mut Expr, models: &std::collections::HashSet<String>, in_model: bool) {
+pub(crate) fn rewrite_node(expr: &mut Expr, models: &crate::det::HashSet<String>, in_model: bool) {
     let ExprNode::Send { recv, method, args, block: None, .. } = &mut *expr.node else { return };
     let to = match (method.as_str(), args.len()) {
         ("read_attribute", 1) => "[]",

@@ -111,6 +111,7 @@ fn ingest_table_stmt(
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
                 virtual_module: None,
+                known_keyless: false,
             };
             if let Some(body) =
                 call.block().and_then(|b| b.as_block_node()).and_then(|b| b.body())
@@ -190,6 +191,8 @@ fn ingest_column_stmt(
                 generated: None,
                 generated_text_compatible: None,
                 generated_int4_compatible: None,
+                array: false,
+                array_stored: false,
             });
         }
         "foreign_key" => {
@@ -215,6 +218,8 @@ fn ingest_column_stmt(
                 generated: None,
                 generated_text_compatible: None,
                 generated_int4_compatible: None,
+                array: false,
+                array_stored: false,
             });
             table.foreign_keys.push(ForeignKey {
                 from_column: Symbol::from(name.as_str()),
@@ -291,6 +296,8 @@ fn ingest_column_stmt(
                 generated: None,
                 generated_text_compatible: None,
                 generated_int4_compatible: None,
+                array: false,
+                array_stored: false,
             });
         }
     }

@@ -103,10 +103,10 @@ end
         .map(|(path, source)| (path.into(), source.as_bytes().to_vec()))
         .collect();
     let app = ingest_app_from_tree(tree).unwrap();
-    let params_ty = Ty::Class { id: ClassId(Symbol::from("ArticleParams")), args: vec![] };
+    let params_ty = Ty::Class { id: ClassId(Symbol::from("ArticleParams")), args: vec![].into() };
     let inferred = [((ClassId(Symbol::from("ArticlesController")), Symbol::from("caption")), vec![params_ty.clone()])]
         .into_iter().collect();
-    let routed = std::collections::HashMap::new();
+    let routed = roundhouse::det::HashMap::default();
     let classes = lower_controllers_with_arel_views_assocs_and_routes(
         &app.controllers,
         Vec::new(),

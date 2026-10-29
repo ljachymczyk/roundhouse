@@ -94,6 +94,27 @@ pub(super) fn emit_form_tag_inline(args: &[Expr], block: &Expr, ctx: &ViewCtx) -
     out
 }
 
+/// `ActionView::Base.new.form_with` — the view-context entry a template
+/// `form_with` site makes before its macro-expanded markup. Placed in
+/// the expansion itself, so a `<% cache %>` hit that skips the body
+/// skips the call too. See `runtime/ruby/action_view/base.rb`.
+///
+/// Ruby family only (`ViewCtx::form_with_entry`): no strict target
+/// ships `ActionView::Base`, and none has a spy to observe the call.
+fn form_with_entry(ctx: &ViewCtx) -> Option<Expr> {
+    if !ctx.form_with_entry {
+        return None;
+    }
+    let base = Expr::new(
+        Span::synthetic(),
+        ExprNode::Const {
+            path: vec![Symbol::from("ActionView"), Symbol::from("Base")],
+        },
+    );
+    let instance = send(Some(base), "new", Vec::new(), None, false);
+    Some(send(Some(instance), "form_with", Vec::new(), None, false))
+}
+
 /// `<%= form_with url: …, method: :delete, id: … %>` with NO block.
 ///
 /// Rails renders an EMPTY `<form>` — open tag, `_method` override, CSRF
@@ -164,7 +185,8 @@ pub(super) fn emit_form_with_blockless(args: &[Expr], ctx: &ViewCtx) -> Option<V
         opts_entries: entries,
         id_prefix: String::new(),
     };
-    Some(vec![
+    let mut out: Vec<Expr> = form_with_entry(ctx).into_iter().collect();
+    out.extend([
         emit_open_form_tag(&comps, ctx, false),
         accumulator_append_call(
             view_helpers_call("method_override_input", vec![method]),
@@ -174,7 +196,8 @@ pub(super) fn emit_form_with_blockless(args: &[Expr], ctx: &ViewCtx) -> Option<V
             view_helpers_call("csrf_token_hidden_input", Vec::new()),
             ctx,
         ),
-    ])
+    ]);
+    Some(out)
 }
 
 /// Inline-expand `<%= form_with(opts) do |form| ...inner... %>` at
@@ -217,7 +240,7 @@ pub(super) fn emit_form_with_inline(
         return vec![accumulator_append_call(lit_str(String::new()), ctx)];
     };
 
-    let mut out: Vec<Expr> = Vec::new();
+    let mut out: Vec<Expr> = form_with_entry(ctx).into_iter().collect();
 
     // Bind locals before emitting the open tag so the open-tag's
     // action interp can read them. `<form_param>_record` holds the
@@ -632,8 +655,7 @@ fn route_helperize(url: Expr, route_helpers: &impl Fn() -> Expr, ctx: &ViewCtx) 
         // CRuby interpolated its inspect into the action, spinel raised
         // `no implicit conversion of User into Integer` — campfire's
         // bot edit page.
-        let route_args: Vec<Expr> =
-            args.iter().map(|a| super::helpers::rewrite_path_arg(a, ctx)).collect();
+        let route_args = super::helpers::rewrite_path_args(m, args, ctx);
         if m.ends_with("_path") {
             return send(Some(route_helpers()), m, route_args, None, true);
         }
@@ -939,15 +961,22 @@ fn classify_form_with_components(
     // record-derived pair when the routes actually name it, otherwise keep
     // the directory-derived pair (including for the empty helper set that
     // test harnesses without routes carry, where neither can be checked).
-    if let Some(name) = record_local_name(&model) {
+    //
+    // The record's CLASS when the analyzer typed it, else its local's
+    // name. Not only when the directory's pair is missing: users/show's
+    // `form_with model: @mod_note` posts to `mod_notes_path` in Rails,
+    // and the directory's `user_path` exists too.
+    // Then the analyzer's model for the view ivar (`@users` recorded as User where the binding's own type is a collection).
+    let typed_class = match model.ty.as_ref().map(crate::ty::Ty::peel_nilable) {
+        Some(crate::ty::Ty::Class { id, .. }) => Some(id.0.as_str().rsplit("::").next().unwrap_or_default().to_string()),
+        _ => None,
+    }
+    .or_else(|| record_local_name(&model).and_then(|name| ctx.ivar_models.get(&name).cloned()));
+    if let Some(name) = typed_class.clone().or_else(|| record_local_name(&model)) {
         let rec_singular = singularize(&snake_case(&name));
         let rec_plural = crate::naming::pluralize_snake(&rec_singular);
         let known = |n: &str| ctx.route_helper_names.contains(&format!("{n}_path"));
-        if rec_plural != plural_owned
-            && !known(&plural_owned)
-            && !known(&singularize(&plural_owned))
-            && (known(&rec_plural) || known(&rec_singular))
-        {
+        if rec_plural != plural_owned && (known(&rec_plural) || known(&rec_singular)) {
             plural_owned = rec_plural;
         }
     }
@@ -994,7 +1023,10 @@ fn classify_form_with_components(
     // directory-derived and Rails-divergent (it renders only for
     // moderators, off-replay) — a pre-existing gap this pass leaves
     // as-was rather than turning into a compile stop.
-    let record_name: Option<String> = record_local_name(&model);
+    // The record's class when typed (`@author` holding a User), else its local's name.
+    let record_name: Option<String> = typed_class
+        .map(|class| singularize(&snake_case(&class)))
+        .or_else(|| record_local_name(&model));
     let slug_key = record_name.as_deref().unwrap_or(singular.as_str());
     let member_arg = if ctx.slug_models.contains(slug_key) {
         send(Some(model.clone()), "to_param", Vec::new(), None, false)
@@ -1400,7 +1432,7 @@ pub(super) fn form_param_ref_name(e: &Expr) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet};
+    use crate::det::{HashMap, HashSet};
     use std::rc::Rc;
 
     fn kw(entries: Vec<(&str, Expr)>) -> Expr {
@@ -1463,6 +1495,7 @@ mod tests {
         let out = emit_form_with_blockless(&args, &ctx).expect("url-only form_with lowers");
         let text = emitted_text(&out);
         assert!(text.contains("<form action="), "{text}");
+        assert!(text.contains("<form_with>"), "{text}");
         assert!(text.contains("method_override_input"), "{text}");
         assert!(text.contains("csrf_token_hidden_input"), "{text}");
     }
@@ -1527,10 +1560,13 @@ mod tests {
             i18n: Default::default(),
             route_helper_arity: Default::default(),
             form_wrappers: Default::default(),
+            form_with_entry: true,
             stylesheets: Vec::new(),
             lexxy: false,
             lexxy_editor_adapter: false,
             partial_ivars: Default::default(),
+            formats: vec!["html".to_string()],
+            view_formats: Default::default(),
             multipart_partials: Default::default(),
             dyn_pools: Default::default(),
             partial_extras: Default::default(),

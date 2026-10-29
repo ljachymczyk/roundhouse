@@ -4,13 +4,25 @@
 //! and the app/helpers fold), and the `ActionDispatch::Flash::FlashHash`
 //! class. Extracted verbatim from `Analyzer::with_adapter`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use crate::det::HashMap;
 
 use crate::analyze::ClassInfo;
 use crate::expr::{ExprNode, Literal};
 use crate::App;
 use crate::ident::{ClassId, Symbol};
 use crate::ty::Ty;
+
+// The index also contains singleton defs and promoted module functions.
+// Only a retained instance body overrides the catalog's instance return;
+// the other spellings keep their existing concern-fold behavior.
+pub(in crate::analyze) fn has_instance_helper(app: &App, name: &Symbol, owner: &ClassId) -> bool {
+    app.library_classes.iter().any(|class| &class.name == owner && class.methods.iter().any(|method| {
+        &method.name == name && method.receiver == crate::dialect::MethodReceiver::Instance
+    })) || app.controllers.iter().any(|controller| {
+        &controller.name == owner && controller.actions().any(|action| &action.name == name)
+    })
+}
 
 pub(in crate::analyze) fn register(
     classes: &mut HashMap<ClassId, ClassInfo>,
@@ -24,7 +36,7 @@ pub(in crate::analyze) fn register(
     // once `form` is a FormBuilder, an unregistered `form.x` would be a
     // dispatch *error*, so the field surface is covered here.
     let form_builder_id = ClassId(Symbol::from("ActionView::Helpers::FormBuilder"));
-    let form_builder_ty = Ty::Class { id: form_builder_id.clone(), args: vec![] };
+    let form_builder_ty = Ty::Class { id: form_builder_id.clone(), args: vec![].into() };
     let mut form_builder = ClassInfo::default();
     for m in [
         "label", "submit", "button", "text_field", "text_area", "textarea",
@@ -167,7 +179,7 @@ pub(in crate::analyze) fn register(
     // renders; `tag("br")`, the call form, is the same String.
     action_view.instance_methods.insert(
         Symbol::from("tag"),
-        Ty::Class { id: ClassId(Symbol::from("ActionView::Helpers::TagHelper::TagBuilder")), args: vec![] },
+        Ty::Class { id: ClassId(Symbol::from("ActionView::Helpers::TagHelper::TagBuilder")), args: vec![].into() },
     );
     // Flash convenience accessors — Rails 7 scaffolds emit bare
     // `notice`/`alert` in views; both read `flash[:notice]`/`[:alert]`.
@@ -184,7 +196,7 @@ pub(in crate::analyze) fn register(
     // (instance) and controller (class-side) contexts get it.
     let flash_ty = Ty::Class {
         id: ClassId(Symbol::from("ActionDispatch::Flash::FlashHash")),
-        args: vec![],
+        args: vec![].into(),
     };
     action_view
         .instance_methods
@@ -197,7 +209,7 @@ pub(in crate::analyze) fn register(
     // builder mutations (`extract!`, `partial!`, …) nil.
     action_view.instance_methods.insert(
         Symbol::from("json"),
-        Ty::Class { id: ClassId(Symbol::from("Jbuilder")), args: vec![] },
+        Ty::Class { id: ClassId(Symbol::from("Jbuilder")), args: vec![].into() },
     );
     // Route URL helpers (view side).
     for name in route_helper_names {
@@ -224,13 +236,13 @@ pub(in crate::analyze) fn register(
     // values are whatever the site passed, so the read is gradual.
     action_view.instance_methods.insert(
         Symbol::from("local_assigns"),
-        Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Untyped) },
+        Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) },
     );
     // `params` is exposed to templates too (same strong-params
     // surface the controller context declares).
     action_view.instance_methods.insert(
         Symbol::from("params"),
-        Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Str) },
+        Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Str) },
     );
     // SimpleForm's form builder — same shape as `form_with` but the
     // yielded builder (`f.input`, `f.association`, …) is a SimpleForm
@@ -243,16 +255,16 @@ pub(in crate::analyze) fn register(
             .entry(Symbol::from(m))
             .or_insert_with(|| super::block_fn(&Ty::Untyped, Ty::Str));
     }
-    // Helper-fold: Rails mixes EVERY module under app/helpers into
-    // every view (`helpers :all` default). Declaring them as
-    // `include`s of the view context lets `fold_concern_surfaces`
-    // copy each helper's typed surface onto `ActionView::Base` at
-    // every harvest round — so a bare `material_symbol(…)` in a
-    // template resolves exactly like a concern method on a model,
-    // refining as the fixpoint types helper bodies. Hardcoded
-    // framework entries above win over a same-named app helper
-    // (own-entry-wins in the fold); acceptable, both are Str-shaped
-    // in practice.
+    // Rails mixes app helpers into every view (`helpers :all` default).
+    // Keep their includes for context, but the helper index selects each
+    // method's owner. Until harvest_returns_to_registry projects that
+    // owner's return, calls are gradual, not the framework's answer or
+    // another module's signature selected by the generic concern fold.
+    for (name, owner) in &app.helper_method_index {
+        if has_instance_helper(app, name, owner) {
+            action_view.instance_methods.insert(name.clone(), Ty::Untyped);
+        }
+    }
     let helper_modules: BTreeSet<ClassId> =
         app.helper_method_index.values().cloned().collect();
     action_view.includes.extend(helper_modules);
@@ -286,7 +298,7 @@ pub(in crate::analyze) fn register(
         let mut flash = ClassInfo::default();
         let flash_self = Ty::Class {
             id: ClassId(Symbol::from("ActionDispatch::Flash::FlashHash")),
-            args: vec![],
+            args: vec![].into(),
         };
         for (m, ty) in [
             ("[]", Ty::Str),
@@ -314,10 +326,10 @@ pub(in crate::analyze) fn register(
             ("empty?", Ty::Bool),
             ("present?", Ty::Bool),
             ("blank?", Ty::Bool),
-            ("keys", Ty::Array { elem: Box::new(Ty::Sym) }),
-            ("values", Ty::Array { elem: Box::new(Ty::Str) }),
-            ("to_h", Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Str) }),
-            ("to_hash", Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Str) }),
+            ("keys", Ty::Array { elem: std::sync::Arc::new(Ty::Sym) }),
+            ("values", Ty::Array { elem: std::sync::Arc::new(Ty::Str) }),
+            ("to_h", Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Str) }),
+            ("to_hash", Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Str) }),
         ] {
             flash.instance_methods.insert(Symbol::from(m), ty);
         }

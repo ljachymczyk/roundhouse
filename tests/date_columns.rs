@@ -44,14 +44,14 @@ fn columns_constructors_and_callers_preserve_the_date_domain() {
     assert_eq!(
         row.fields[&Symbol::from("due_on")],
         Ty::Union {
-            variants: vec![Ty::Date, Ty::Nil]
+            variants: vec![Ty::Date, Ty::Nil].into()
         }
     );
     for name in ["observed_at", "opens_at"] {
         assert_eq!(
             row.fields[&Symbol::from(name)],
             Ty::Union {
-                variants: vec![Ty::Time, Ty::Nil]
+                variants: vec![Ty::Time, Ty::Nil].into()
             }
         );
     }
@@ -75,7 +75,7 @@ fn columns_constructors_and_callers_preserve_the_date_domain() {
     assert_eq!(
         exprs.last().unwrap().ty,
         Some(Ty::Union {
-            variants: vec![Ty::Date, Ty::Nil]
+            variants: vec![Ty::Date, Ty::Nil].into()
         })
     );
     assert_eq!(roundhouse::ide::render_ty(&Ty::Date), "Date");
@@ -85,7 +85,7 @@ fn columns_constructors_and_callers_preserve_the_date_domain() {
     let Ty::Fn { params, ret, .. } = sig else {
         panic!("expected function: {sig:?}")
     };
-    assert_eq!(params[0].ty, Ty::Date);
+    assert_eq!(params[0].ty, Ty::Date.into());
     assert_eq!(**ret, Ty::Date);
 }
 
@@ -165,12 +165,7 @@ fn date_target_boundary_rejects_before_reading_or_emitting_files() {
             boot.1.contains("require_relative \"runtime/active_support_date_parsing\""),
             "CRuby date apps share date_* helpers with Spinel"
         );
-        assert!(
-            !boot.1.contains("require_relative \"runtime/date\""),
-            "CRuby must keep stdlib Date — not Spinel's polyfill:\n{}",
-            boot.1
-        );
-        assert!(
+            assert!(
             !boot.1.contains("active_record_date_serialization"),
             "CRuby overlay already wraps date JSON — do not double-alias"
         );
@@ -185,18 +180,9 @@ fn spinel_emits_date_runtime_and_keeps_date_as_a_date() {
         scope(|| target_files(&app, std::path::Path::new("not-a-fixture"), BuildTarget::Spinel));
     assert!(result.is_ok(), "{diagnostics:?}");
     let files = result.unwrap();
-    let runtime = files.iter().find(|(path, _)| path == "runtime/date.rb").unwrap();
-    assert!(runtime.1.contains("class Date"));
-    assert!(
-        files.iter().any(|(path, _)| path == "runtime/date.rbs"),
-        "signature files: {:?}",
-        files.iter().map(|(path, _)| path).filter(|path| path.ends_with(".rbs")).collect::<Vec<_>>()
-    );
+    assert!(!files.iter().any(|(path, _)| path == "runtime/date.rb"), "Spinel's date package, not a program-defined Date");
     let boot = files.iter().find(|(path, _)| path == "boot.rb").unwrap();
-    assert!(
-        boot.1.contains("require_relative \"runtime/date\""),
-        "date apps must load the program-defined Date"
-    );
+    assert!(boot.1.lines().any(|l| l == "require \"date\""), "date apps must load Spinel's date package:\n{}", boot.1);
     assert!(
         boot.1.contains("require_relative \"runtime/active_support_date_parsing\""),
         "date apps must load Date parse/format intrinsics"
@@ -228,8 +214,6 @@ fn spinel_emits_date_runtime_and_keeps_date_as_a_date() {
 #[test]
 fn spinel_omits_date_runtime_when_the_app_has_no_dates() {
     // Campfire-shaped: no t.date columns and no Date constructors.
-    // Loading Date#strftime into every Spinel tree breaks poly
-    // Time|Date receivers (matz/spinel#7334) — omit until needed.
     let mut app = app_with(
         r#"ActiveRecord::Schema.define do
   create_table "widgets" do |t|
@@ -253,10 +237,6 @@ end
     );
     let files = result.unwrap();
     assert!(
-        !files.iter().any(|(path, _)| path == "runtime/date.rb"),
-        "date.rb must not ship when unused"
-    );
-    assert!(
         !files.iter().any(|(path, _)| path == "runtime/active_support_date_parsing.rb"),
         "date parse/format must not ship when unused"
     );
@@ -270,7 +250,7 @@ end
     );
     let boot = files.iter().find(|(path, _)| path == "boot.rb").unwrap();
     assert!(
-        !boot.1.contains("runtime/date\""),
+        !boot.1.lines().any(|l| l == "require \"date\""),
         "boot must not require Date when unused:\n{}",
         boot.1
     );
@@ -355,14 +335,14 @@ fn date_signatures_normalize_builtins_without_erasing_nominal_namespaces() {
             "nominal",
             Ty::Class {
                 id: ClassId(Symbol::from("Scheduling::Date")),
-                args: vec![],
+                args: vec![].into(),
             },
         ),
     ] {
         let Ty::Fn { params, ret, .. } = signature(name) else {
             panic!("not a function")
         };
-        assert_eq!(params[0].ty, expected);
+        assert_eq!(params[0].ty, expected.clone().into());
         assert_eq!(*ret, expected);
     }
     let Ty::Fn { params, ret, .. } = signature("nested") else {
@@ -371,20 +351,20 @@ fn date_signatures_normalize_builtins_without_erasing_nominal_namespaces() {
     assert_eq!(
         params[0].ty,
         Ty::Array {
-            elem: Box::new(Ty::Union {
-                variants: vec![Ty::Date, Ty::Nil]
+            elem: std::sync::Arc::new(Ty::Union {
+                variants: vec![Ty::Date, Ty::Nil].into()
             })
-        }
+        }.into()
     );
     assert_eq!(
         *ret,
         Ty::Hash {
-            key: Box::new(Ty::Str),
-            value: Box::new(Ty::Date)
+            key: std::sync::Arc::new(Ty::Str),
+            value: std::sync::Arc::new(Ty::Date)
         }
     );
     let date = Ty::Union {
-        variants: vec![Ty::Date, Ty::Nil],
+        variants: vec![Ty::Date, Ty::Nil].into(),
     };
     let text = roundhouse::rbs::print_ty(&date);
     let reparsed = roundhouse::rbs::parse_app_signatures(&format!(
@@ -408,14 +388,14 @@ fn date_signatures_normalize_builtins_without_erasing_nominal_namespaces() {
             "nominal",
             Ty::Class {
                 id: ClassId(Symbol::from("Scheduling::Date")),
-                args: vec![],
+                args: vec![].into(),
             },
         ),
     ] {
         let Ty::Fn { params, ret, .. } = &sigs[&Symbol::from(name)] else {
             panic!("not a function")
         };
-        assert_eq!(params[0].ty, expected);
+        assert_eq!(params[0].ty, expected.clone().into());
         assert_eq!(**ret, expected);
     }
 }

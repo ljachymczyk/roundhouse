@@ -5,11 +5,12 @@
 //! `has_one_attached :favicon if defined?(ActiveStorage)`,
 //! `acts_as_tenant :account if defined? ActsAsTenant`,
 //! `return unless defined?(Rails) && Rails.respond_to?(:logger)`.
-//! The strict targets have no runtime `defined?`, but almost every such
-//! guard is decidable from what ingest already holds. The reference
-//! program for a target is the EMITTED app, so "defined" means "the
-//! emitted program has that constant": a class the tree ingested, a
-//! framework the application loads, a modeled gem the Gemfile asks for.
+//! Most strict targets have no runtime `defined?` (Spinel has one; see
+//! below), but almost every such guard is decidable from what ingest
+//! already holds. The reference program for a target is the EMITTED
+//! app, so "defined" means "the emitted program has that constant": a
+//! class the tree ingested, a framework the application loads, a
+//! modeled gem the Gemfile asks for.
 //!
 //! The rule, per `defined?(A::B::C)` on a plain (possibly `::`-rooted)
 //! constant path. Anything else — a method, ivar, `yield`, `super`,
@@ -46,15 +47,22 @@
 //! statement, a constant or class-ivar initializer, a class_attribute
 //! default) can be nil even though `Later` exists. Such references never
 //! fold TRUE on an in-tree name (they stay `defined?`, hence refused on
-//! spinel). Method bodies, lambdas, templates and seeds run after load
-//! and do fold. Framework and gem constants are loaded before any app
-//! file, so they fold in either position; FALSE needs the name absent
-//! from the whole program and is order-independent.
+//! the strict targets, spinel included). Method bodies, lambdas,
+//! templates and seeds run after load and do fold. Framework and gem
+//! constants are loaded before any app file, so they fold in either
+//! position; FALSE needs the name absent from the whole program and is
+//! order-independent.
 //!
-//! Everything else is left as `defined?`, so the strict target still
-//! refuses it. A wrong fold either way silently changes app behaviour,
-//! while an unfolded guard only stays a diagnostic, so every ambiguous
-//! class falls toward leaving the error:
+//! Everything else is left as `defined?`, so a strict target still
+//! refuses it, except Spinel after load: Spinel answers `defined?` of a
+//! constant path from the whole compiled program, which is what CRuby
+//! answers for that program once it has loaded, so an unfolded guard
+//! in a method body, lambda, template or seed is left to it
+//! (`load_time_roots`, `project::report_native_ruby_syntax`). A wrong
+//! fold either way silently changes app behaviour, while an unfolded
+//! guard only stays a diagnostic (or, on Spinel after load, is answered
+//! by the program that runs), so every ambiguous class falls toward
+//! leaving the `defined?`:
 //!  * a nested path whose prefix resolves but whose tail does not is
 //!    NOT folded (`SourceMonitor::Nope`): a gem or reopening may add it;
 //!  * a gem present in the lock but outside the catalog is not folded
@@ -70,7 +78,7 @@
 //! too; the literal is exactly what Ruby's `defined?` returns for a
 //! constant that exists/doesn't, so behaviour is unchanged.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::app::App;
 use crate::expr::{BoolOpKind, Expr, ExprNode, Literal};
@@ -203,7 +211,7 @@ struct Facts {
 
 impl Facts {
     fn of(app: &App) -> Facts {
-        let mut tree: HashSet<String> = HashSet::new();
+        let mut tree: HashSet<String> = HashSet::default();
         for m in &app.models {
             tree.insert(m.name.0.as_str().to_string());
         }
@@ -218,7 +226,7 @@ impl Facts {
             tree.insert(name);
         }
         let mut tree_and_prefixes = tree.clone();
-        let mut segments = HashSet::new();
+        let mut segments = HashSet::default();
         for name in &tree {
             let mut acc = String::new();
             for seg in name.split("::") {
@@ -371,6 +379,88 @@ impl Facts {
     }
 }
 
+/// The expression roots that run while the tree loads, by address (the
+/// `&Expr` the app body walkers hand out).
+struct LoadTimeRoots {
+    /// Class-body statements (`has_one_attached :x if defined?(Y)`).
+    /// They were classified at ingest, before the fold; a guard that
+    /// folds to its bare statement is not re-classified (a controller
+    /// `before_action` would silently never install). See
+    /// `fold_class_statement`.
+    class_stmts: HashSet<usize>,
+    /// Load-time expressions that are not statements: constant and
+    /// class-ivar initializers, class_attribute defaults.
+    load_time: HashSet<usize>,
+}
+
+impl LoadTimeRoots {
+    fn of(app: &App) -> LoadTimeRoots {
+        let mut class_stmts: HashSet<usize> = HashSet::default();
+        let mut load_time: HashSet<usize> = HashSet::default();
+        for m in &app.models {
+            for item in &m.body {
+                if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item {
+                    class_stmts.insert(addr(expr));
+                }
+            }
+            for v in m.class_attr_defaults.values() {
+                load_time.insert(addr(v));
+            }
+        }
+        for c in &app.controllers {
+            for item in &c.body {
+                if let crate::dialect::ControllerBodyItem::Unknown { expr, .. } = item {
+                    class_stmts.insert(addr(expr));
+                }
+            }
+        }
+        for lc in app.library_classes.iter().chain(app.rails_application.iter()) {
+            for call in &lc.unknown_calls {
+                class_stmts.insert(addr(call));
+            }
+            for (_, v) in &lc.constants {
+                load_time.insert(addr(v));
+            }
+            for v in &lc.class_ivar_initializers {
+                load_time.insert(addr(v));
+            }
+        }
+        LoadTimeRoots { class_stmts, load_time }
+    }
+}
+
+fn addr(e: &Expr) -> usize {
+    e as *const Expr as usize
+}
+
+/// Every expression root that runs while the program loads: the ones
+/// the fold treats as load-time, plus a test module's constants and its
+/// inner classes' class bodies. A `defined?(Const)` under any other root
+/// (method and action bodies, lambdas, templates, seeds) runs once the
+/// whole program has loaded, so its answer no longer depends on load
+/// order; `project::report_native_ruby_syntax` leaves those to Spinel.
+pub(crate) fn load_time_roots(app: &App) -> HashSet<usize> {
+    let LoadTimeRoots { mut class_stmts, load_time } = LoadTimeRoots::of(app);
+    class_stmts.extend(load_time);
+    for tm in &app.test_modules {
+        for (_, v) in &tm.constants {
+            class_stmts.insert(addr(v));
+        }
+        for class in &tm.inner_classes {
+            for (_, v) in &class.constants {
+                class_stmts.insert(addr(v));
+            }
+            for call in &class.unknown_calls {
+                class_stmts.insert(addr(call));
+            }
+            for v in &class.class_ivar_initializers {
+                class_stmts.insert(addr(v));
+            }
+        }
+    }
+    class_stmts
+}
+
 pub fn apply_defined_const_fold(app: &mut App) {
     // Nothing to fold in an app that never asks.
     let mut asks = false;
@@ -380,56 +470,18 @@ pub fn apply_defined_const_fold(app: &mut App) {
         return;
     }
     let facts = Facts::of(app);
-    // Class-body statements (`has_one_attached :x if defined?(Y)`) were
-    // classified at ingest, before this pass; a guard that folds to its
-    // bare statement is not re-classified (a controller `before_action`
-    // would silently never install). See `fold_class_statement`.
-    let mut class_stmts: HashSet<usize> = HashSet::new();
-    let addr = |e: &Expr| e as *const Expr as usize;
-    for m in &app.models {
-        for item in &m.body {
-            if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item {
-                class_stmts.insert(addr(expr));
-            }
-        }
-    }
-    for c in &app.controllers {
-        for item in &c.body {
-            if let crate::dialect::ControllerBodyItem::Unknown { expr, .. } = item {
-                class_stmts.insert(addr(expr));
-            }
-        }
-    }
-    // Load-time expressions that are not statements: constant and
-    // class-ivar initializers, class_attribute defaults.
-    let mut load_time: HashSet<usize> = HashSet::new();
-    for lc in app.library_classes.iter().chain(app.rails_application.iter()) {
-        for call in &lc.unknown_calls {
-            class_stmts.insert(addr(call));
-        }
-        for (_, v) in &lc.constants {
-            load_time.insert(addr(v));
-        }
-        for v in &lc.class_ivar_initializers {
-            load_time.insert(addr(v));
-        }
-    }
-    for m in &app.models {
-        for v in m.class_attr_defaults.values() {
-            load_time.insert(addr(v));
-        }
-    }
+    let LoadTimeRoots { class_stmts, load_time } = LoadTimeRoots::of(app);
     super::for_each_owned_hook_body(app, &mut |owner, body| {
-        if class_stmts.contains(&(&*body as *const Expr as usize)) {
+        if class_stmts.contains(&addr(body)) {
             fold_class_statement(body, owner, &facts);
         } else {
-            walk(body, owner, &facts, load_time.contains(&(&*body as *const Expr as usize)));
+            walk(body, owner, &facts, load_time.contains(&addr(body)), false);
         }
     });
     // Templates belong to no class: an unrooted name is looked up from
     // the top level.
     for view in &mut app.views {
-        walk(&mut view.body, None, &facts, false);
+        walk(&mut view.body, None, &facts, false, false);
     }
 }
 
@@ -448,11 +500,11 @@ fn fold_class_statement(e: &mut Expr, owner: Option<&ClassId>, facts: &Facts) {
     // Class-body statements run while the tree loads.
     let guarded = matches!(&*e.node, ExprNode::If { .. } | ExprNode::BoolOp { .. });
     if !guarded {
-        walk(e, owner, facts, true);
+        walk(e, owner, facts, true, false);
         return;
     }
     let mut folded = e.clone();
-    if !walk(&mut folded, owner, facts, true) {
+    if !walk(&mut folded, owner, facts, true, false) {
         return;
     }
     let keep = match &*folded.node {
@@ -490,10 +542,22 @@ fn lit(like: &Expr, value: Literal, ty: Ty) -> Expr {
     out
 }
 
-/// Fold `e` in place; true when anything under it changed.
-fn walk(e: &mut Expr, owner: Option<&ClassId>, facts: &Facts, lt: bool) -> bool {
+/// Fold `e` in place; true when anything under it changed. `cond`:
+/// only `e`'s truthiness is read (an `if`/`while` condition, the left
+/// of `&&`/`||`, the operand of `!`, or the right of a `&&`/`||` that
+/// is itself one).
+fn walk(e: &mut Expr, owner: Option<&ClassId>, facts: &Facts, lt: bool, cond: bool) -> bool {
+    let child_cond: &[bool] = match &*e.node {
+        ExprNode::If { .. } | ExprNode::While { .. } => &[true],
+        ExprNode::BoolOp { .. } => &[true, cond],
+        ExprNode::Send { recv: Some(_), method, args, .. } if method.as_str() == "!" && args.is_empty() => &[true],
+        _ => &[],
+    };
     let mut changed: Vec<bool> = Vec::new();
-    e.node.for_each_child_mut(&mut |c| changed.push(walk(c, owner, facts, lt)));
+    e.node.for_each_child_mut(&mut |c| {
+        let cond = child_cond.get(changed.len()).copied().unwrap_or(false);
+        changed.push(walk(c, owner, facts, lt, cond))
+    });
     let any = changed.iter().any(|c| *c);
 
     if let ExprNode::Defined { operand } = &*e.node {
@@ -501,6 +565,14 @@ fn walk(e: &mut Expr, owner: Option<&ClassId>, facts: &Facts, lt: bool) -> bool 
             let path: Vec<String> = path.iter().map(|s| s.as_str().to_string()).collect();
             let answer = facts.decide(owner, &path, lt);
             match answer {
+                // Where only truthiness is read, `true`: a String
+                // literal there is Ruby's "string literal in condition"
+                // warning, which a warnings-as-errors boot raises.
+                // Elsewhere the value is `defined?`'s own.
+                Some(true) if cond => {
+                    *e = lit(e, Literal::Bool { value: true }, Ty::Bool);
+                    return true;
+                }
                 Some(true) => {
                     *e = lit(e, Literal::Str { value: "constant".into() }, Ty::Str);
                     return true;

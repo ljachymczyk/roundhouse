@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Active Storage — what a `has_one_attached` reader hands back, the
 # blob it points at, and the identity "variant" of that blob.
 #
@@ -78,6 +79,19 @@ module ActiveStorage
 
   def self.variable_content_type?(content_type)
     variable_content_types.include?(content_type)
+  end
+
+  # Rails' `ActiveStorage.paths` — executable locations for previewers /
+  # analyzers (`:ffmpeg`, `:ffprobe`, `:mutool`). Default `{}` means
+  # PATH lookup. Tests and config assign `paths[:ffmpeg] = "/bin/…"`.
+  def self.paths
+    @paths = {} if @paths.nil?
+    @paths
+  end
+
+  def self.paths=(value)
+    @paths = value
+    value
   end
 
   # Rails' `config.active_storage.video_preview_arguments` — the ffmpeg
@@ -262,12 +276,55 @@ module ActiveStorage
   class Error < StandardError
   end
 
+  # The remaining exceptions in Rails 8.1's active_storage/errors.rb.
+  class InvariableError < Error
+  end
+
+  class UnpreviewableError < Error
+  end
+
+  class UnrepresentableError < Error
+  end
+
+  class IntegrityError < Error
+  end
+
+  class FileNotFoundError < Error
+  end
+
+  class InvalidKeyError < Error
+  end
+
   # Rails' `ActiveStorage::PreviewError` — raised when a previewer cannot
   # draw a poster (ffmpeg failed, timed out, …). Apps and railties rescue
   # or raise it; campfire's `TimeLimitedVideoPreviewer` raises it when
   # the wall-clock limit trips. Parent is `Error`, not bare StandardError,
   # matching Rails.
   class PreviewError < Error
+  end
+
+  # Nested exceptions keep their Rails owners as well as their parents.
+  class Service
+    class GCSService < Service
+      class MetadataServerError < ActiveStorage::Error
+      end
+
+      class MetadataServerNotFoundError < ActiveStorage::Error
+      end
+    end
+  end
+
+  module Transformers
+    class Transformer
+    end
+
+    class ImageProcessingTransformer < Transformer
+      class UnsupportedImageProcessingMethod < StandardError
+      end
+
+      class UnsupportedImageProcessingArgument < StandardError
+      end
+    end
   end
 
   # The video previewer's swap point. Drawing is the class-side
@@ -293,7 +350,14 @@ module ActiveStorage
     # (and `config.active_storage.previewers` identity checks against
     # that constant) resolve. Poster drawing on this runtime goes
     # through `Previewer.poster`, not the Rails instance `capture` path.
+    #
+    # Override `preview_timeout` to cap the class-side poster (seconds),
+    # or define `TIME_LIMIT` on the subclass — the spinel poster reads
+    # either (campfire's TimeLimitedVideoPreviewer + suite stub_const).
     class VideoPreviewer < Previewer
+      def self.preview_timeout
+        nil
+      end
     end
   end
 
@@ -312,6 +376,9 @@ module ActiveStorage
   # exactly where `url_for(preview)` points in Rails; serving it draws
   # and transforms on demand, so building the URL does not.
   class Preview
+    class UnprocessedError < StandardError
+    end
+
     def initialize(blob, variation)
       @blob = blob
       @variation = variation
@@ -550,19 +617,21 @@ module ActiveStorage
     end
 
     def to_s
-      @filename
+      # Fresh characters: the stored name may still be a handle another
+      # name appends to; readers only answer text.
+      @filename + ""
     end
 
     # `.jpg` — the delimiter and the extension, "" when there is none.
     def extension_with_delimiter
       i = @filename.rindex(".")
-      i.nil? || i == 0 ? "" : @filename[i..]
+      i.nil? || i == 0 ? +"" : @filename[i..] + ""
     end
 
     # `jpg` — the extension without its delimiter, "" when there is none.
     def extension_without_delimiter
       e = extension_with_delimiter
-      e.empty? ? "" : e[1..]
+      e.empty? ? +"" : e[1..] + ""
     end
 
     def extension
@@ -572,7 +641,7 @@ module ActiveStorage
     # `racecar` for `racecar.jpg`; the whole name when there is no extension.
     def base
       e = extension_with_delimiter
-      e.empty? ? @filename : @filename[0, @filename.length - e.length]
+      e.empty? ? @filename + "" : @filename[0, @filename.length - e.length].to_s + ""
     end
 
     # Rails strips the characters no filesystem or URL wants.
@@ -581,7 +650,7 @@ module ActiveStorage
     end
 
     def as_json
-      @filename
+      @filename + ""
     end
   end
 
@@ -837,7 +906,37 @@ module ActiveStorage
     # The blob's own route: `rails_blob_path(blob)`. A `disposition` of
     # "attachment" rides as the query Rails puts it in.
     def redirect_url(disposition)
-      base = "/rails/active_storage/blobs/redirect/" + signed_id + "/" +
+      service_route("redirect", disposition)
+    end
+
+    # `rails_storage_proxy_path(blob)`: the engine's other blob route,
+    # whose controller answers with the bytes instead of a redirect.
+    def proxy_url(disposition)
+      service_route("proxy", disposition)
+    end
+
+    # Rails' `Blob::Servable`, with activestorage 8.1.4's default
+    # lists: an uploaded type a browser would RUN (HTML, SVG, XML, ...)
+    # is served as `application/octet-stream`, and any type outside the
+    # inline list is an attachment whatever the URL asks. The content
+    # type is the uploader's word, so serving it inline as declared lets
+    # an upload script the app's origin.
+    def content_type_for_serving
+      ActiveStorage.content_types_to_serve_as_binary.include?(@content_type) ? "application/octet-stream" : @content_type
+    end
+
+    # "attachment" when Rails forces it, "" when the caller's
+    # disposition stands.
+    def forced_disposition_for_serving
+      if ActiveStorage.content_types_to_serve_as_binary.include?(@content_type) || !ActiveStorage.content_types_allowed_inline.include?(@content_type)
+        "attachment"
+      else
+        ""
+      end
+    end
+
+    def service_route(kind, disposition)
+      base = "/rails/active_storage/blobs/" + kind + "/" + signed_id + "/" +
              ActiveStorage.url_filename(@filename)
       disposition == "" ? base : base + "?disposition=" + disposition
     end
@@ -888,19 +987,35 @@ module ActiveStorage
 
     # `[key, disposition]`, or an empty key when the token is bad or
     # stale.
+    #
+    # Built by push onto an empty Array so Spinel keeps `Array[String]`
+    # (`sp_StrArray *`). A four- or two-element literal whose slots are
+    # `parts[i].to_s` widens to a poly array and fails the C compile
+    # against the RBS return type.
     def self.decode(token)
       json = ActionController::MessageVerifier.verified_data_json(
         Rails.application.secret_key_base, "ActiveStorage", token, "disk_key", false
       )
-      return ["", ""] if json == ""
-      parts = ActionController::MessageVerifier.json_value(json).split("|")
-      return ["", ""] if parts.length != 2
-      [parts[0].to_s, parts[1].to_s]
+      out = []
+      if json != ""
+        parts = ActionController::MessageVerifier.json_value(json).split("|")
+        if parts.length == 2
+          out << parts[0].to_s
+          out << parts[1].to_s
+          return out
+        end
+      end
+      out << +""
+      out << +""
+      out
     end
 
+    # Rails' `Blob#url` signs `forced_disposition_for_serving ||
+    # disposition`, so a forced attachment holds on the disk route too.
     def self.disk_url(blob, disposition)
+      forced = blob.forced_disposition_for_serving
       ActiveStorage::Current.base_url + "/rails/active_storage/disk/" +
-        encode(blob.key, disposition) + "/" + ActiveStorage.url_filename(blob.filename.to_s)
+        encode(blob.key, forced == "" ? disposition : forced) + "/" + ActiveStorage.url_filename(blob.filename.to_s)
     end
 
     # The token a direct upload's PUT carries (Rails' `DiskService#
@@ -920,15 +1035,27 @@ module ActiveStorage
     end
 
     # `[key, content_type, content_length, checksum]`, or an empty key
-    # when the token is bad or stale.
+    # when the token is bad or stale. Same push shape as `decode`.
     def self.decode_upload(token)
       json = ActionController::MessageVerifier.verified_data_json(
         Rails.application.secret_key_base, "ActiveStorage", token, "blob_token", false
       )
-      return ["", "", "", ""] if json == ""
-      parts = ActionController::MessageVerifier.json_value(json).split("|")
-      return ["", "", "", ""] if parts.length != 4
-      [parts[0].to_s, parts[1].to_s, parts[2].to_s, parts[3].to_s]
+      out = []
+      if json != ""
+        parts = ActionController::MessageVerifier.json_value(json).split("|")
+        if parts.length == 4
+          out << parts[0].to_s
+          out << parts[1].to_s
+          out << parts[2].to_s
+          out << parts[3].to_s
+          return out
+        end
+      end
+      out << +""
+      out << +""
+      out << +""
+      out << +""
+      out
     end
 
     def self.upload_url(blob, checksum)
@@ -977,6 +1104,21 @@ module ActiveStorage
   # the last path segment (`*filename`, cosmetic — the key is in the
   # signed id). URI-component encoded so a name with a space or a
   # slash cannot break the path.
+  # activestorage 8.1.4's `content_types_to_serve_as_binary` and
+  # `content_types_allowed_inline` defaults (engine.rb), read by
+  # `Blob#content_type_for_serving` / `#forced_disposition_for_serving`.
+  def self.content_types_to_serve_as_binary
+    ["text/html", "image/svg+xml", "application/postscript",
+     "application/x-shockwave-flash", "text/xml", "application/xml",
+     "application/xhtml+xml", "application/mathml+xml", "text/cache-manifest"]
+  end
+
+  def self.content_types_allowed_inline
+    ["image/webp", "image/avif", "image/png", "image/gif", "image/jpeg",
+     "image/tiff", "image/bmp", "image/vnd.adobe.photoshop",
+     "image/vnd.microsoft.icon", "application/pdf"]
+  end
+
   def self.url_filename(filename)
     ActionView::ViewHelpers.url_encode_component(filename)
   end
@@ -1231,6 +1373,13 @@ module ActiveStorage
     def content_type
       b = blob
       b.nil? ? nil : b.content_type
+    end
+
+    # The blob's bytes, or nil when nothing is attached — Rails'
+    # `Attached::One` delegates to its attachment with `allow_nil: true`.
+    def download
+      b = blob
+      b.nil? ? nil : b.download
     end
 
     def key
@@ -1538,6 +1687,29 @@ module ActiveStorage
       rows
     end
 
+    # More of the same delegation: a jbuilder `json.pictures(record
+    # .pictures) do |picture| … end` maps the proxy, and `size` /
+    # `empty?` are the reads a view guards it with.
+    def map
+      out = []
+      rows = attachments
+      i = 0
+      n = rows.length
+      while i < n
+        out.push(yield rows[i])
+        i += 1
+      end
+      out
+    end
+
+    def size
+      attachments.length
+    end
+
+    def empty?
+      attachments.length == 0
+    end
+
     # `self.embeds = blobs` for blob ids, in order: Rails' replace on
     # assign to a `has_many_attached`. A row whose blob is not listed
     # is detached; a listed blob not yet attached is attached once; an
@@ -1655,6 +1827,7 @@ end
 # controllers), which is why the URL shapes here are Rails' own:
 #
 #   /rails/active_storage/blobs/redirect/:signed_id/*filename
+#   /rails/active_storage/blobs/proxy/:signed_id/*filename
 #   /rails/active_storage/representations/redirect/:signed_blob_id/:variation_key/*filename
 #   /rails/active_storage/disk/:encoded_key/*filename
 #   /rails/active_storage/direct_uploads              (POST)
@@ -1681,6 +1854,33 @@ module RouteHelpers
 
   def self.rails_blob_url(attachment, disposition: nil, only_path: nil)
     rails_blob_path(attachment, disposition: disposition, only_path: only_path)
+  end
+
+  # The engine's two `direct` routes over a blob. `rails_storage_redirect`
+  # is the route `rails_blob` resolves to under Rails' default
+  # `resolve_model_to_route`; `rails_storage_proxy` names the proxy
+  # route, which serves the bytes through the app. Rails' blocks take
+  # whatever answers `signed_id`: the Blob itself or its attachment.
+  def self.rails_storage_proxy_path(model, disposition: nil, only_path: nil)
+    b = storage_blob(model)
+    b.nil? ? "" : b.proxy_url(disposition.to_s)
+  end
+
+  def self.rails_storage_proxy_url(model, disposition: nil, only_path: nil)
+    rails_storage_proxy_path(model, disposition: disposition, only_path: only_path)
+  end
+
+  def self.rails_storage_redirect_path(model, disposition: nil, only_path: nil)
+    b = storage_blob(model)
+    b.nil? ? "" : b.redirect_url(disposition.to_s)
+  end
+
+  def self.rails_storage_redirect_url(model, disposition: nil, only_path: nil)
+    rails_storage_redirect_path(model, disposition: disposition, only_path: only_path)
+  end
+
+  def self.storage_blob(model)
+    model.is_a?(ActiveStorage::Blob) ? model : model.blob
   end
 
   def self.rails_representation_path(variant, only_path: nil)

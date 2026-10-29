@@ -2,7 +2,7 @@
 //! retains candidate declarations; only a concrete model inclusion
 //! commits to their ivar contract or reports a contextual refusal.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::diagnostic::DiagnosticKind;
 use crate::dialect::{MethodReceiver, ModelBodyItem};
@@ -14,6 +14,7 @@ use crate::App;
 use super::survey::unwrap_or_record;
 use super::{IngestError, IngestResult};
 
+use crate::ingest::prism_api::PrismLocation;
 /// Retain recognized attr_* declarations, including conditional ones,
 /// so refusal is attributed to each includer rather than silently dropped.
 pub(super) fn is_candidate(item: &ModelBodyItem) -> bool {
@@ -30,8 +31,10 @@ pub(super) fn is_candidate(item: &ModelBodyItem) -> bool {
     matches!(item, ModelBodyItem::Unknown { expr, .. } if accessor(expr))
 }
 
-/// Computed/splat names retain concern lexical scope, and one-sided
-/// accessors need a separate analyzer fix. Neither is admitted here.
+/// Computed/splat names retain concern lexical scope and are not
+/// admitted here. A one-sided `attr_reader` / `attr_writer` is: the model
+/// lowering, the analyzer and the audit each take its half alone, as for
+/// a model's own declaration.
 pub(super) fn is_supported(item: &ModelBodyItem) -> bool {
     let ModelBodyItem::Unknown { expr, .. } = item else {
         return false;
@@ -46,7 +49,7 @@ pub(super) fn is_supported(item: &ModelBodyItem) -> bool {
     else {
         return false;
     };
-    method.as_str() == "attr_accessor"
+    matches!(method.as_str(), "attr_accessor" | "attr_reader" | "attr_writer")
         && !args.is_empty()
         && args.iter().all(|arg| {
             matches!(
@@ -64,7 +67,7 @@ pub(super) fn decline(item: &mut ModelBodyItem, detail: &str) {
     let ModelBodyItem::Unknown { expr, .. } = item else {
         unreachable!()
     };
-    expr.diagnostic.get_or_insert(DiagnosticKind::Unsupported {
+    expr.diagnostic_mut().get_or_insert(DiagnosticKind::Unsupported {
         target: None,
         construct: Symbol::from("concern attr_accessor"),
         detail: detail.into(),
@@ -125,7 +128,7 @@ fn unconsumed_included_hook(model: &crate::dialect::Model, app: &App) -> Option<
     }
 
     let mut pending = crate::analyze::model_includes(model);
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     while let Some(id) = pending.pop() {
         if !seen.insert(id.clone()) {
             continue;
@@ -178,7 +181,7 @@ fn validate_activation(
     }
     let resolver = app.const_resolver.for_sources(&app.sources);
     let mut includes = BTreeMap::<crate::ClassId, Vec<crate::ClassId>>::new();
-    let mut modules = HashSet::new();
+    let mut modules = HashSet::default();
     let retained: HashSet<_> = app.library_classes.iter().map(|c| &c.name)
         .chain(app.models.iter().map(|m| &m.name))
         .chain(app.controllers.iter().map(|c| &c.name))
@@ -191,7 +194,7 @@ fn validate_activation(
         })))
         .collect();
     for (index, source) in app.sources.iter().enumerate().filter(|(_, s)| s.path.ends_with(".rb")) {
-        let parsed = ruby_prism::parse(source.text.as_bytes());
+        let parsed = super::prism::parse_silent(source.text.as_bytes());
         let root = parsed.node();
         let bodies = find_all_classes_with_scope(&root).into_iter()
             .filter_map(|(scope, class)| Some((scope, class_name_path(&class)?, class.body()?, false)))
@@ -265,8 +268,8 @@ fn validate_activation(
             }
         }
         let mut pending = direct.clone();
-        let mut seen = HashSet::new();
-        let mut reported = HashSet::new();
+        let mut seen = HashSet::default();
+        let mut reported = HashSet::default();
         while let Some(id) = pending.pop() {
             if !seen.insert(id.clone()) {
                 continue;
@@ -338,13 +341,13 @@ pub(super) fn validate(
     // a large app a second complete analysis. Only a name that passes every
     // syntactic check reads it, so a dry pass finds those models and the
     // probe covers just them (or does not run at all).
-    let mut probed = HashSet::new();
+    let mut probed = HashSet::default();
     let _ = refusals(app, &spans, &mut |model, _, _| {
         probed.insert(model.clone());
         false
     });
     let surfaces = if probed.is_empty() {
-        HashMap::new()
+        HashMap::default()
     } else {
         crate::timings::phase("concern-accessor-surface", || {
             crate::lower::model_to_library::accessor_surface::occupied_surfaces(app, &probed)
@@ -357,7 +360,7 @@ pub(super) fn validate(
     });
     let mut rejections = Vec::new();
     for (model_index, refused) in refused {
-        let mut rejected = HashSet::new();
+        let mut rejected = HashSet::default();
         for (span, message) in refused {
             let file = &app.sources[span.file.0 as usize - 1].path;
             unwrap_or_record::<()>(Err(IngestError::Unsupported {
@@ -390,7 +393,7 @@ fn refusals(
             continue;
         };
         let hook = unconsumed_included_hook(model, app);
-        let mut nonpublic_methods = HashSet::new();
+        let mut nonpublic_methods = HashSet::default();
         for item in &model.body {
             match item {
                 ModelBodyItem::Unknown { expr, .. } => {
@@ -414,6 +417,8 @@ fn refusals(
                             .as_ref()
                             .is_none_or(|recv| matches!(&*recv.node, ExprNode::SelfRef))
                             && matches!(method.as_str(), "private" | "protected" | "public")
+                            // Not a refusal: the model lowering applies a carried marker to the accessor it synthesizes.
+                            && expr.decisions & crate::expr::INHERITED_VISIBILITY == 0
                         {
                             for arg in args {
                                 let name = match &*arg.node {
@@ -458,7 +463,7 @@ fn refusals(
             };
             if let Some(DiagnosticKind::Unsupported {
                 construct, detail, ..
-            }) = &expr.diagnostic
+            }) = &expr.diagnostic()
             {
                 refused.push((expr.span, format!("{construct} on {} {detail}", model.name.0)));
                 continue;

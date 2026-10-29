@@ -34,6 +34,11 @@ module ActiveRecord
     # SqliteAdapter (CRuby/spinel) already implements both.
     %a{abstract}
     def select_rows: (String sql) -> Array[Hash[String, untyped]]
+    # `select_rows` one row at a time: each row Hash yielded as it is
+    # read. Hydration goes through it so a row reaches `instantiate` as
+    # a Hash rather than as an element of an Array of Hashes.
+    %a{abstract}
+    def each_row: (String sql) { (Hash[String, untyped]) -> void } -> void
     %a{abstract}
     def execute_ddl: (String sql) -> void
     %a{abstract}
@@ -78,8 +83,28 @@ module ActiveRecord
   # metaprogramming. Per-model subclasses define their own column
   # accessors, attributes hash, and `[]/[]=` indexers; Base supplies
   # the shared CRUD + lifecycle protocol.
+  class ErrorDetail
+    @attribute: String
+    @kind: String
+    @message: String
+    @full_message: String
+    @symbolic: bool
+    @optionless: bool
+    def attribute: () -> String
+    def kind: () -> String
+    def message: () -> String
+    def full_message: () -> String
+    def symbolic: () -> bool
+    def optionless: () -> bool
+    def initialize: (String attribute, String kind, String message, String full_message, bool symbolic, bool optionless) -> void
+  end
+
   class Base
     def self.sanitize_sql_like: (String value, ?String escape_character) -> String
+    def self.like_escapes_doubled: (String value, String escape_character) -> String
+    def self.like_wildcards_marked: (String source, String escape_character) -> String
+    def self.like_replacement: (String source, Integer index, String escape_character) -> String
+    def self.like_group_reference: (String escape_character, Integer start) -> void
 
     EMPTY_ATTRS: Hash[Symbol, untyped]
     HYDRATE_ATTRS: Hash[Symbol, untyped]
@@ -96,6 +121,7 @@ module ActiveRecord
     # the app's keys and no wider.
     def id: () -> Integer
     def id=: (Integer) -> Integer
+    def _primary_key_value: () -> Integer
     def to_param: () -> String
 
     # Error message accumulator populated by the lowerer-emitted
@@ -114,6 +140,10 @@ module ActiveRecord
     # it as a pointer and the message is swept while the array holds it.
     @errors: Array[String]
     def errors: () -> Array[String]
+    @error_details: Array[ErrorDetail]
+    def error_details: () -> Array[ErrorDetail]
+    def error_messages_for: (String attribute) -> Array[String]
+    def errors_json: () -> Hash[String, Array[String]]
 
     def initialize: (?Hash[Symbol, untyped] attrs) -> void
 
@@ -161,6 +191,8 @@ module ActiveRecord
     def changed?: () -> bool
     def has_changes_to_save?: () -> bool
     def attribute_was: (String name) -> untyped
+    def clear_attribute_change: (String name) -> nil
+    def restore_attribute!: (String name) -> nil
     def id_previously_changed?: () -> bool
     def previously_new_record?: () -> bool
 
@@ -204,6 +236,15 @@ module ActiveRecord
     # `void` keeps TS from requiring an explicit `return ...;` for
     # the trailing assignment.
     def mark_persisted!: () -> void
+
+    # cache_key / cache_version / cache_key_with_version — see
+    # connection.rb's Base reopen, NOT this file: base.rb is transpiled
+    # into every strict target's runtime (runtime_loader.rs's per-stem
+    # tables), and `self[:updated_at]` there compiles to each target's
+    # untyped-value representation (Rust: `serde_json::Value`), which
+    # has no `.to_i` — roundhouse PR #1034's compare(rust)/
+    # compare-extra(kotlin,swift)/smoke(rust)/smoke-extra(swift)
+    # failures.
 
     # Class-level CRUD — delegate to the adapter. Returns Base
     # nominally; per-target emit can refine to the actual subclass
@@ -250,6 +291,8 @@ module ActiveRecord
     # self either way (idempotent on already-destroyed records).
     def save: () -> bool
     def save_after_validation: () -> bool
+    def _save_committed: (bool was_new) -> void
+    def _destroy_committed: () -> void
     def _insert_row: () -> bool
     def save!: () -> Base
     def destroy: () -> Base
@@ -264,12 +307,14 @@ module ActiveRecord
     def lock!: (?(bool | String)? lock) -> Base
     # `touch` is no-arg on purpose; see the note on the body.
     def touch: () -> bool
+    def touch_later: () -> bool
     def touch_written: () -> bool
 
     # Lifecycle hooks — no-op defaults. Subclasses override.
     def after_initialize: () -> void
     def before_validation: () -> void
     def after_validation: () -> void
+    def _autosave_belongs_to: () -> void
     def before_save: () -> void
     def after_save: () -> void
     def before_create: () -> void
@@ -293,6 +338,7 @@ module ActiveRecord
     # `untyped` from `self[]=` otherwise. Declare `void` since
     # callers ignore the result.
     def fill_timestamps: (bool creating) -> void
+    def stamps_timestamps?: () -> bool
 
     def valid?: () -> bool
 

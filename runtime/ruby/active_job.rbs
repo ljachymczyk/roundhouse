@@ -17,11 +17,20 @@ module ActiveJob
   def self.register_drain: () -> nil
   def self.enqueue: (^() -> nil work) -> nil
   def self.enqueue_payload: (String json) -> nil
+  def self.enqueue_payload_after_commit: (String json) -> nil
   def self.pending_count: () -> Integer
   def self.perform_payload: (String json) -> bool
   def self.drain: () -> Integer
 
   class DeserializationError < StandardError
+  end
+
+  class EnqueueError < StandardError
+  end
+
+  module Continuable
+    @completed_steps: Array[String]?
+    def step: (String | Symbol name) { () -> untyped } -> untyped
   end
   HELD_NAMES: Array[String]
   HELD: Array[^() -> nil]

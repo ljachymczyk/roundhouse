@@ -166,10 +166,30 @@ fn walk_stmt(stmt: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
                 },
             )]
         }
+        // `<% type, value = node.first %>` (lobsters' search parse
+        // tree) — the multi-local form of the arm above. Locals only:
+        // an ivar target would need the view-context write-through the
+        // single-ivar arm builds, so that shape keeps the residue line.
+        ExprNode::MultiAssign { targets, value }
+            if targets.iter().all(|t| matches!(t, LValue::Var { .. })) =>
+        {
+            vec![Expr::new(
+                stmt.span,
+                ExprNode::MultiAssign {
+                    targets: targets.clone(),
+                    value: rewrite_predicates(
+                        value,
+                        &ctx.nullable_locals,
+                        &ctx.reference_reads,
+                        &ctx.nilable_scalar_reads,
+                    ),
+                },
+            )]
+        }
         // Conditional branching at the template level. Cond goes
-        // through `rewrite_predicates` so Rails-style `.present?` /
-        // `.any?` / `.none?` / `.blank?` collapse to the
-        // `.empty?`-based forms spinel's runtime expects.
+        // through `rewrite_predicates`: `.blank?` / `.present?` become
+        // `(recv || "").empty?`, and `.any?` / `.none?` / `.empty?`
+        // become collection `empty?`.
         ExprNode::If { cond, then_branch, else_branch } => {
             let then_seq = walk_body(then_branch, ctx);
             let then_body = if then_seq.len() == 1 {
@@ -205,14 +225,18 @@ fn walk_stmt(stmt: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
         // controller's) when the key can be built, and rendered
         // transparently when it cannot:
         //
-        //   __cache_hit_1 = ActionView::ViewHelpers.fragment_read("views/messages/_message/…")
+        //   __cache_hit_1 = ActionView::ViewHelpers.fragment_read_record("messages/_message", message)
         //   if __cache_hit_1.nil?
         //     __cache_io_1 = String.new
         //     … body …
-        //     io << ActionView::ViewHelpers.fragment_write(<same key>, __cache_io_1, 0)
+        //     io << ActionView::ViewHelpers.fragment_write_record(<same key>, __cache_io_1, 0)
         //   else
         //     io << __cache_hit_1
         //   end
+        //
+        // `cache record` hands the controller `[template, record]`, as
+        // Rails does (`record_cache_key`); any other key is folded to
+        // text and read with `fragment_read("views/…")`.
         //
         // TWO APPENDS, not one through a reassigned local. `read_str`
         // answers `String?` and the body produces a `String`; a single
@@ -239,10 +263,14 @@ fn walk_stmt(stmt: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
             let ExprNode::Lambda { body, .. } = &*block.node else {
                 return vec![todo_io_append("cache block shape", stmt.span)];
             };
-            let Some(parts) = cache_key_parts(args, ctx) else {
-                return walk_body(body, ctx);
+            let key = match record_cache_key(args, ctx) {
+                Some(key) => key,
+                None => match cache_key_parts(args, ctx) {
+                    Some(parts) => FragmentKey::Text(parts),
+                    None => return walk_body(body, ctx),
+                },
             };
-            emit_cached_fragment(&parts, cache_ttl(args), body, ctx, stmt.span)
+            emit_cached_fragment(&key, cache_ttl(args), body, ctx, stmt.span)
         }
         // Block-form `<% content_for :subnav do %> … <% end %>` —
         // slot capture (lobsters' subnav pattern: pages and partials
@@ -313,7 +341,7 @@ fn walk_stmt(stmt: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
                 &is_options_ivar,
             ) {
                 let disc = "discard";
-                let disc_ctx = ViewCtx { accumulator: disc.to_string(), ..ctx.clone() };
+                let disc_ctx = ViewCtx { accumulator: disc.to_string(), ..ctx.for_render(args) };
                 if let Some(stmt) = emit_render_partial(&rp, &disc_ctx) {
                     return vec![assign_accumulator_string_new(disc), stmt];
                 }
@@ -470,7 +498,7 @@ fn splice_form_wrapper(
     if !args.iter().all(is_pure_read) {
         return None;
     }
-    let mut binding: std::collections::HashMap<&Symbol, &Expr> = std::collections::HashMap::new();
+    let mut binding: crate::det::HashMap<&Symbol, &Expr> = crate::det::HashMap::default();
     for (i, (name, default)) in w.params.iter().enumerate() {
         match args.get(i) {
             Some(a) => {
@@ -579,7 +607,7 @@ fn is_pure_read(e: &Expr) -> bool {
     }
 }
 
-fn substitute_vars(e: &Expr, binding: &std::collections::HashMap<&Symbol, &Expr>) -> Expr {
+fn substitute_vars(e: &Expr, binding: &crate::det::HashMap<&Symbol, &Expr>) -> Expr {
     if let ExprNode::Var { name, .. } = &*e.node {
         if let Some(replacement) = binding.get(name) {
             return (*replacement).clone();
@@ -828,6 +856,7 @@ fn emit_io_append(arg: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
             &is_local,
             &is_options_ivar,
         ) {
+            let render_ctx = ctx.for_render(sa);
             // `render layout: "x" do … end` lowers to SEVERAL statements
             // (a capture local, then the layout call), so it can't ride
             // `emit_render_partial`'s single-expression return. It also
@@ -836,12 +865,12 @@ fn emit_io_append(arg: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
             // `render` and emit a call to a method no view module has.
             if let crate::lower::view::RenderPartial::LayoutBlock { layout, locals, block } = &rp {
                 if let Some(stmts) =
-                    super::partial::emit_layout_block(layout, *locals, block, ctx)
+                    super::partial::emit_layout_block(layout, *locals, block, &render_ctx)
                 {
                     return stmts;
                 }
             }
-            if let Some(stmt) = emit_render_partial(&rp, ctx) {
+            if let Some(stmt) = emit_render_partial(&rp, &render_ctx) {
                 return vec![stmt];
             }
         }
@@ -911,98 +940,54 @@ fn emit_io_append(arg: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
             // / `as:`). Same resolution a `render partial:` call site
             // gets, through the same `named_partial_call` — a second
             // partial resolver here would be a second set of rules to
-            // keep in step.
-            if let (2, None) = (sa.len(), block.as_ref()) {
-                if let ExprNode::Hash { entries, .. } = &*sa[1].node {
-                    // `partial:` alone renders once. `collection:` is
-                    // Rails' "once per element" — campfire's
-                    // `accounts/users/index.turbo_stream.erb` writes
-                    // `turbo_stream.replace :next_page_container,
-                    // partial: "…/user", collection: @page.records,
-                    // as: :user`. Treating that as a single render
-                    // would keep only the first element, so the
-                    // collection walks into a capture accumulator and
-                    // the captured String is the fragment.
-                    let understood = entries.iter().all(|(k, _)| {
-                        matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } }
-                            if matches!(value.as_str(), "partial" | "locals" | "collection" | "as"))
-                    });
-                    let opt = |name: &str| {
-                        entries.iter().find_map(|(k, v)| match &*k.node {
-                            ExprNode::Lit { value: Literal::Sym { value } }
-                                if value.as_str() == name =>
-                            {
-                                Some(v)
-                            }
-                            _ => None,
-                        })
-                    };
-                    let partial = opt("partial").and_then(|p| match &*p.node {
-                        ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
-                        _ => None,
-                    });
-                    // Absent `locals:`/`as:` is fine. A supplied value
-                    // that is not a hash / name literal cannot be
-                    // lowered — dropping it would render the partial
-                    // under the wrong local. Decline the whole call.
-                    let locals = match opt("locals") {
-                        None => Some(None),
-                        Some(l) => match &*l.node {
-                            ExprNode::Hash { entries, .. } => Some(Some(
-                                entries
-                                    .iter()
-                                    .map(|(k, v)| (k.clone(), rewrite_helpers_in_expr(v, ctx)))
-                                    .collect::<Vec<_>>(),
-                            )),
-                            _ => None,
-                        },
-                    };
-                    let collection = opt("collection").map(|c| rewrite_helpers_in_expr(c, ctx));
-                    let as_name = match opt("as") {
-                        None => Some(None),
-                        Some(a) => match &*a.node {
-                            ExprNode::Lit { value: Literal::Sym { value } } => {
-                                Some(Some(value.as_str().to_string()))
-                            }
-                            ExprNode::Lit { value: Literal::Str { value } } => {
-                                Some(Some(value.clone()))
-                            }
-                            _ => None,
-                        },
-                    };
-                    if let (true, Some(partial), Some(locals), Some(as_name)) =
-                        (understood, partial, locals, as_name)
-                    {
-                        if let Some(coll) = collection {
-                            if let Some(out) = turbo_stream_collection_fragment(
-                                method.as_str(),
-                                &sa[0],
-                                &partial,
-                                coll,
-                                as_name.as_deref(),
-                                locals.as_deref(),
-                                ctx,
-                            ) {
-                                return out;
-                            }
-                        } else if as_name.is_none() {
-                            if let Some(html) = super::partial::named_partial_call(
-                                &partial,
-                                None,
-                                locals.as_deref(),
-                                ctx,
-                            ) {
-                                return vec![accumulator_append_call(
-                                    super::helpers::turbo_stream_fragment_call(
-                                        method.as_str(),
-                                        super::helpers::turbo_stream_target(&sa[0], ctx),
-                                        html,
-                                    ),
-                                    ctx,
-                                )];
-                            }
-                        }
+            // keep in step. Looked up in html: turbo-rails renders it
+            // `formats: [:html]` (`TagBuilder#render_template`).
+            if let Some(ts) = block
+                .is_none()
+                .then(|| super::helpers::turbo_stream_partial(recv.as_ref(), method.as_str(), sa))
+                .flatten()
+            {
+                let locals = ts.locals.map(|entries| {
+                    entries
+                        .iter()
+                        .map(|(k, v)| (k.clone(), rewrite_helpers_in_expr(v, ctx)))
+                        .collect::<Vec<_>>()
+                });
+                // `partial:` alone renders once. `collection:` is
+                // Rails' "once per element" — campfire's
+                // `accounts/users/index.turbo_stream.erb` writes
+                // `turbo_stream.replace :next_page_container,
+                // partial: "…/user", collection: @page.records,
+                // as: :user`. Treating that as a single render
+                // would keep only the first element, so the
+                // collection walks into a capture accumulator and
+                // the captured String is the fragment.
+                if let Some(coll) = ts.collection {
+                    if let Some(out) = turbo_stream_collection_fragment(
+                        method.as_str(),
+                        ts.target,
+                        ts.partial,
+                        rewrite_helpers_in_expr(coll, ctx),
+                        ts.as_name,
+                        locals.as_deref(),
+                        ctx,
+                    ) {
+                        return out;
                     }
+                } else if let Some(html) = super::partial::named_partial_call(
+                    ts.partial,
+                    None,
+                    locals.as_deref(),
+                    &ctx.in_formats(&["html"]),
+                ) {
+                    return vec![accumulator_append_call(
+                        super::helpers::turbo_stream_fragment_call(
+                            method.as_str(),
+                            super::helpers::turbo_stream_target(ts.target, ctx),
+                            html,
+                        ),
+                        ctx,
+                    )];
                 }
             }
         }
@@ -1273,6 +1258,16 @@ fn emit_io_append(arg: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
     if let Some(safe) = html_safe_value(&rewritten, ctx) {
         return vec![accumulator_append_call(coerce_to_s(safe), ctx)];
     }
+    // Not left to each emitter: only the Ruby one unwrapped the escape around `raw`, and TypeScript shipped `html_escape(raw(x))`
+    if let ExprNode::Send { recv, method, args, block: None, .. } = &*rewritten.node
+        && method.as_str() == "raw"
+        && args.len() == 1
+        && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::Const { path } if path.last().is_some_and(|s| s.as_str() == "ViewHelpers")))
+    {
+        let mut call = view_helpers_call("raw", vec![args[0].clone()]);
+        call.ty = Some(crate::ty::Ty::Str);
+        return vec![accumulator_append_call(coerce_to_s(call), ctx)];
+    }
     let escaped = view_helpers_call("html_escape", vec![coerce_to_s(rewritten)]);
     vec![accumulator_append_call(escaped, ctx)]
 }
@@ -1327,7 +1322,7 @@ fn turbo_stream_collection_fragment(
         None,
         bound_locals.as_deref(),
         Some(var_ref(var.clone())),
-        ctx,
+        &ctx.in_formats(&["html"]),
     )?;
     let cap = "_ts_cap";
     let cap_ctx = ViewCtx {
@@ -1492,6 +1487,33 @@ fn coerce_to_s(expr: Expr) -> Expr {
 /// before the html_escape wrap, matching the convention every
 /// emitter would otherwise have to repeat.
 pub(super) fn rewrite_helpers_in_expr(e: &Expr, ctx: &ViewCtx) -> Expr {
+    // `x.presence` in a view's output (`<%= r[:title].presence || t(...) %>`):
+    // ActiveSupport's Object#presence, which only the CRuby overlay can
+    // reopen onto every value. `lower::blank` grounds it in app bodies but
+    // does not walk views (their conditions have their own predicate
+    // rewrite), so an output site stayed a dynamic call that the spinel
+    // binary answered with NoMethodError. It becomes the runtime predicate
+    // `lower::blank` uses for a receiver it cannot type:
+    // `ActiveSupport.presence(x)`.
+    if let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*e.node {
+        if method.as_str() == "presence" && args.is_empty() {
+            let mut call = Expr::new(
+                e.span,
+                ExprNode::Send {
+                    recv: Some(Expr::new(
+                        e.span,
+                        ExprNode::Const { path: vec![crate::ident::Symbol::from("ActiveSupport")] },
+                    )),
+                    method: crate::ident::Symbol::from("presence"),
+                    args: vec![rewrite_helpers_in_expr(r, ctx)],
+                    block: None,
+                    parenthesized: true,
+                },
+            );
+            call.ty = e.ty.clone();
+            return call;
+        }
+    }
     let new_node = match &*e.node {
         ExprNode::Send {
             recv: None,
@@ -1529,6 +1551,18 @@ pub(super) fn rewrite_helpers_in_expr(e: &Expr, ctx: &ViewCtx) -> Expr {
             if method.as_str() == "h" && args.len() == 1 {
                 let mut call = view_helpers_call(
                     "html_escape",
+                    vec![coerce_to_s(rewrite_helpers_in_expr(&args[0], ctx))],
+                );
+                call.inherit_span(e.span);
+                return call;
+            }
+            // `u(x)` / `url_encode(x)`: ERB::Util.url_encode, which a
+            // view reaches through ERB::Util (Rails includes it in every
+            // view). Percent-encoding with `%20` for a space, not
+            // `CGI.escape`'s `+` that the runtime's `url_encode` is.
+            if matches!(method.as_str(), "u" | "url_encode") && args.len() == 1 {
+                let mut call = view_helpers_call(
+                    "erb_url_encode",
                     vec![coerce_to_s(rewrite_helpers_in_expr(&args[0], ctx))],
                 );
                 call.inherit_span(e.span);
@@ -1624,7 +1658,12 @@ pub(super) fn rewrite_helpers_in_expr(e: &Expr, ctx: &ViewCtx) -> Expr {
         },
         other => other.clone(),
     };
-    Expr::new(e.span, new_node)
+    let mut out = Expr::new(e.span, new_node);
+    // `f.object.class::X` stays a path (`expr::CONST_PATH`).
+    out.decisions |= e.decisions & crate::expr::CONST_PATH;
+    // Not a fresh, untyped node: a rebuilt `[]` the i18n lowering typed `Array[String]` would read as `Array[untyped]`
+    out.ty = e.ty.clone();
+    out
 }
 
 /// Does a block body hold compiled-template buffer ops (`_buf = _buf + …`)?
@@ -1737,10 +1776,13 @@ mod tests {
             i18n: Default::default(),
             route_helper_arity: Default::default(),
             form_wrappers: Default::default(),
+            form_with_entry: false,
             stylesheets: Vec::new(),
             lexxy: false,
             lexxy_editor_adapter: false,
             partial_ivars: Default::default(),
+            formats: vec!["html".to_string()],
+            view_formats: Default::default(),
             multipart_partials: Default::default(),
             dyn_pools: Default::default(),
             partial_extras: Default::default(),
@@ -1836,6 +1878,28 @@ mod tests {
         );
         assert!(emitted.contains("inner"), "the body still renders on a miss:\n{emitted}");
         assert!(!emitted.contains("_buf"), "raw _buf must not survive:\n{emitted}");
+    }
+
+    #[test]
+    fn a_record_key_reaches_the_controller_as_the_record() {
+        // campfire's `<% cache message do %>`: Rails hands the controller
+        // `[template, record]`, so the app's `combined_fragment_cache_key`
+        // sees the Message, and a `cached: true` collection of the same
+        // partial files the fragment under the same key.
+        let emitted = cache_emit(vec![var("message")]);
+
+        assert!(
+            emitted.contains("ActionView::ViewHelpers.fragment_read_record(\"#{ActionView::ViewHelpers.cache_scope}messages/_message\", message)"),
+            "the read hands over the template and the record:\n{emitted}"
+        );
+        assert!(
+            emitted.contains("ActionView::ViewHelpers.fragment_write_record(\"#{ActionView::ViewHelpers.cache_scope}messages/_message\", message, "),
+            "the miss arm writes under the same key:\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("cache_key_with_version"),
+            "the record is not folded to text before the controller sees it:\n{emitted}"
+        );
     }
 
     #[test]
@@ -2479,6 +2543,51 @@ enum KeyPart {
     Expr(Expr),
 }
 
+/// How a `<% cache %>` site names its fragment.
+enum FragmentKey {
+    /// `cache_key_parts`' interpolated text.
+    Text(Vec<InterpPart>),
+    /// `cache record`: the template's path and the record, which the
+    /// controller combines, as Rails' CacheHelper hands it
+    /// `cache_fragment_name(record, digest_path:)`.
+    Record { template: Vec<InterpPart>, record: Expr },
+}
+
+/// `cache record` — one record, nothing else in the key — keeps the
+/// record in the key, as Rails does, instead of folding it to text.
+///
+/// TWO THINGS DEPEND ON IT. An app's `combined_fragment_cache_key`
+/// override sees what Rails would hand it: campfire's `CachedResponses`
+/// shares a message's fragment across viewers only when the key holds a
+/// `Message`, and keys a String per viewer and per database commit. And
+/// the key is the one a `cached: true` collection of the same partial
+/// files the fragment under (`collection_fragment_key` with the same
+/// template path), so a collection miss that renders the partial writes
+/// one entry, not a second that nothing ever reads.
+///
+/// The template is `ctx.view_name`, behind the broadcast scope as in
+/// `cache_key_parts`. Other key shapes keep `cache_key_parts`.
+fn record_cache_key(args: &[Expr], ctx: &ViewCtx) -> Option<FragmentKey> {
+    if args.is_empty() || args.len() > 2 {
+        return None;
+    }
+    let record = match &*args[0].node {
+        ExprNode::Array { elements, .. } if elements.len() == 1 => &elements[0],
+        ExprNode::Array { .. } => return None,
+        _ => &args[0],
+    };
+    if !is_record(record, ctx) {
+        return None;
+    }
+    Some(FragmentKey::Record {
+        template: vec![
+            InterpPart::Expr { expr: view_helpers_call("cache_scope", Vec::new()) },
+            InterpPart::Text { value: ctx.view_name.clone() },
+        ],
+        record: record.clone(),
+    })
+}
+
 /// Append literal text, merging into the previous chunk so the emitted
 /// string carries one `Text` run rather than a chain of adjacent ones.
 fn push_key_text(parts: &mut Vec<InterpPart>, t: &str) {
@@ -2574,7 +2683,7 @@ fn cache_ttl(args: &[Expr]) -> Expr {
 /// The read / render / write triple. See the walker arm's note for the
 /// shape and why it is spelled without a block.
 fn emit_cached_fragment(
-    parts: &[InterpPart],
+    fragment: &FragmentKey,
     ttl: Expr,
     body: &Expr,
     ctx: &ViewCtx,
@@ -2587,7 +2696,16 @@ fn emit_cached_fragment(
     let hit = Symbol::from(format!("__cache_hit_{uniq}"));
     let cap = format!("__cache_io_{uniq}");
 
-    let key = || Expr::new(span, ExprNode::StringInterp { parts: parts.to_vec() });
+    let interp = |parts: &[InterpPart]| Expr::new(span, ExprNode::StringInterp { parts: parts.to_vec() });
+    // The read's and the write's arguments, before the value and TTL.
+    let key = || match fragment {
+        FragmentKey::Text(parts) => vec![interp(parts)],
+        FragmentKey::Record { template, record } => vec![interp(template), record.clone()],
+    };
+    let (read_method, write_method) = match fragment {
+        FragmentKey::Text(_) => ("fragment_read", "fragment_write"),
+        FragmentKey::Record { .. } => ("fragment_read_record", "fragment_write_record"),
+    };
     // `ActionView::ViewHelpers.fragment_read/fragment_write`: the
     // runtime's store on every target, reopened on the ruby family and
     // spinel to ask the controller as Rails' CacheHelper does.
@@ -2603,7 +2721,7 @@ fn emit_cached_fragment(
         span,
         ExprNode::Assign {
             target: LValue::Var { id: VarId(0), name: hit.clone() },
-            value: send(Some(store()), "fragment_read", vec![key()], None, true),
+            value: send(Some(store()), read_method, key(), None, true),
         },
     );
 
@@ -2615,8 +2733,8 @@ fn emit_cached_fragment(
     miss.push(accumulator_append_call(
         send(
             Some(store()),
-            "fragment_write",
-            vec![key(), accumulator_result_ref(&cap), ttl],
+            write_method,
+            key().into_iter().chain([accumulator_result_ref(&cap), ttl]).collect(),
             None,
             true,
         ),

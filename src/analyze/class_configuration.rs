@@ -3,7 +3,7 @@
 //! here, and `ClassAttribute` methods, whose parameters are typed from
 //! their call sites like any method's (class-body macro calls included).
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::dialect::{ClassConfigurationRole, Controller, ControllerBodyItem};
 use crate::expr::{Expr, ExprNode, LValue};
@@ -14,7 +14,7 @@ use super::{Analyzer, Ctx, union_of};
 
 impl Analyzer {
     pub(super) fn analyze_class_configuration(&mut self, controllers: &mut [Controller]) {
-        let mut types: HashMap<(ClassId, Symbol), Ty> = HashMap::new();
+        let mut types: HashMap<(ClassId, Symbol), Ty> = HashMap::default();
         for controller in controllers.iter_mut() {
             for item in &mut controller.body {
                 let ControllerBodyItem::ClassIvarInit { expr, carrier, .. } = item else {
@@ -25,7 +25,7 @@ impl Analyzer {
                 }
                 // A class-body macro call dispatches on the class itself.
                 let ctx = Ctx {
-                    self_ty: Some(Ty::Class { id: controller.name.clone(), args: vec![] }),
+                    self_ty: Some(Ty::Class { id: controller.name.clone(), args: vec![].into() }),
                     class_side: true,
                     ..Ctx::default()
                 };
@@ -120,7 +120,7 @@ impl Analyzer {
                 let mut ctx = Ctx {
                     self_ty: Some(Ty::Class {
                         id: controller.name.clone(),
-                        args: vec![],
+                        args: vec![].into(),
                     }),
                     // ClassAttribute / Writer / Reader methods are
                     // `def self.`; receiverless sends must hit the
@@ -187,19 +187,19 @@ impl Analyzer {
                             // A writer takes the slot's value; any other
                             // method's parameter is what its sites seeded.
                             ty: match *configuration_role {
-                                ClassConfigurationRole::Writer => ty.clone(),
+                                ClassConfigurationRole::Writer => ty.clone().into(),
                                 ClassConfigurationRole::Reader
                                 | ClassConfigurationRole::ClassAttribute => ctx
                                     .local_bindings
                                     .get(&p.name)
                                     .cloned()
-                                    .unwrap_or(Ty::Untyped),
+                                    .unwrap_or(Ty::Untyped).into(),
                             },
                             kind: p.ty_kind(),
                         })
                         .collect(),
                     block: None,
-                    ret: Box::new(method.body.ty.clone().unwrap_or(Ty::Untyped)),
+                    ret: std::sync::Arc::new(method.body.ty.clone().unwrap_or(Ty::Untyped)),
                     effects: method.effects.clone(),
                 });
                 // Sibling class methods in this same pass call each other
@@ -233,8 +233,8 @@ fn is_uninformative(ty: &Ty) -> bool {
 
 fn empty_hash() -> Ty {
     Ty::Hash {
-        key: Box::new(Ty::Bottom),
-        value: Box::new(Ty::Bottom),
+        key: std::sync::Arc::new(Ty::Bottom),
+        value: std::sync::Arc::new(Ty::Bottom),
     }
 }
 

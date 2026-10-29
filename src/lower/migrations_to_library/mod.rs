@@ -23,6 +23,7 @@ use crate::ident::Symbol;
 use crate::lower::typing::{fn_sig, lit_str, with_ty};
 use crate::span::Span;
 use crate::ty::Ty;
+use std::sync::Arc;
 
 /// The statements for one migration, or why it cannot run.
 fn migration_statements(m: &crate::schema::Migration) -> Result<Vec<String>, String> {
@@ -46,7 +47,7 @@ fn migration_statements(m: &crate::schema::Migration) -> Result<Vec<String>, Str
 /// end state from `Schema.statements`.
 pub fn lower_migrations_module_functions(app: &App) -> Vec<LibraryFunction> {
     let str_array = Ty::Array {
-        elem: Box::new(Ty::Str),
+        elem: Arc::new(Ty::Str),
     };
     let mut elements: Vec<Expr> = Vec::new();
     for m in &app.migrations {
@@ -81,7 +82,7 @@ pub fn lower_migrations_module_functions(app: &App) -> Vec<LibraryFunction> {
         ));
     }
     let ret = Ty::Array {
-        elem: Box::new(str_array.clone()),
+        elem: Arc::new(str_array.clone()),
     };
     let body = with_ty(
         Expr::new(

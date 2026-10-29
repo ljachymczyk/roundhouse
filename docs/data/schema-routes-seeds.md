@@ -93,7 +93,7 @@ is an `integer` key, and a hash-valued `id: { type: :string, limit:
 32 }` keeps its type and limit. And the folds below
 apply (`timestamptz` renders `timestamp`). The IR preserves `json` and
 `jsonb` separately so PostgreSQL DDL keeps the source type. SQLite stores both
-as text, and both use the same Ruby `JsonColumn` encoding/decoding path; this
+as text, and both use the same Ruby `RoundhouseJsonColumn` encoding/decoding path; this
 does not add PostgreSQL runtime support.
 Roda's current Sequel schema mapping remains text-backed and records the
 original type in a comment rather than claiming native JSONB support.
@@ -124,7 +124,8 @@ installed by a PostgreSQL deployment.
 Postgres column types map to their SQLite storage at
 ingest (`uuid` → TEXT via `ColumnType::Uuid`, `json`/`jsonb` → the same
 text-backed JSON representation, `citext` → text, `timestamptz` → datetime,
-`inet`/`cidr`/`macaddr`/`enum` → string); a type with no mapping is an
+`interval` → INTEGER via `ColumnType::Interval` with an `ActiveSupport::Duration`
+reader, `inet`/`cidr`/`macaddr`/`enum` → string); a type with no mapping is an
 ingest error (a ledger line under `--survey`), never a silent drop — its index would still be
 emitted and the DDL would not apply. A non-integer primary key
 (`create_table …, id: :uuid` / `primary_key: "identifier", id:
@@ -206,7 +207,7 @@ Expressions remain verbatim, so PostgreSQL preserves the source JSON type's
 behavior. The default application ingest remains portable, and SQLite DDL
 validation rejects a schema imported in PostgreSQL mode. This adds no
 PostgreSQL model persistence and leaves the shared serialized-text
-`JsonColumn` model path unchanged.
+`RoundhouseJsonColumn` model path unchanged.
 
 Other PostgreSQL operators, casts to non-text types apart from the bounded
 text-to-int4 casts above, other functions,
@@ -273,6 +274,52 @@ Explicit generated values in YAML fixtures are rejected with fixture, record,
 and column context. The regression suites are `tests/generated_columns*.rs`;
 `generated_columns_spinel` executes the SQLite contract natively in the
 selected Spinel CI suite.
+
+## `config/database.yml` → `App::databases` and model ownership
+
+`config/database.yml` is resolved when Roundhouse builds the app, as
+Rails' `ActiveRecord::DatabaseConfigurations` reads it: every
+environment, each one's configurations (three-tier when every value of
+the environment is a mapping, otherwise the one configuration
+`primary`), the primary (named `primary`, else the first), replicas, and
+the adapter (`adapter:`, or the scheme of a literal `url:`, which wins;
+an environment given as a URL string is that URL's configuration).
+Only identity keys are read (`adapter`, `url`, `replica`,
+`database_tasks`, `migrations_paths`, `schema_search_path`), so no
+connection value or credential reaches the IR. ERB is not run: an
+output tag in a connection value does not matter, one in an identity key
+leaves that configuration out with a warning, and a control tag leaves
+them all out. `DATABASE_URL` is not read. The primary's SQLite
+`pragmas:` are read from the same file (`App::database_pragmas`).
+
+Which database a model runs on is read from source, never from the
+file: a literal `connects_to database: { writing:, reading: }` in an
+abstract class, inherited by its subclasses (`App::model_databases`).
+The emitted runtime opens only the primary, so a model whose writing
+database is another, a name the file does not configure, a computed or
+conditional `connects_to`, `shards:`, `establish_connection`, an
+app-defined `connection_pool`, and any role or shard switch are errors
+at their source (`App::database_refusals`). A switch is Active Record's
+when it is called on a class (`self`, a constant, or no receiver) and,
+for `connected_to`, `connected_to_many` and `connecting_to`, passes the
+`role:` or `shard:` Rails requires; a call on another object is the
+app's own method. A `connects_to` whose
+writing database is the primary checks clean and runs.
+
+The primary the test environment names decides the SQL dialect of the
+Ruby target's emit (`schema_sql::Dialect::for_app`). For postgresql, the
+schema DDL, the lowered queries (boolean literals, truncation) and the
+tree are PostgreSQL's: `runtime/spinel/db_pg.rb` over the pg gem as
+the emitted tree's Db, `gem "pg"`, and the database `DATABASE_URL` names, at
+boot and in the emitted tests (`project::apply_postgresql_tree`). Every
+other target, and every other adapter, keeps SQLite. The runtime's
+database tasks (`db:schema:load`, `prepare_all`, `migrate`) and
+`data_source_exists?` / `column_exists?` still ask SQLite's catalog
+(`sqlite_master`, `PRAGMA`, `INSERT OR IGNORE`), so a PostgreSQL app
+that reaches them fails at run time.
+
+The enum `database::DatabaseAdapter` names a configuration's adapter;
+it is not the analyzer's [`DatabaseAdapter` trait](adapter.md).
 
 ## `config/routes.rb` → `RouteTable` → `RouteHelpers.<x>_path`
 
@@ -566,6 +613,9 @@ methods.
 | `src/ingest/` | `ingest_schema` + `ingest_migration` (`schema.rs`), `ingest_routes` (`routes.rs`), `ingest_importmap` (`app.rs`); seeds go through `ingest_ruby_program` (`expr.rs`) |
 | `src/dialect.rs` | `RouteTable`, `RouteSpec`, `Fixture`, `LibraryClass`, `LibraryFunction` |
 | `src/app.rs` | `App::seeds`, `App::fixtures`, `App::importmap`, `App::rbs_signatures` |
+| `src/database.rs` | Database identity: `Database`, `ModelDatabase`, `DatabaseRefusal` |
+| `src/ingest/database_yml.rs` | `config/database.yml` → configurations and pragmas, at build time |
+| `src/ingest/database_ownership.rs` | `connects_to` and connection overrides → `App::model_databases`, routing refusals |
 | `src/rbs.rs` | `sig/**/*.rbs` sidecars → `App::rbs_signatures` |
 | `src/emit/shared/schema_sql.rs` | Schema → CREATE TABLE DDL statements; `render_migration_step` (sibling `seed_sql.rs` renders seed rows and version stamps) |
 | `src/lower/routes.rs` | `RouteTable` → `Vec<FlatRoute>` |

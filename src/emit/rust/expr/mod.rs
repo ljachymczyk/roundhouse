@@ -35,7 +35,7 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
-pub(super) fn with_param_types<F, R>(types: std::collections::HashMap<String, crate::ty::Ty>, f: F) -> R
+pub(super) fn with_param_types<F, R>(types: crate::det::HashMap<String, crate::ty::Ty>, f: F) -> R
 where
     F: FnOnce() -> R,
 {
@@ -76,7 +76,7 @@ pub(super) fn mark_local_var_ty(name: &str, ty: crate::ty::Ty) {
 /// the same `.clone().unwrap()` Option-unwrap fires for `params =
 /// match_pattern(...)` locals as for function params declared
 /// `Option<T>` in RBS.
-fn var_decl_ty(name: &str) -> Option<crate::ty::Ty> {
+pub(super) fn var_decl_ty(name: &str) -> Option<crate::ty::Ty> {
     param_ty(name).or_else(|| local_var_ty(name))
 }
 
@@ -235,7 +235,7 @@ pub(super) fn ivar_field_ty(name: &str) -> Option<crate::ty::Ty> {
 /// `library.rs` to scope each `impl` block's emit. Swaps
 /// `EmitCtx::ivar_types` with save-restore (Phase 2 of #24).
 /// Must be called inside `with_emit_ctx` — panics otherwise.
-pub(super) fn with_ivar_types<F, R>(types: std::collections::HashMap<String, crate::ty::Ty>, f: F) -> R
+pub(super) fn with_ivar_types<F, R>(types: crate::det::HashMap<String, crate::ty::Ty>, f: F) -> R
 where
     F: FnOnce() -> R,
 {
@@ -267,10 +267,10 @@ pub(super) fn with_method_scope<F, R>(body: &Expr, f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    let mut counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
+    let mut counts: crate::det::HashMap<String, usize> =
+        crate::det::HashMap::default();
     collect_var_assign_counts(body, &mut counts);
-    let mut mut_vars: std::collections::HashSet<String> = counts
+    let mut mut_vars: crate::det::HashSet<String> = counts
         .into_iter()
         .filter_map(|(name, n)| if n > 1 { Some(name) } else { None })
         .collect();
@@ -291,11 +291,11 @@ where
     let prev_mut = std::mem::replace(&mut *ctx.mut_vars.borrow_mut(), mut_vars);
     let prev_declared = std::mem::replace(
         &mut *ctx.declared_vars.borrow_mut(),
-        std::collections::HashSet::new(),
+        crate::det::HashSet::default(),
     );
     let prev_back_prop = std::mem::replace(
         &mut *ctx.back_propagated_hash_locals.borrow_mut(),
-        std::collections::HashSet::new(),
+        crate::det::HashSet::default(),
     );
     let r = f();
     *ctx.mut_vars.borrow_mut() = prev_mut;
@@ -342,7 +342,7 @@ pub(super) fn wrap_if_needs_parens(e: &Expr, emitted: String) -> String {
 
 fn collect_var_send_receivers(
     e: &Expr,
-    out: &mut std::collections::HashSet<String>,
+    out: &mut crate::det::HashSet<String>,
 ) {
     match &*e.node {
         ExprNode::Send { recv, args, block, .. } => {
@@ -395,7 +395,7 @@ fn collect_var_send_receivers(
 
 fn collect_var_assign_counts(
     e: &Expr,
-    out: &mut std::collections::HashMap<String, usize>,
+    out: &mut crate::det::HashMap<String, usize>,
 ) {
     match &*e.node {
         ExprNode::Assign { target: LValue::Var { name, .. }, value } => {
@@ -468,7 +468,7 @@ pub(super) fn render_self_literal() -> String {
 /// method set. Used by `library.rs::emit_library_class` to scope the
 /// static-method dispatch decision to the impl block being rendered.
 pub(super) fn with_static_methods<F, R>(
-    methods: std::collections::HashSet<String>,
+    methods: crate::det::HashSet<String>,
     f: F,
 ) -> R
 where
@@ -487,7 +487,7 @@ where
 /// `EmitCtx::class_method_param_tys` with save-restore (Phase 2 of
 /// #24). Must be called inside `with_emit_ctx`.
 pub(super) fn with_class_method_param_tys<F, R>(
-    map: std::collections::HashMap<String, Vec<crate::ty::Ty>>,
+    map: crate::det::HashMap<String, Vec<crate::ty::Ty>>,
     f: F,
 ) -> R
 where
@@ -602,6 +602,19 @@ fn in_constructor() -> bool {
     current_emit_ctx()
         .map(|ctx| ctx.in_constructor.get())
         .unwrap_or(false)
+}
+
+thread_local! {
+    static CURRENT_RUBY_CLASS: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// The Ruby name of the library class being emitted, for a raise that names a sibling bare.
+pub(crate) fn set_current_ruby_class_name(name: &str) {
+    CURRENT_RUBY_CLASS.with(|c| *c.borrow_mut() = name.to_string());
+}
+
+pub(super) fn current_ruby_class_name() -> Option<String> {
+    CURRENT_RUBY_CLASS.with(|c| Some(c.borrow().clone()).filter(|s| !s.is_empty()))
 }
 
 fn in_class_method() -> bool {
@@ -791,6 +804,9 @@ pub(super) fn has_str_coercion(e: &Expr) -> bool {
 
 /// Render a Rust expression node after shared complete-call primitive classification.
 fn emit_expr_inner(e: &Expr) -> String {
+    if let Some(s) = rescued_expr(e) {
+        return s;
+    }
     if let Some(s) = crate::emit::shared::utf8_chr::emit(e, crate::emit::shared::utf8_chr::Target::Rust, emit_expr) {
         return s;
     }
@@ -1102,6 +1118,24 @@ fn emit_expr_inner(e: &Expr) -> String {
             // function-return Vec receivers (the common case here,
             // `adapter.all(...).map { ... }`) the temporary is moved
             // anyway.
+            // `vec.find { |x| ... }`: the first element the block holds true for, or nil. Rust Vec has no `.find`
+            if matches!(method.as_str(), "find" | "detect") && args.is_empty() {
+                if let (Some(r), Some(b)) = (recv.as_ref(), block.as_ref()) {
+                    if let (Some(crate::ty::Ty::Array { .. }), ExprNode::Lambda { params, body, .. }) = (r.ty.as_ref().map(peel_nil), &*b.node) {
+                        if params.len() == 1 {
+                            let p = params[0].as_str();
+                            let field_ty = match &*r.node {
+                                ExprNode::Ivar { name } => ivar_field_ty(name.as_str()),
+                                _ => None,
+                            };
+                            let was_option = field_ty.or_else(|| r.ty.clone()).is_some_and(|t| util::is_option_ty(&t));
+                            let iter = if was_option { ".iter().flatten()" } else { ".iter()" };
+                            // Not the closure's own `&&T`: the body reads the element as the `&T` every other block here binds
+                            return format!("{}{iter}.find(|__x| {{ let {p} = *__x; {} }}).cloned()", emit_expr(r), emit_expr(body));
+                        }
+                    }
+                }
+            }
             if method.as_str() == "map" && args.is_empty() && recv.is_some() {
                 let r = recv.as_ref().unwrap();
                 if matches!(r.ty.as_ref().map(peel_nil), Some(crate::ty::Ty::Array { .. })) {
@@ -1138,6 +1172,9 @@ fn emit_expr_inner(e: &Expr) -> String {
                             );
                             let iter_chain = if was_option {
                                 ".iter().flatten()"
+                            } else if matches!(&*r.node, ExprNode::Ivar { .. }) {
+                                // `into_iter` would move the field out of `self`, which the method only borrows.
+                                ".iter().cloned()"
                             } else {
                                 ".into_iter()"
                             };
@@ -1148,7 +1185,7 @@ fn emit_expr_inner(e: &Expr) -> String {
                     }
                 }
             }
-            let base = emit_send(recv.as_ref(), method.as_str(), args, e.ty.as_ref());
+            let base = emit_send(recv.as_ref(), method.as_str(), args, block.as_ref(), e.ty.as_ref());
             // A Send with attached block becomes a closure passed as
             // the last arg. `other.each do |k, v| ... end` (Ruby) →
             // `other.each(|k, v| { ... })` (Rust). Whether the
@@ -1319,9 +1356,32 @@ fn emit_expr_inner(e: &Expr) -> String {
         ExprNode::Raise { value } => {
             format!("panic!(\"{{}}\", {})", emit_expr(value))
         }
-        // Catch-all for IR shapes not yet implemented. Each new runtime
-        // file in Phase 2 expands this until full coverage.
-        other => format!("/* TODO rust2: ExprNode::{:?} */", std::mem::discriminant(other)),
+        // Not reported: the struct literal a constructor ends in already starts every field the parent's `initialize` would
+        ExprNode::Super { .. } if current_emit_ctx().map(|c| c.in_constructor.get()).unwrap_or(false) => String::new(),
+        ExprNode::Let { name, value, body, .. } => {
+            let value_s = emit_expr(value);
+            let name_s = name.as_str().to_string();
+            if let Some(ty) = value.ty.clone() {
+                mark_local_var_ty(&name_s, ty);
+            }
+            declare_var(name_s.clone());
+            let body_s = emit_expr(body);
+            format!("{{ let {name_s} = {value_s}; {body_s} }}")
+        }
+        ExprNode::BeginRescue { body, rescues, else_branch: None, ensure: Some(en), .. }
+            if rescues.is_empty() && !contains_jump(body) =>
+        {
+            emit_ensure_only(body, en)
+        }
+        // Not with an ensure or an else: the ensure runs after the rescue's own body, which the closure has already left
+        ExprNode::BeginRescue { body, rescues, else_branch: None, ensure: None, .. }
+            if !rescues.is_empty()
+                && rescues.iter().all(|r| r.classes.iter().all(|c| matches!(&*c.node, ExprNode::Const { .. })))
+                && (in_return_tail() || !contains_jump(body)) =>
+        {
+            emit_begin_rescue(body, rescues)
+        }
+        other => crate::emit::diagnostics::report_unsupported(e.span, "rust", other.kind_str(), ""),
     }
 }
 
@@ -1344,7 +1404,7 @@ pub(super) fn arg_hash_var_local_ty(arg: &Expr) -> Option<(crate::ty::Ty, crate:
         _ => return None,
     };
     match local_var_ty(&name)? {
-        crate::ty::Ty::Hash { key, value } => Some((*key, *value)),
+        crate::ty::Ty::Hash { key, value } => Some((std::sync::Arc::unwrap_or_clone(key), std::sync::Arc::unwrap_or_clone(value))),
         _ => None,
     }
 }
@@ -1362,7 +1422,7 @@ pub(super) fn recv_var_back_propagated_hash_kv(recv: &Expr) -> Option<(crate::ty
         return None;
     }
     match local_var_ty(&name)? {
-        crate::ty::Ty::Hash { key, value } => Some((*key, *value)),
+        crate::ty::Ty::Hash { key, value } => Some((std::sync::Arc::unwrap_or_clone(key), std::sync::Arc::unwrap_or_clone(value))),
         _ => None,
     }
 }
@@ -1378,4 +1438,150 @@ pub(super) fn with_declared_vars_scope<R>(f: impl FnOnce() -> R) -> R {
     let r = f();
     *ctx.declared_vars.borrow_mut() = snapshot;
     r
+}
+
+fn emit_ensure_only(body: &Expr, ensure: &Expr) -> String {
+    let mut ensure_reads = crate::det::HashSet::default();
+    collect_var_reads(ensure, &mut ensure_reads);
+    let stmts: Vec<&Expr> = match &*body.node {
+        ExprNode::Seq { exprs } => exprs.iter().collect(),
+        _ => vec![body],
+    };
+    let mut lines = Vec::new();
+    for st in &stmts {
+        if let ExprNode::Assign { target: LValue::Var { name, .. }, value } = &*st.node {
+            let n = name.as_str().to_string();
+            if ensure_reads.contains(&n) && !is_declared_var(&n) {
+                let ty = value.ty.clone().unwrap_or(crate::ty::Ty::Untyped);
+                lines.push(format!("let mut {n}: {} = Default::default();", super::ty::rust_ty(&ty)));
+                mark_local_var_ty(&n, ty);
+                declare_var(n);
+            }
+        }
+    }
+    let body_s = with_declared_vars_scope(|| emit_expr(body));
+    let ensure_s = with_declared_vars_scope(|| emit_expr(ensure));
+    // Not a Drop guard: the ensure reads locals the body assigns, which a guard would hold borrowed across the body
+    lines.push(format!("let __ensured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{ {body_s} }}));"));
+    lines.push(format!("{ensure_s};"));
+    lines.push("match __ensured { Ok(__v) => __v, Err(__p) => std::panic::resume_unwind(__p) }".to_string());
+    format!("{{\n{}\n}}", lines.join("\n"))
+}
+
+fn collect_var_reads(e: &Expr, out: &mut crate::det::HashSet<String>) {
+    if let ExprNode::Var { name, .. } = &*e.node {
+        out.insert(name.as_str().to_string());
+    }
+    e.node.for_each_child(&mut |c| collect_var_reads(c, out));
+}
+
+// Not emitted inside the closure: a `return`/`break`/`next` there would leave the closure, not the method or loop it names
+fn contains_jump(e: &Expr) -> bool {
+    if matches!(&*e.node, ExprNode::Return { .. } | ExprNode::Break { .. } | ExprNode::Next { .. }) {
+        return true;
+    }
+    if matches!(&*e.node, ExprNode::Lambda { .. }) {
+        return false;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| found |= contains_jump(c));
+    found
+}
+
+thread_local! {
+    /// Locals bound to a rescued exception, `true` for the `Option` a `cause` read answers.
+    static RESCUED_VARS: std::cell::RefCell<crate::det::HashMap<String, bool>> = std::cell::RefCell::new(crate::det::HashMap::default());
+}
+
+fn rescued_var(e: &Expr) -> Option<(String, bool)> {
+    let ExprNode::Var { name, .. } = &*e.node else { return None };
+    RESCUED_VARS.with(|v| v.borrow().get(name.as_str()).map(|opt| (name.as_str().to_string(), *opt)))
+}
+
+fn rescued_cause(name: &str, opt: bool) -> String {
+    if opt { format!("{name}.as_ref().and_then(|__x| __x.cause())") } else { format!("{name}.cause()") }
+}
+
+fn rescued_expr(e: &Expr) -> Option<String> {
+    match &*e.node {
+        ExprNode::Assign { target: LValue::Var { name, .. }, value } => {
+            let ExprNode::Send { recv: Some(r), method, args, .. } = &*value.node else { return None };
+            let (rv, opt) = rescued_var(r)?;
+            if method.as_str() != "cause" || !args.is_empty() {
+                return None;
+            }
+            let cause = rescued_cause(&rv, opt);
+            let known = RESCUED_VARS.with(|v| v.borrow().get(name.as_str()).copied());
+            Some(match known {
+                Some(true) => format!("{name} = {cause}"),
+                _ => {
+                    RESCUED_VARS.with(|v| v.borrow_mut().insert(name.as_str().to_string(), true));
+                    format!("let mut {name}: Option<crate::errors_ext::Rescued> = {cause}")
+                }
+            })
+        }
+        ExprNode::Send { recv: Some(r), method, args, .. } => {
+            let (rv, opt) = rescued_var(r)?;
+            match (method.as_str(), args.as_slice()) {
+                ("cause", []) => Some(rescued_cause(&rv, opt)),
+                ("nil?", []) => Some(if opt { format!("{rv}.is_none()") } else { "false".to_string() }),
+                ("is_a?" | "kind_of?", [c]) => {
+                    let ExprNode::Const { path } = &*c.node else { return None };
+                    let class = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
+                    Some(if opt { format!("{rv}.as_ref().map_or(false, |__x| __x.is_a({class:?}))") } else { format!("{rv}.is_a({class:?})") })
+                }
+                ("message" | "to_s", []) => Some(if opt {
+                    format!("{rv}.as_ref().map(|__x| __x.message.clone()).unwrap_or_default()")
+                } else {
+                    format!("{rv}.message.clone()")
+                }),
+                _ => None,
+            }
+        }
+        ExprNode::Send { recv: None, method, args, .. } if method.as_str() == "raise" => match args.as_slice() {
+            [a] => match rescued_var(a)? {
+                (rv, false) => Some(format!("{rv}.raise()")),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn emit_begin_rescue(body: &Expr, rescues: &[crate::expr::RescueClause]) -> String {
+    let tail = in_return_tail();
+    let emit_arm = |x: &Expr| with_declared_vars_scope(|| if tail { emit_expr_tail(x) } else { emit_expr(x) });
+    let body_s = emit_arm(body);
+    let mut arms = Vec::new();
+    for r in rescues {
+        let classes: Vec<String> = if r.classes.is_empty() {
+            vec!["StandardError".to_string()]
+        } else {
+            r.classes
+                .iter()
+                .filter_map(|c| match &*c.node {
+                    ExprNode::Const { path } => Some(path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::")),
+                    _ => None,
+                })
+                .collect()
+        };
+        let cond = classes.iter().map(|c| format!("__e.is_a({c:?})")).collect::<Vec<_>>().join(" || ");
+        let saved = RESCUED_VARS.with(|v| v.borrow().clone());
+        let bind = match &r.binding {
+            Some(b) => {
+                RESCUED_VARS.with(|v| v.borrow_mut().insert(b.as_str().to_string(), false));
+                format!("let {b} = __e.clone();\n")
+            }
+            None => String::new(),
+        };
+        let rbody = emit_arm(&r.body);
+        RESCUED_VARS.with(|v| *v.borrow_mut() = saved);
+        arms.push(format!("if {cond} {{\n{bind}{rbody}\n}}"));
+    }
+    // Not a Drop guard or a Result: a Ruby raise is a panic here, and catch_unwind is what stops one
+    format!(
+        "match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{ {body_s} }})) {{\nOk(__v) => __v,\nErr(__p) => {{\nlet __e = crate::errors_ext::Rescued::from_panic(&*__p);\n{} else {{ std::panic::resume_unwind(__p) }}\n}}\n}}",
+        arms.join(" else ")
+    )
 }

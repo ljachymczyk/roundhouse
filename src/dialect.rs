@@ -140,6 +140,32 @@ impl Model {
         })
     }
 
+    /// The association on this model, the `through:` model, that
+    /// supplies the rows of `through_assoc`. This is Rails'
+    /// `source_reflection_names`: the `source:` name when it is given,
+    /// and otherwise the singular name, then the name itself. `None`
+    /// when no candidate is declared here, or when both are (Rails
+    /// raises `AmbiguousSourceReflectionForThroughAssociation`). Never
+    /// match the source by class: a model can have two associations to
+    /// one class, and each one gives other rows.
+    pub fn through_source(&self, through_assoc: &Association) -> Option<&Association> {
+        let Association::HasMany { name, source, .. } = through_assoc else { return None };
+        let mut candidates = match source {
+            Some(source) => vec![source.clone()],
+            None => vec![Symbol::from(crate::naming::singularize(name.as_str())), name.clone()],
+        };
+        candidates.dedup();
+        // A later declaration of a name replaces an earlier one, as in Rails.
+        let found = candidates
+            .iter()
+            .filter_map(|c| self.associations().filter(|a| a.name() == c).last())
+            .collect::<Vec<_>>();
+        match found.as_slice() {
+            [one] => Some(one),
+            _ => None,
+        }
+    }
+
     /// Like `associations()`, but paired with each declaration's source
     /// span — for lowerers that stamp synthesized methods with the
     /// `has_many`/`belongs_to` line they came from.
@@ -267,6 +293,27 @@ pub enum ModelBodyItem {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         leading_blank_line: bool,
     },
+    /// `alias new old` (keyword form), kept unresolved until after
+    /// synthesis. The model walk only sees hand-written `def`s and
+    /// enum-generated methods — columns, associations, `attr_accessor`
+    /// and `attribute` are synthesized later, in
+    /// `lower::model_to_library` — so resolving here would wrongly
+    /// refuse an alias naming any of those. `lower_model_to_library_class`
+    /// resolves it in body order (snapshot semantics: `old` is read as
+    /// defined AT THIS POINT, not as finally defined) and copies the
+    /// resolved `MethodDef` under `new`; an alias it can't resolve stays
+    /// a refusal (gap in survey mode, error in strict mode), same as an
+    /// ordinary unsupported construct.
+    Alias {
+        new: Symbol,
+        old: Symbol,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        leading_comments: Vec<Comment>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        leading_blank_line: bool,
+        #[serde(default, skip_serializing_if = "Span::is_synthetic")]
+        span: Span,
+    },
 }
 
 impl ModelBodyItem {
@@ -277,7 +324,8 @@ impl ModelBodyItem {
         match self {
             Self::Association { span, .. }
             | Self::Validation { span, .. }
-            | Self::Callback { span, .. } => *span,
+            | Self::Callback { span, .. }
+            | Self::Alias { span, .. } => *span,
             Self::Scope { scope, .. } => scope.body.span,
             Self::Method { method, .. } => method.body.span,
             Self::Unknown { expr, .. } => expr.span,
@@ -293,7 +341,8 @@ impl ModelBodyItem {
             | Self::Scope { leading_comments, .. }
             | Self::Callback { leading_comments, .. }
             | Self::Method { leading_comments, .. }
-            | Self::Unknown { leading_comments, .. } => leading_comments,
+            | Self::Unknown { leading_comments, .. }
+            | Self::Alias { leading_comments, .. } => leading_comments,
         }
     }
 
@@ -304,7 +353,8 @@ impl ModelBodyItem {
             | Self::Scope { leading_comments, .. }
             | Self::Callback { leading_comments, .. }
             | Self::Method { leading_comments, .. }
-            | Self::Unknown { leading_comments, .. } => leading_comments,
+            | Self::Unknown { leading_comments, .. }
+            | Self::Alias { leading_comments, .. } => leading_comments,
         }
     }
 
@@ -315,7 +365,8 @@ impl ModelBodyItem {
             | Self::Scope { leading_blank_line, .. }
             | Self::Callback { leading_blank_line, .. }
             | Self::Method { leading_blank_line, .. }
-            | Self::Unknown { leading_blank_line, .. } => *leading_blank_line,
+            | Self::Unknown { leading_blank_line, .. }
+            | Self::Alias { leading_blank_line, .. } => *leading_blank_line,
         }
     }
 
@@ -326,7 +377,8 @@ impl ModelBodyItem {
             | Self::Scope { leading_blank_line, .. }
             | Self::Callback { leading_blank_line, .. }
             | Self::Method { leading_blank_line, .. }
-            | Self::Unknown { leading_blank_line, .. } => *leading_blank_line = v,
+            | Self::Unknown { leading_blank_line, .. }
+            | Self::Alias { leading_blank_line, .. } => *leading_blank_line = v,
         }
     }
 }
@@ -389,6 +441,17 @@ pub enum Association {
         #[serde(default, skip_serializing_if = "is_false")]
         foreign_key_explicit: bool,
         through: Option<Symbol>,
+        /// The `source:` option as written. It names the association on
+        /// the `through:` model that supplies the rows. Read it through
+        /// [`Model::through_source`], which also covers an omitted
+        /// `source:`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<Symbol>,
+        /// Written with `class_name:` or `source_type:`. Otherwise app
+        /// assembly sets the `target` of a `through:` association to the
+        /// class of its source association, as Rails does.
+        #[serde(default, skip_serializing_if = "is_false")]
+        class_explicit: bool,
         dependent: Dependent,
         /// `has_many :notifications, as: :notifiable` — this side is
         /// one implementor of the named polymorphic interface; rows
@@ -524,6 +587,34 @@ pub enum Dependent {
 pub struct Validation {
     pub attribute: Symbol,
     pub rules: Vec<ValidationRule>,
+    /// `if: :pred` / `if: -> { … }` / `if: lambda { … }` / `if: proc { … }`.
+    /// A Symbol and a zero-arity lambda/proc both become the guard
+    /// expression `callback_condition` already builds for a callback:
+    /// a Symbol is the predicate called on the record, and a lambda
+    /// body is spliced where Rails `instance_exec`s it with `self` the
+    /// record. `None` runs the rules on every save. When both this and
+    /// `unless_cond` are set, the rules run only when `if:` holds and
+    /// `unless:` does not. Anything else (an arity>0 lambda, a String,
+    /// a captured local, a body survey mode had to stub with `nil`) is
+    /// not stored; ingest refuses the whole call instead of checking
+    /// unconditionally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_cond: Option<Expr>,
+    /// `unless:` — see `if_cond`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unless_cond: Option<Expr>,
+    /// A literal String `message:` from the rule's own hash, in place of
+    /// the default message for every error the rules record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Inclusive or exclusive numeric range from `inclusion: { in: 1..3 }`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InclusionRange {
+    pub begin: f64,
+    pub end: f64,
+    pub exclusive: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -531,10 +622,34 @@ pub struct Validation {
 pub enum ValidationRule {
     Presence,
     Absence,
-    Uniqueness { scope: Vec<Symbol>, case_sensitive: bool },
+    /// `acceptance: true` / `{ accept:, allow_nil: }`. `accept` holds the
+    /// literal values Rails' `AcceptanceValidator` accepts (its default is
+    /// `["1", true]`). `allow_nil` is from the validator's own hash or the
+    /// call (the hash wins); `None` is Rails' default, which for this
+    /// validator is `true`.
+    Acceptance {
+        accept: Vec<Literal>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allow_nil: Option<bool>,
+    },
+    /// `uniqueness: true` / `{ scope:, case_sensitive:, allow_nil:,
+    /// allow_blank: }`. `scope` holds the names as written; an
+    /// association name resolves to its foreign key when the check is
+    /// built. `case_sensitive: false` compares `LOWER(col) = LOWER(value)`.
+    Uniqueness {
+        scope: Vec<Symbol>,
+        case_sensitive: bool,
+        #[serde(default)]
+        allow_nil: bool,
+        #[serde(default)]
+        allow_blank: bool,
+    },
     Length {
         min: Option<u32>,
         max: Option<u32>,
+        /// `is:` — the one length Rails accepts (`wrong_length`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is: Option<u32>,
         /// `message:` override for the length failure text. Forced by
         /// the Sequel front-end (`validates_min_length 10, :body,
         /// message: "..."`); Rails' `length: { minimum: 10, message:
@@ -542,10 +657,79 @@ pub enum ValidationRule {
         /// the Rails default text.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
+        /// `allow_nil:` on the validator. `None` is Rails' default:
+        /// a nil value fails `:minimum` and is skipped for a lone
+        /// `:maximum`. `Some(true)` skips the check when the value
+        /// is nil. `Some(false)` fails both bounds on nil.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allow_nil: Option<bool>,
     },
-    Format { pattern: String },
-    Numericality { only_integer: bool, gt: Option<f64>, lt: Option<f64> },
-    Inclusion { values: Vec<Literal> },
+    Format {
+        pattern: String,
+        /// Ruby regex flags, restricted at ingest to the combinations
+        /// every emit target can reproduce with Ruby's exact meaning:
+        /// `i` (case-insensitive), `m` (Ruby's dot-matches-newline), or
+        /// both — never `x` (extended) or an encoding/`o` flag, which
+        /// stay a `format: with` survey gap instead. `#[serde(default)]`
+        /// so JSON written before this field existed still loads.
+        #[serde(default)]
+        flags: String,
+        /// `allow_nil:` / `allow_blank:`, from the validator's own hash
+        /// or the call (the hash wins). `None` is unset: Rails then
+        /// matches a nil or blank value's `to_s` like any other.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allow_nil: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allow_blank: Option<bool>,
+    },
+    Numericality {
+        only_integer: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gt: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lt: Option<f64>,
+        /// `greater_than_or_equal_to:` / `less_than_or_equal_to:`.
+        /// The store guide uses the inclusive floor. Strict bounds stay
+        /// `gt` / `lt`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gte: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lte: Option<f64>,
+        /// `allow_nil:` / `allow_blank:`, from the validator's own hash
+        /// or the call (the hash wins). `None` is unset: Rails then
+        /// validates a nil or blank value like any other.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allow_nil: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allow_blank: Option<bool>,
+        /// `in: a..b` / `a...b`: Rails' "must be in a..b" check.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        in_range: Option<InclusionRange>,
+    },
+    Inclusion {
+        values: Vec<Literal>,
+        /// `in: 1..3` / `1...3`. Numeric `Range#include?` is `cover?`,
+        /// so the endpoints stay a range instead of an expanded list.
+        /// `values` is empty when this is set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        range: Option<InclusionRange>,
+    },
+    /// `exclusion: { in: […] }` / `validates_exclusion_of`: the value
+    /// must NOT be one of `values`, or, with `range`, must not be covered
+    /// by it. `nil` is reserved only when it's listed (no implicit
+    /// `allow_nil`), never by a range. Rails' message is "is reserved".
+    Exclusion {
+        values: Vec<Literal>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        range: Option<InclusionRange>,
+    },
+    /// `inclusion: { in: ->(record) { … } }`, `in: -> { … }` or `in: :method`:
+    /// the set Rails asks for at validation time, with the record as
+    /// `self` (a lambda's parameter is `self`). `set.include?(value)`
+    /// decides, so a nil set raises `NoMethodError` as it does in Rails.
+    InclusionCall { set: Expr },
+    /// `exclusion:` with a callable `in:`, as `InclusionCall`.
+    ExclusionCall { set: Expr },
     Custom {
         method: Symbol,
         /// `validate :m, if: :pred` / `unless: :pred` — the instance
@@ -614,6 +798,9 @@ pub enum CallbackHook {
     /// name and fires it in the right two places.
     AfterSaveCommit,
     AfterRollback,
+    /// `after_initialize :set_salt` — runs on construction and on load,
+    /// the same `def after_initialize` the block form lowers to.
+    AfterInitialize,
 }
 
 /// A formal parameter on a `MethodDef`. Carries the parameter name, an
@@ -900,6 +1087,15 @@ pub struct LibraryClass {
     /// (e.g. `Enumerable`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub includes: Vec<ClassId>,
+    /// Span of each `include` call in `includes`, same length and
+    /// order. Ingest drops the call's own span once it resolves the
+    /// name (most of the time it's never needed again), so an
+    /// unresolved include had nowhere to point a diagnostic at; this
+    /// gives it one. Synthesized classes and a literal `LibraryClass`
+    /// built by a lowering (not ingested from source) carry an empty
+    /// vec, same as a missing `parent_span`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include_spans: Vec<Span>,
     /// All instance + class methods in the class. `attr_reader` /
     /// `attr_writer` / `attr_accessor` are lowered to synthetic
     /// `MethodDef`s at ingest time (not preserved as attr declarations
@@ -964,11 +1160,24 @@ pub struct LibraryClass {
     /// does), so these replay ahead of the method definitions. That
     /// makes position-sensitive markers unsafe to capture — see the
     /// visibility deny-list at the ingest site.
+    /// Class-body `if` / `unless` statements whose branches define
+    /// methods. See [`ConditionalDefinitions`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditional_definitions: Vec<ConditionalDefinitions>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unknown_calls: Vec<Expr>,
 }
 
 impl LibraryClass {
+    /// The members and the `Data.define` span of a class that a
+    /// file-level `X = Data.define(…)` creates.
+    pub fn data_define(&self) -> Option<(&[Symbol], Span)> {
+        match &self.origin {
+            Some(LibraryClassOrigin::DataDefine { members, span }) => Some((members, *span)),
+            _ => None,
+        }
+    }
+
     /// Direct source `@ivar` / compound `@ivar` writes — the shapes that
     /// need source-ordered emission. Synthetic `mattr_*` / `cattr_*` `@@`
     /// seeds and other framework initialization stay on the partitioned
@@ -988,6 +1197,18 @@ impl LibraryClass {
                 )
         })
     }
+}
+
+/// One property of a [`LibraryClassOrigin::RepresentableDecorator`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RepresentableField {
+    /// The property name; its value is read by `representable_<name>`.
+    pub name: Symbol,
+    /// The JSON key (`as:`, else the name).
+    pub key: String,
+    /// The representer `extend:` names, when the value is rendered by
+    /// another one.
+    pub nested: Option<ClassId>,
 }
 
 /// What synthesized a `LibraryClass`. Used by per-target collapsers to
@@ -1010,6 +1231,22 @@ pub enum LibraryClassOrigin {
     /// alone. This remains a source library class, not a model/params sibling.
     AlbaResource {
         declaration_span: Span,
+    },
+    /// A `Representable::Decorator` expanded to ordinary methods before
+    /// inference (`ingest::representable`): `representable_<name>`
+    /// readers, `to_hash`, `as_json_str`. `fields` lets
+    /// `lower::as_json_poro` settle each value's JSON encoder from its
+    /// analyzed type.
+    RepresentableDecorator {
+        declaration_span: Span,
+        fields: Vec<RepresentableField>,
+    },
+    /// An `ActiveModel::Serializer` expanded by
+    /// `ingest::active_model_serializer`: its attributes, in declaration
+    /// order (each read by `ams_<name>`).
+    ActiveModelSerializer {
+        declaration_span: Span,
+        fields: Vec<Symbol>,
     },
     /// Per-resource params holder synthesized from a controller's
     /// `permit([:f1, :f2, …])` declaration. `resource` is the singular
@@ -1041,11 +1278,38 @@ pub enum LibraryClassOrigin {
     StructConstant {
         members: Vec<Symbol>,
         keyword_init: bool,
+        /// `keyword_init: false` written out: Ruby then passes a keyword
+        /// call as one Hash to the first member, as the positional
+        /// constructor does. Omitted, Ruby binds keywords by member name.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        positional_written: bool,
     },
     /// A `Dry::Struct` class lowered into its readers and constructor
     /// (`ingest::dry_struct`). Carried so a target can tell the coercions
     /// it generated from the app's own code.
     DryStruct,
+    /// A `Dry::Initializer` class given its constructor and readers
+    /// (`ingest::dry_initializer`), for the same reason.
+    DryInitializer,
+    /// A `Dry::Validation::Contract` given its `call`, a `Dry::Schema`
+    /// constant's class, or what they share (`ingest::dry_validation`).
+    DryValidation,
+    /// dry-monads' Result and do-notation stand-ins (`ingest::dry_monads`).
+    DryMonads,
+    /// The class a file-level `X = Data.define(:a, :b)` creates, in a
+    /// file that declares nothing else. `members` are the literal
+    /// Symbol members in declaration order; `span` is the
+    /// `Data.define` call. The statements of a `do … end` block are the
+    /// class body, and its constants are the class's `constants`. Ruby
+    /// runs the block with `self` as the class, but with the top level
+    /// as its lexical scope. Ruby and Spinel emit the factory again;
+    /// other targets have no Data representation and reject it.
+    DataDefine {
+        members: Vec<Symbol>,
+        span: Span,
+    },
+    /// The `Oj` stand-in an app under `Oj.mimic_JSON` reaches (`ingest::oj`).
+    Oj,
 }
 
 /// A graphql-ruby object type (a class descending from
@@ -1723,6 +1987,18 @@ impl ResourceScope {
 /// Surface forms of a routes.rb entry. Preserves source structure so
 /// `resources :articles do ... end` round-trips byte-for-byte; a downstream
 /// target emitter that needs concrete routes expands via [`RouteSpec::expand`].
+/// The `constraints` key of a route's requirement on its `(.:format)`
+/// extension (`constraints: { format: /csv|json/ }`, `format: false`).
+/// Kept apart from `format`, which there is the route's forced response
+/// format (`format: "rss"`, `defaults: { format: :json }`): Rails keeps a
+/// requirement and a default apart, and a requirement forces nothing on
+/// a request that sends no extension. Not a name a path param can take.
+pub const FORMAT_REQUIREMENT: &str = "(.:format)";
+
+/// The `FORMAT_REQUIREMENT` value of `format: false`: no extension is
+/// accepted. Not a regex source; the route lowering knows it by name.
+pub const FORMAT_NONE: &str = "";
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RouteSpec {
@@ -1895,9 +2171,10 @@ pub struct View {
     /// for the overwhelmingly common headerless partial/view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict_locals: Option<Vec<Param>>,
-    /// Ingested for the analyzer only — a mailer's `.text.erb` variant
-    /// and the mailer layout: templates whose Ruby the type checks and
-    /// the IDE should see, but which no emitter renders yet.
+    /// Ingested for the analyzer only: a template whose Ruby the type
+    /// checks and the IDE should see, but which no emitter renders. No
+    /// ingest sets it today (a mailer's `.text.erb` renders, through
+    /// `lower::mailer_templates`).
     /// `session::analyze_and_lower` drops them before lowering;
     /// `check`, the LSP and the MCP keep them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1975,11 +2252,26 @@ impl TestModule {
     /// a `def` of its own or of a test class it inherits from (among
     /// `modules`), before the framework's method of that name. A `def
     /// self.<method>` is not one: the call is sent to the test instance.
+    /// The instance methods of the carried modules this class includes
+    /// (`include LinkHelper` with `LinkHelper` among `inner_classes`):
+    /// the class answers them as its own, as Ruby's `include` makes it.
+    pub fn included_module_methods(&self) -> impl Iterator<Item = &Symbol> + '_ {
+        self.inner_classes
+            .iter()
+            .filter(|lc| lc.is_module && self.includes.contains(&lc.name))
+            .flat_map(|lc| lc.methods.iter())
+            .filter(|m| m.receiver == MethodReceiver::Instance)
+            .map(|m| &m.name)
+    }
+
     pub fn defines_instance_method(&self, modules: &[TestModule], method: &str) -> bool {
         let mut current = Some(self);
         for _ in 0..32 {
             let Some(tm) = current else { break };
             if tm.helpers.iter().any(|helper| helper.name.as_str() == method && helper.receiver == MethodReceiver::Instance) {
+                return true;
+            }
+            if tm.included_module_methods().any(|name| name.as_str() == method) {
                 return true;
             }
             current = tm.parent.as_ref()
@@ -2104,16 +2396,16 @@ impl Fixture {
     pub(crate) fn accessor_signature(&self, models: &[Model]) -> Ty {
         let class = self.class_id();
         let ret = models.iter().find(|model| model.name == class)
-            .map(|model| Ty::Class { id: model.name.clone(), args: vec![] })
+            .map(|model| Ty::Class { id: model.name.clone(), args: vec![].into() })
             .unwrap_or(Ty::Untyped);
         Ty::Fn {
             params: vec![crate::ty::Param {
                 name: Symbol::from("name"),
-                ty: Ty::Sym,
+                ty: Ty::Sym.into(),
                 kind: crate::ty::ParamKind::Required,
-            }],
+            }].into(),
             block: None,
-            ret: Box::new(ret),
+            ret: std::sync::Arc::new(ret),
             effects: EffectSet::pure(),
         }
     }
@@ -2125,10 +2417,130 @@ pub fn enum_reads_label(model: &Model, column: &Symbol) -> bool {
 }
 
 // Not every string mapping: one whose labels are its values (`%w[…].index_by(&:itself)`) reads the column as it is.
+// One `nil` value is the label of a NULL column (`unknown: nil`): Rails' `EnumType#deserialize` is `mapping.key(value)`.
 pub fn enum_mapping_reads_label(m: &[(String, crate::expr::Literal)]) -> bool {
     use crate::expr::Literal;
-    !m.is_empty()
+    let nils = m.iter().filter(|(_, v)| matches!(v, Literal::Nil)).count();
+    let m: Vec<&(String, Literal)> = m.iter().filter(|(_, v)| !matches!(v, Literal::Nil)).collect();
+    // A mapping of the `nil` entry alone (`{ unknown: nil }`) reads its label too:
+    // NULL is `"unknown"`, and a stored value no label names reads as nil.
+    if nils == 1 && m.is_empty() {
+        return true;
+    }
+    nils <= 1
+        && !m.is_empty()
         && (m.iter().all(|(_, v)| matches!(v, Literal::Int { .. }))
             || (m.iter().all(|(_, v)| matches!(v, Literal::Str { .. }))
-                && m.iter().any(|(l, v)| !matches!(v, Literal::Str { value } if value == l))))
+                && (nils == 1 || m.iter().any(|(l, v)| !matches!(v, Literal::Str { value } if value == l)))))
+}
+
+/// The label an enum mapping gives a NULL column (`unknown: nil`), if any.
+pub fn enum_nil_label(m: &[(String, crate::expr::Literal)]) -> Option<&str> {
+    m.iter().find(|(_, v)| matches!(v, crate::expr::Literal::Nil)).map(|(l, _)| l.as_str())
+}
+
+/// A class-body (or `class << self`) `if` / `elsif` / `else` or `unless`
+/// / `else` whose branches hold only method definitions:
+///
+/// ```ruby
+/// class << self
+///   if Rails.env.test?
+///     def diagnostic_sampling = "test"
+///   else
+///     def diagnostic_sampling = "other"
+///   end
+/// end
+/// ```
+///
+/// Ruby evaluates the condition when the body runs, at load time, and
+/// only the selected branch defines its methods. Every branch's methods
+/// are ordinary entries of `LibraryClass::methods`, so analysis types
+/// each of them; this record says which branch each belongs to. The Ruby
+/// family writes the conditional around them, where its first member
+/// stands, so the selected branch defines the method as in the source.
+/// Other targets refuse the class by name: they would define every
+/// branch's methods, the last one winning.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ConditionalDefinitions {
+    /// The whole `if` / `unless` statement.
+    pub span: Span,
+    /// `unless`: the first branch runs when its condition is falsy.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub negated: bool,
+    /// The branches in source order: `if`, each `elsif`, then `else`
+    /// (no condition). A branch that defines nothing is kept, so the
+    /// emitted conditional selects what the source selects.
+    pub arms: Vec<ConditionalArm>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ConditionalArm {
+    /// `None` for the `else` branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<Expr>,
+    /// The `methods` entries this branch defines, by identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<ConditionalMember>,
+    /// The load-time conditionals nested in this branch, which Ruby
+    /// evaluates only when the branch runs; written inside it, ordered by
+    /// their start among the branch's methods.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested: Vec<ConditionalDefinitions>,
+    /// The classes and modules this branch declares, in source order.
+    /// Each is an ordinary library class (with what it nests), so analysis
+    /// types it; the Ruby family loads its file inside the branch, so it
+    /// exists only when Ruby runs the branch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declarations: Vec<ConditionalDeclaration>,
+}
+
+/// A `class` / `module` statement in a [`ConditionalArm`]: the name it
+/// declares, qualified, and where the statement starts, which orders it
+/// among the branch's methods.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConditionalDeclaration {
+    pub name: ClassId,
+    pub start: u32,
+}
+
+impl ConditionalDefinitions {
+    /// The names every branch (and every nested conditional) declares.
+    pub fn declared_names(&self) -> Vec<&ClassId> {
+        let mut out = Vec::new();
+        for arm in &self.arms {
+            out.extend(arm.declarations.iter().map(|d| &d.name));
+            for nested in &arm.nested {
+                out.extend(nested.declared_names());
+            }
+        }
+        out
+    }
+}
+
+/// One method a [`ConditionalArm`] defines: its name, side and the span
+/// of its name in the `def` header, which tells it from another branch's
+/// definition of the same name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConditionalMember {
+    pub name: Symbol,
+    pub receiver: MethodReceiver,
+    pub name_span: Span,
+}
+
+impl ConditionalMember {
+    pub fn of(method: &MethodDef) -> Self {
+        Self { name: method.name.clone(), receiver: method.receiver, name_span: method.name_span }
+    }
+
+    pub fn is(&self, method: &MethodDef) -> bool {
+        self.name == method.name && self.receiver == method.receiver && self.name_span == method.name_span
+    }
+}
+
+impl ConditionalDefinitions {
+    /// Whether a branch of this statement, or of a conditional nested in
+    /// one, defines `method`.
+    pub fn contains(&self, method: &MethodDef) -> bool {
+        self.arms.iter().any(|arm| arm.methods.iter().any(|m| m.is(method)) || arm.nested.iter().any(|n| n.contains(method)))
+    }
 }

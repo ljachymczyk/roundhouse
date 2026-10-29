@@ -28,6 +28,7 @@ use crate::ty::Ty;
 use super::util::{bool_value, constant_id_str, string_value, symbol_or_string_value, symbol_value};
 use super::IngestResult;
 
+use crate::ingest::prism_api::PrismLocation;
 pub(super) fn expand_delegated_type_decl(
     call: &ruby_prism::CallNode<'_>,
     file: &str,
@@ -354,10 +355,10 @@ fn expand(decl: Declaration, leading_comments: &[Comment]) -> Vec<ModelBodyItem>
             variants: vec![
                 Ty::Class {
                     id: ClassId(Symbol::from(type_name.as_str())),
-                    args: vec![],
+                    args: vec![].into(),
                 },
                 Ty::Nil,
-            ],
+            ].into(),
         };
         items.push(instance_method_typed(
             singular.clone(),
@@ -521,9 +522,9 @@ fn instance_method_typed(name: String, body: Expr, ret: Ty) -> ModelBodyItem {
         MethodReceiver::Instance,
         body,
         Some(Ty::Fn {
-            params: Vec::new(),
+            params: Vec::new().into(),
             block: None,
-            ret: Box::new(ret),
+            ret: std::sync::Arc::new(ret),
             effects: EffectSet::pure(),
         }),
     )

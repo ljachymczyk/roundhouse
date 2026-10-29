@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # ActiveRecord::ConnectionNotEstablished — named by `rescue_from
 # ActiveRecord::ConnectionNotEstablished` (lobsters answers it with a
 # plain-text 500). Nothing here raises it: the emitted `Db` opens its
@@ -12,5 +13,13 @@
 # targets and spinel AOT share.
 module ActiveRecord
   class ConnectionNotEstablished < StandardError
+  end
+
+  # A failed open and a timed-out open. Both are
+  # ConnectionNotEstablished, so a rescue of the parent catches them.
+  class ConnectionFailed < ConnectionNotEstablished
+  end
+
+  class ConnectionTimeoutError < ConnectionNotEstablished
   end
 end

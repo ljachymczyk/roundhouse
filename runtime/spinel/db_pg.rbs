@@ -70,7 +70,16 @@ class PgConn
   @named: Array[PgNamed]
   @name_serial: Integer
   @last_insert_table: String
+  @qc_on: bool
+  @qc_by_sql: Hash[String, PgResult]
+  QC_CAPTURE_ROWS: Integer
   def initialize: (PgConfig config) -> void
+  def qc_on?: () -> bool
+  def qc_begin: () -> nil
+  def qc_end: () -> nil
+  def qc_clear: () -> nil
+  def qc_lookup: (String sql) -> Integer
+  def qc_store: (PgStmt st) -> nil
   def client: () -> PgClientCore
   def changes: () -> Integer
   def last_tag: () -> String
@@ -123,6 +132,8 @@ module Db
   def self.in_lease?: () -> bool
   def self.pin_transaction: (PgConn conn) -> nil
   def self.with_connection: [T] () { () -> T } -> T
+  def self.without_foreign_keys: [T] () { () -> T } -> T
+  def self.check_foreign_keys!: () -> nil
   def self.read_snapshot_begin: () -> bool
   def self.read_snapshot_end: () -> bool
   def self.checkpoint_in_background!: () -> nil

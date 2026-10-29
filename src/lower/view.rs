@@ -168,10 +168,16 @@ pub enum RenderPartial<'a> {
         /// `cached: true` — Rails' collection cache. The concatenated
         /// partials are stored under one key (each element's
         /// `cache_key_with_version`) so a warm campfire room page is
-        /// one `read_str`, not 40 fragment lookups. A proc / non-true
-        /// value is declined: that shape customizes the key and is
-        /// not modeled.
+        /// one `read_str`, not 40 fragment lookups.
         cached: bool,
+        /// `cached: ->(item) { key }` — Rails' collection cache with a
+        /// callable key: each element's fragment is stored under the
+        /// key the lambda answers, and the collection is preloaded
+        /// first because the key may read associations (campfire's
+        /// `message_fragment_cache_key`). Any other non-true value (a
+        /// `{ key:, expires_in: }` hash) is not modeled and renders
+        /// uncached.
+        cached_key: Option<&'a Expr>,
     },
     /// `render partial: @above` — the partial NAME is a runtime value
     /// (an ivar/local), not a literal, so it can't be resolved to one
@@ -327,6 +333,32 @@ pub fn classify_render_partial<'a>(
     }
 }
 
+/// The formats a `render partial: "x", formats: [:xml, :html]` names, in
+/// order. Rails looks the partial up in exactly those formats for that
+/// render (`ActionView::Base#in_rendering_context`): they replace the
+/// lookup's (`LookupContext#with_prepended_formats`), so neither the
+/// rendering template's own format nor html follows them. A list with a
+/// runtime element is not one a static lowering can read.
+pub fn render_formats_option(args: &[Expr]) -> Option<Vec<&str>> {
+    let [arg] = args else { return None };
+    let ExprNode::Hash { entries, .. } = &*arg.node else { return None };
+    let (_, value) = entries.iter().find(|(k, _)| {
+        matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "formats")
+    })?;
+    let elements = match &*value.node {
+        ExprNode::Array { elements, .. } => elements.as_slice(),
+        _ => std::slice::from_ref(value),
+    };
+    let formats = elements
+        .iter()
+        .map(|e| match &*e.node {
+            ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!formats.is_empty()).then_some(formats)
+}
+
 /// `render layout: "<path>"[, locals: { … }] do … end` from its kwarg
 /// hash. A hash with no `layout:` key returns `None` — the block-form
 /// renders this lowering does not model stay unrecognized rather than
@@ -379,6 +411,7 @@ fn classify_render_kwargs(entries: &[(Expr, Expr)]) -> Option<RenderPartial<'_>>
     let mut first_local: Option<&Expr> = None;
     let mut locals_entries: Option<&[(Expr, Expr)]> = None;
     let mut cached = false;
+    let mut cached_key: Option<&Expr> = None;
     for (k, v) in entries {
         match key_of(k).as_deref() {
             Some("partial") => match &*v.node {
@@ -402,9 +435,14 @@ fn classify_render_kwargs(entries: &[(Expr, Expr)]) -> Option<RenderPartial<'_>>
                     as_name = Some(value.as_str());
                 }
             }
-            Some("cached") => {
-                cached = matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { value: true } });
-            }
+            // Which formats the partial is looked up in, not a local
+            // (`render_formats_option`).
+            Some("formats") => {}
+            Some("cached") => match &*v.node {
+                ExprNode::Lit { value: Literal::Bool { value: true } } => cached = true,
+                ExprNode::Lambda { params, .. } if params.len() == 1 => cached_key = Some(v),
+                _ => {}
+            },
             // An explicit `locals: {…}` hash — keep the entries so the
             // emitter can bind record + extra locals by name.
             Some("locals") => {
@@ -448,6 +486,7 @@ fn classify_render_kwargs(entries: &[(Expr, Expr)]) -> Option<RenderPartial<'_>>
             as_name,
             locals: locals_entries,
             cached,
+            cached_key,
         })
     } else {
         Some(RenderPartial::Named {
@@ -654,6 +693,16 @@ pub enum FormBuilderMethod {
     Button,
     UrlField,
     EmailField,
+    /// `number_field` / `range_field` / `search_field` /
+    /// `telephone_field` (alias `phone_field`): Rails' `Tags::TextField`
+    /// subclasses, the same `<input>` under another `type`. The options
+    /// their `render` rewrites (`in:`/`within:` → `min`/`max`;
+    /// `autosave:`/`onsearch:`) are refused at analyze
+    /// (`unlowered_form_builder_calls`).
+    NumberField,
+    RangeField,
+    SearchField,
+    TelephoneField,
     FileField,
     RichTextArea,
     /// `form.fields_for :settings, obj do |nested| … end` — Rails'
@@ -706,10 +755,14 @@ pub fn renders_through_view_path(format: &str) -> bool {
     // `<action>_txt`. Paired with the ingest gate in `ingest::app`'s
     // `walk_erb` the same way `svg`/`json` are: a format admitted only
     // here or only there is silently dropped in between.
+    // `css`: joins them the same way — a CSS responder with no html
+    // sibling (Mastodon's `custom_css#show`), as `<action>_css`.
+    // `text`: a mailer's plain-text part and its layout, as
+    // `<action>_text`, which `lower::mailer_templates` renders.
     matches!(
         format,
         "html" | "turbo_stream" | "svg" | "rss" | "atom" | "xml" | "xls" | "json" | "js" | "pdf"
-            | "csv" | "txt"
+            | "csv" | "txt" | "css" | "md" | "text"
     )
 }
 
@@ -731,6 +784,21 @@ pub fn view_output_stem(v: &crate::dialect::View) -> String {
         v.name.as_str().to_string()
     } else {
         format!("{}_{}", v.name.as_str(), v.format.as_str())
+    }
+}
+
+/// The template a fragment key names (`articles/_note`), format-qualified
+/// when it is not the html one: `_note.turbo_stream.erb` keys under
+/// `articles/_note.turbo_stream`. Rails names it by its digest path,
+/// `articles/_note:<digest>`, and the digest is the variant's own source,
+/// so the html and turbo_stream fragments of one record never meet.
+/// Without a digest (`walker::cache_key_parts`) the format is what keeps
+/// them apart. The html template keeps the bare path its keys always had.
+pub fn fragment_template_path(path: &str, format: &str) -> String {
+    if format == "html" {
+        path.to_string()
+    } else {
+        format!("{path}.{format}")
     }
 }
 
@@ -774,6 +842,10 @@ pub fn classify_form_builder_method(method: &str) -> Option<FormBuilderMethod> {
         "button" => Some(FormBuilderMethod::Button),
         "url_field" => Some(FormBuilderMethod::UrlField),
         "email_field" => Some(FormBuilderMethod::EmailField),
+        "number_field" => Some(FormBuilderMethod::NumberField),
+        "range_field" => Some(FormBuilderMethod::RangeField),
+        "search_field" => Some(FormBuilderMethod::SearchField),
+        "telephone_field" | "phone_field" => Some(FormBuilderMethod::TelephoneField),
         // The INPUT TAG only. Receiving the upload is Active Storage,
         // which is deferred by design — but rendering `<input
         // type="file">` needs none of it, and without this the call
@@ -787,6 +859,36 @@ pub fn classify_form_builder_method(method: &str) -> Option<FormBuilderMethod> {
         // unbound, which is a NameError on every render of the page.
         "rich_text_area" | "rich_textarea" => Some(FormBuilderMethod::RichTextArea),
         _ => None,
+    }
+}
+
+/// The builder methods Rails' default `field_error_proc` wraps in
+/// `<div class="field_with_errors">` when their field has errors: every
+/// control that goes through `Tags::Base#tag`, and the label. A hidden
+/// field, a button, the submit and Action Text's editor are not.
+pub fn wraps_field_errors(method: &str) -> bool {
+    classify_form_builder_method(method).is_some_and(FormBuilderMethod::wraps_field_errors)
+}
+
+impl FormBuilderMethod {
+    pub fn wraps_field_errors(self) -> bool {
+        matches!(
+            self,
+            FormBuilderMethod::Label
+                | FormBuilderMethod::TextField
+                | FormBuilderMethod::TextArea
+                | FormBuilderMethod::PasswordField
+                | FormBuilderMethod::CheckBox
+                | FormBuilderMethod::RadioButton
+                | FormBuilderMethod::Select
+                | FormBuilderMethod::UrlField
+                | FormBuilderMethod::EmailField
+                | FormBuilderMethod::NumberField
+                | FormBuilderMethod::RangeField
+                | FormBuilderMethod::SearchField
+                | FormBuilderMethod::TelephoneField
+                | FormBuilderMethod::FileField
+        )
     }
 }
 

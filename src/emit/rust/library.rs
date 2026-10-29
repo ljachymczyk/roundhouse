@@ -47,10 +47,12 @@ pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
         parent: None,
         parent_span: Default::default(),
         includes: Vec::new(),
+        include_spans: Vec::new(),
         methods: std::mem::take(&mut colored),
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     }];
@@ -89,6 +91,8 @@ pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
 /// Subsequent commits drive the per-ExprNode body emit until the
 /// produced Rust is `cargo check`-clean.
 pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
+    // Not for a class: a bare constant in a module body is the module's own nested class, the shape runtime modules raise
+    super::expr::set_current_ruby_class_name(if class.is_module { class.name.0.as_str() } else { "" });
     // Strip the namespace prefix (`ActiveSupport::HashWithIndifferentAccess`
     // → `HashWithIndifferentAccess`). Rust uses file-as-module, so the
     // namespace is carried by the file path, not the struct name.
@@ -126,7 +130,7 @@ pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
     // case: pure value-transformation, no instance state. The
     // companion call-site rewrite in `expr.rs::emit_send` routes
     // `self.method(args)` for these methods to `Self::method(args)`.
-    let static_method_names: std::collections::HashSet<String> = class
+    let static_method_names: crate::det::HashSet<String> = class
         .methods
         .iter()
         .filter(|m| {
@@ -164,7 +168,7 @@ pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
     // closure. Build the per-class mutating-name set from the flags
     // for the `static_method_names` exclusion check + the existing
     // call-site method-mutates logic that the body emit consults.
-    let mutating_methods: std::collections::HashSet<String> = class
+    let mutating_methods: crate::det::HashSet<String> = class
         .methods
         .iter()
         .filter(|m| m.mutates_self)
@@ -221,7 +225,7 @@ pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
     // commonly `self.body = ""` where field is `String` and `""` is
     // `&str`. Empty outside class-body scope; scoped per-class to
     // prevent bleeding between siblings.
-    let ivar_type_map: std::collections::HashMap<String, Ty> =
+    let ivar_type_map: crate::det::HashMap<String, Ty> =
         ivars.iter().cloned().collect();
     let class_method_param_tys = collect_class_method_param_tys(&class.methods);
     let body_result = super::expr::with_class_method_param_tys(class_method_param_tys, || super::expr::with_ivar_types(ivar_type_map, || super::expr::with_static_methods(static_method_names.clone(), || {
@@ -372,7 +376,7 @@ fn emit_module_singleton(
         out.push('\n');
     }
     writeln!(out, "impl {name} {{").unwrap();
-    let ivar_type_map: std::collections::HashMap<String, Ty> =
+    let ivar_type_map: crate::det::HashMap<String, Ty> =
         ivars.iter().cloned().collect();
     let class_method_param_tys = collect_class_method_param_tys(&class.methods);
     let body_result = super::expr::with_class_method_param_tys(class_method_param_tys, || super::expr::with_module_singleton(true, thread_local, || {
@@ -486,7 +490,12 @@ fn method_reads_self(body: &Expr) -> bool {
                 walk(scrutinee) || arms.iter().any(|a| walk(&a.body))
             }
             ExprNode::Cast { value, .. } => walk(value),
-            _ => false,
+            // Not false for the rest: a begin/rescue or any other node holding a self read still makes the method an instance one
+            _ => {
+                let mut found = false;
+                e.node.for_each_child(&mut |c| found |= walk(c));
+                found
+            }
         }
     }
     walk(body)
@@ -503,15 +512,15 @@ fn method_reads_self(body: &Expr) -> bool {
 /// lookup in emit_send for `Self::method(args)` calls.
 fn collect_class_method_param_tys(
     methods: &[MethodDef],
-) -> std::collections::HashMap<String, Vec<Ty>> {
+) -> crate::det::HashMap<String, Vec<Ty>> {
     use crate::ty::ParamKind;
-    let mut out = std::collections::HashMap::new();
+    let mut out = crate::det::HashMap::default();
     for m in methods {
         let tys: Vec<Ty> = match m.signature.as_ref() {
             Some(Ty::Fn { params, .. }) => params
                 .iter()
                 .filter(|p| !matches!(p.kind, ParamKind::Block | ParamKind::KeywordRest))
-                .map(|p| p.ty.clone())
+                .map(|p| (*p.ty).clone())
                 .collect(),
             _ => continue,
         };
@@ -549,12 +558,12 @@ fn collect_ivar_types(methods: &[MethodDef]) -> Vec<(String, Ty)> {
     // by writes get widened by re-observation and break framework
     // runtime emit (e.g. `Base.flash` typed Option<Flash> mistakenly).
     let mut order: Vec<String> = Vec::new();
-    let mut observed: std::collections::HashMap<String, Vec<Ty>> =
-        std::collections::HashMap::new();
+    let mut observed: crate::det::HashMap<String, Vec<Ty>> =
+        crate::det::HashMap::default();
     for m in methods {
         walk_collect_ivars(&m.body, &mut order, &mut observed);
     }
-    let written: std::collections::HashSet<String> =
+    let written: crate::det::HashSet<String> =
         observed.keys().cloned().collect();
     for m in methods {
         walk_collect_ivar_reads(&m.body, &written, &mut order, &mut observed);
@@ -594,7 +603,7 @@ fn unify_ivar_tys(tys: &[Ty]) -> Ty {
                 t
             }
             Some(t) => Ty::Union {
-                variants: vec![Ty::Nil, t],
+                variants: vec![Ty::Nil, t].into(),
             },
             // Nil-only ivar (e.g. `@location = nil` with no other
             // assignments visible in the class body) — widen to
@@ -602,7 +611,7 @@ fn unify_ivar_tys(tys: &[Ty]) -> Ty {
             // value-typed payload without an E0308. Without widening
             // the field types as `()` and every other path fails.
             None => Ty::Union {
-                variants: vec![Ty::Nil, Ty::Untyped],
+                variants: vec![Ty::Nil, Ty::Untyped].into(),
             },
         }
     } else {
@@ -638,13 +647,13 @@ fn unify_ivar_tys(tys: &[Ty]) -> Ty {
 fn walk_collect_ivars(
     e: &Expr,
     order: &mut Vec<String>,
-    observed: &mut std::collections::HashMap<String, Vec<Ty>>,
+    observed: &mut crate::det::HashMap<String, Vec<Ty>>,
 ) {
     fn record(
         name: &str,
         ty: Ty,
         order: &mut Vec<String>,
-        observed: &mut std::collections::HashMap<String, Vec<Ty>>,
+        observed: &mut crate::det::HashMap<String, Vec<Ty>>,
     ) {
         let k = name.to_string();
         if !order.iter().any(|n| n == &k) {
@@ -688,7 +697,7 @@ fn walk_collect_ivars(
                 record(
                     name.as_str(),
                     Ty::Array {
-                        elem: Box::new(elem),
+                        elem: std::sync::Arc::new(elem),
                     },
                     order,
                     observed,
@@ -712,8 +721,8 @@ fn walk_collect_ivars(
                     record(
                         key,
                         Ty::Hash {
-                            key: Box::new(k_ty),
-                            value: Box::new(v_ty),
+                            key: std::sync::Arc::new(k_ty),
+                            value: std::sync::Arc::new(v_ty),
                         },
                         order,
                         observed,
@@ -752,15 +761,15 @@ fn walk_collect_ivars(
 /// this pass entirely — the write-based ty rules already cover them.
 fn walk_collect_ivar_reads(
     e: &Expr,
-    written: &std::collections::HashSet<String>,
+    written: &crate::det::HashSet<String>,
     order: &mut Vec<String>,
-    observed: &mut std::collections::HashMap<String, Vec<Ty>>,
+    observed: &mut crate::det::HashMap<String, Vec<Ty>>,
 ) {
     fn record(
         name: &str,
         ty: Ty,
         order: &mut Vec<String>,
-        observed: &mut std::collections::HashMap<String, Vec<Ty>>,
+        observed: &mut crate::det::HashMap<String, Vec<Ty>>,
     ) {
         let k = name.to_string();
         if !order.iter().any(|n| n == &k) {
@@ -806,7 +815,8 @@ fn walk_collect_ivar_reads(
             walk_collect_ivar_reads(body, written, order, observed);
         }
         ExprNode::Return { value } => walk_collect_ivar_reads(value, written, order, observed),
-        _ => {}
+        // Not only the shapes above: a read inside a local's value (`article = Article.find(@params[:id])`) is a read too.
+        _ => e.node.for_each_child(&mut |child| walk_collect_ivar_reads(child, written, order, observed)),
     }
 }
 
@@ -851,7 +861,11 @@ pub fn format_constant(name: &str, value: &Expr) -> String {
         }
         ExprNode::Hash { entries, .. } => format_hash_constant(name, entries),
         ExprNode::Array { elements, .. } => format_array_constant(name, elements),
-        _ => format!("// TODO rust2 const: {name} = {:?}", value.node),
+        _ => {
+            // Not the panic stub in place: a constant is an item, where an expression does not parse
+            let stub = crate::emit::diagnostics::report_unsupported(value.span, "rust", value.node.kind_str(), "constant value");
+            format!("// {name} = {stub}")
+        }
     }
 }
 
@@ -933,7 +947,7 @@ fn render_constant_value(e: &Expr) -> String {
         ExprNode::Lit { value: Literal::Bool { value } } => value.to_string(),
         ExprNode::Lit { value: Literal::Str { value } } => format!("{value:?}"),
         ExprNode::Lit { value: Literal::Sym { value } } => format!("{:?}", value.as_str()),
-        _ => format!("/* TODO rust2 const value: {:?} */", e.node),
+        _ => crate::emit::diagnostics::report_unsupported(e.span, "rust", e.node.kind_str(), "constant value"),
     }
 }
 
@@ -958,7 +972,7 @@ mod op_assign_tests {
             "module OpAssign\n  def self.count(n)\n    i = 0\n    s = \"\"\n    while i < n\n      s += \"x\"\n      i += 1\n    end\n    s\n  end\nend\n",
             "module OpAssign\n  def self.count: (Integer n) -> String\nend\n",
         );
-        assert!(!out.contains("TODO rust2"), "OpAssign fell through:\n{out}");
+        assert!(!out.contains("unsupported"), "OpAssign fell through:\n{out}");
         assert!(out.contains("i = i + 1_i64"), "int counter not advanced:\n{out}");
         // A `+=` is a reassignment, so its local needs `let mut` as the
         // spelled-out `s = s + "x"` gets.

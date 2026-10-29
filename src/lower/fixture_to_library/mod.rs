@@ -12,7 +12,7 @@
 //! Rails's AUTOINCREMENT-on-load behavior. Predictable so test
 //! setups can `Article.find(1)` if they need to.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver};
 use crate::effect::EffectSet;
@@ -51,7 +51,8 @@ pub fn lower_fixtures_to_library_classes(app: &App) -> Vec<LibraryClass> {
                     .map(|t| t.columns.iter()
                         .filter(|c| m.enum_defaults.contains_key(&c.name)).collect()))
                 .unwrap_or_default();
-            build_fixture_class(f, &lowered, dynamic.contains(&f.name), &defaults)
+            let temporal = temporal_columns(app, &f.class);
+            build_fixture_class(f, &lowered, dynamic.contains(&f.name), &defaults, &temporal)
         })
         .collect()
 }
@@ -81,7 +82,7 @@ pub fn lower_fixtures_to_library_classes(app: &App) -> Vec<LibraryClass> {
 /// and dropping them from the list would be worse than emitting them
 /// in the order that exists today.
 fn load_order(lowered: &LoweredFixtureSet) -> Vec<&LoweredFixture> {
-    let mut deps: HashMap<&str, HashSet<&str>> = HashMap::new();
+    let mut deps: HashMap<&str, HashSet<&str>> = HashMap::default();
     for f in &lowered.fixtures {
         let entry = deps.entry(f.name.as_str()).or_default();
         for rec in &f.records {
@@ -97,7 +98,7 @@ fn load_order(lowered: &LoweredFixtureSet) -> Vec<&LoweredFixture> {
             }
         }
     }
-    let mut emitted: HashSet<&str> = HashSet::new();
+    let mut emitted: HashSet<&str> = HashSet::default();
     let mut out: Vec<&LoweredFixture> = Vec::new();
     // At most one pass per fixture: each round emits every fixture whose
     // dependencies are already out, so a chain of depth N settles in N
@@ -135,9 +136,9 @@ fn load_order(lowered: &LoweredFixtureSet) -> Vec<&LoweredFixture> {
 /// `users(user)` rather than `users(:david)`. campfire's spliced
 /// `SessionTestHelper#sign_in` is the only shape in the corpus that
 /// does this.
-fn fixtures_reached_by_variable(app: &App) -> std::collections::HashSet<Symbol> {
+fn fixtures_reached_by_variable(app: &App) -> crate::det::HashSet<Symbol> {
     let names: Vec<Symbol> = app.fixtures.iter().map(|f| f.name.clone()).collect();
-    let mut out = std::collections::HashSet::new();
+    let mut out = crate::det::HashSet::default();
     for tm in &app.test_modules {
         let bodies = tm
             .tests
@@ -155,7 +156,7 @@ fn fixtures_reached_by_variable(app: &App) -> std::collections::HashSet<Symbol> 
 fn collect_variable_fixture_calls(
     e: &Expr,
     names: &[Symbol],
-    out: &mut std::collections::HashSet<Symbol>,
+    out: &mut crate::det::HashSet<Symbol>,
 ) {
     if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node {
         if args.len() == 1
@@ -173,10 +174,11 @@ fn build_fixture_class(
     all: &LoweredFixtureSet,
     wants_by_label: bool,
     defaults: &[&Column],
+    temporal: &HashMap<Symbol, bool>,
 ) -> LibraryClass {
     let owner_name = format!("{}Fixtures", camelize(f.name.as_str()));
     let owner_id = ClassId(Symbol::from(owner_name.clone()));
-    let class_ty = Ty::Class { id: f.class.clone(), args: vec![] };
+    let class_ty = Ty::Class { id: f.class.clone(), args: vec![].into() };
 
     // Each label method (`one`, `two`, …) returns the persisted record
     // looked up by id. The actual insert happens in `_fixtures_load!`,
@@ -257,7 +259,7 @@ fn build_fixture_class(
     // the DB by `<Class>.new({...attrs...}).save`. Inserts happen in
     // 1-indexed file order so the autoincrement column matches the
     // ids the label methods look up. Body is a Seq of Sends.
-    let load_body = build_load_method_body(&f.class, &f.records, &f.preamble, &f.file_blobs, all, defaults);
+    let load_body = build_load_method_body(&f.class, &f.records, &f.preamble, &f.file_blobs, all, defaults, temporal);
     methods.push(MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
         unsupported_formals: None,
@@ -282,10 +284,12 @@ fn build_fixture_class(
         parent: None,
         parent_span: Default::default(),
         includes: Vec::new(),
+        include_spans: Vec::new(),
         methods,
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     }
@@ -364,7 +368,7 @@ fn build_find_call(cls: &ClassId, id: i64) -> Expr {
             Span::synthetic(),
             ExprNode::Const { path: vec![cls.0.clone()] },
         ),
-        Ty::Class { id: cls.clone(), args: vec![] },
+        Ty::Class { id: cls.clone(), args: vec![].into() },
     );
     with_ty(
         Expr::new(
@@ -377,7 +381,7 @@ fn build_find_call(cls: &ClassId, id: i64) -> Expr {
                 parenthesized: true,
             },
         ),
-        Ty::Class { id: cls.clone(), args: vec![] },
+        Ty::Class { id: cls.clone(), args: vec![].into() },
     )
 }
 
@@ -402,8 +406,9 @@ fn build_load_method_body(
     file_blobs: &indexmap::IndexMap<Symbol, crate::dialect::FixtureFileBlob>,
     all: &LoweredFixtureSet,
     defaults: &[&Column],
+    temporal: &HashMap<Symbol, bool>,
 ) -> Expr {
-    let class_ty = Ty::Class { id: cls.clone(), args: vec![] };
+    let class_ty = Ty::Class { id: cls.clone(), args: vec![].into() };
     let instance_sym = Symbol::from("instance");
 
     let mut exprs: Vec<Expr> = Vec::new();
@@ -489,6 +494,14 @@ fn build_load_method_body(
 
         // instance.<field> = <value>
         for field in &r.fields {
+            // Not `<col>=`: it takes a parsed Time on a strict target, where the YAML text is the stored text hydration writes.
+            let method = match &field.value {
+                LoweredFixtureValue::Literal { raw, .. } if is_stored_temporal(temporal, &field.column, raw) =>
+                {
+                    format!("{}_raw=", field.column.as_str())
+                }
+                _ => format!("{}=", field.column.as_str()),
+            };
             let value_expr = match &field.value {
                 LoweredFixtureValue::Literal { ty, raw } => literal_value_to_expr(ty, raw),
                 LoweredFixtureValue::FkLookup { target_fixture, target_label } => {
@@ -510,7 +523,7 @@ fn build_load_method_body(
                 Span::synthetic(),
                 ExprNode::Send {
                     recv: Some(recv),
-                    method: Symbol::from(format!("{}=", field.column.as_str())),
+                    method: Symbol::from(method),
                     args: vec![value_expr],
                     block: None,
                     parenthesized: false,
@@ -582,7 +595,7 @@ fn load_file_blob(id: i64, blob: &crate::dialect::FixtureFileBlob) -> Expr {
             Span::synthetic(),
             ExprNode::Const { path: vec![Symbol::from("ActiveStorage"), Symbol::from("FixtureSet")] },
         ),
-        Ty::Class { id: ClassId(Symbol::from("ActiveStorage::FixtureSet")), args: vec![] },
+        Ty::Class { id: ClassId(Symbol::from("ActiveStorage::FixtureSet")), args: vec![].into() },
     );
     with_ty(
         Expr::new(
@@ -607,6 +620,43 @@ fn load_file_blob(id: i64, blob: &crate::dialect::FixtureFileBlob) -> Expr {
 /// YAML-string values come through as raw strings; cast to the
 /// column's typed literal. Number-shaped raws to Int/Float; "true"/
 /// "false" to Bool; everything else to Str.
+/// A model's date and datetime columns, each with whether it is a date.
+pub(crate) fn temporal_columns(app: &App, class: &ClassId) -> HashMap<Symbol, bool> {
+    app.models.iter()
+        .find(|m| &m.name == class)
+        .and_then(|m| app.schema.tables.get(&m.table.0))
+        .map(|t| t.columns.iter()
+            .filter(|c| matches!(c.col_type, crate::schema::ColumnType::Date | crate::schema::ColumnType::DateTime))
+            .map(|c| (c.name.clone(), c.col_type == crate::schema::ColumnType::Date)).collect())
+        .unwrap_or_default()
+}
+
+/// Whether a fixture's text for `column` is already what the column stores, so a loader writes it to `<column>_raw`.
+pub(crate) fn is_stored_temporal(temporal: &HashMap<Symbol, bool>, column: &Symbol, raw: &str) -> bool {
+    temporal.get(column).is_some_and(|&date| is_stored_temporal_text(raw, date))
+}
+
+/// `YYYY-MM-DD` for a date column, and that and ` HH:MM:SS[.fraction]` for a datetime one: the text each stores.
+fn is_stored_temporal_text(raw: &str, date_column: bool) -> bool {
+    let b = raw.as_bytes();
+    let digits = |r: std::ops::Range<usize>| r.clone().all(|i| b.get(i).is_some_and(u8::is_ascii_digit));
+    let date = b.len() >= 10 && digits(0..4) && b[4] == b'-' && digits(5..7) && b[7] == b'-' && digits(8..10);
+    if !date {
+        return false;
+    }
+    if date_column {
+        return b.len() == 10;
+    }
+    b.len() >= 19
+        && b[10] == b' '
+        && digits(11..13)
+        && b[13] == b':'
+        && digits(14..16)
+        && b[16] == b':'
+        && digits(17..19)
+        && (b.len() == 19 || (b[19] == b'.' && b.len() > 20 && digits(20..b.len())))
+}
+
 fn literal_value_to_expr(ty: &Ty, raw: &str) -> Expr {
     match ty {
         Ty::Int => raw
@@ -701,7 +751,7 @@ pub fn rewrite_fixture_calls(body: &Expr, fixture_names: &[Symbol]) -> Expr {
                     e.span,
                     ExprNode::Const { path: vec![Symbol::from(owner.as_str())] },
                 ),
-                Ty::Class { id: owner_id.clone(), args: vec![] },
+                Ty::Class { id: owner_id.clone(), args: vec![].into() },
             )
         };
         // One argument → one record.

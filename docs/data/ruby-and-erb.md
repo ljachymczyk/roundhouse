@@ -88,6 +88,58 @@ variant carries `leading_comments: Vec<Comment>` plus a
 `leading_blank_line` flag — see `Comment` and `ControllerBodyItem` in
 `src/dialect.rs`.
 
+### Load-time conditional definitions
+
+A library class or module body may define methods under a load-time
+`if` / `elsif` / `else` or `unless` / `else` (`if Rails.env.test?` around
+two `def`s). Each branch may hold `def`s (`private def` too), plain
+`attr_reader` / `attr_writer` / `attr_accessor`s and nested conditionals
+of the same shape, and `class` / `module` declarations, each loaded from
+its own file inside its branch (one nested in a class shares that
+class's file and is an error). Every branch's methods are ordinary methods of the
+class, so analysis types each one; `LibraryClass::conditional_definitions`
+records which branch defines which. The Ruby and JRuby trees write the
+conditional around them where the source had it, so the branch Ruby
+selects at load defines them. Other targets would define every branch's
+methods, and report each such statement as an error
+(`conditional_definition`). A named visibility change (`private :mode`)
+applies to such a method only when every branch defines it and the
+conditional ends in `else`. A model body's conditional definitions, a
+visibility marker inside a branch, and any other statement in one stay
+refused.
+
+### Body statements only Ruby answers
+
+A library class or module body may run code as it loads that defines
+no method the walk can read. The Ruby and JRuby trees write the
+following statements back where the source has them, among the class's methods (`ingest::body_statements`,
+`expr::BODY_STATEMENT`):
+
+- a loop over a literal that `class_eval`s a heredoc or
+  `define_method`s per element;
+- a call to one of Ruby's own `Module` methods (`freeze`,
+  `self.define_method`);
+- a write through a class-side writer the class or an app ancestor
+  defines (`self.require_name = true`, `self.strict ||= :on`);
+- such a write in a class that, itself or through an app ancestor,
+  includes an app module with an `included` hook, which may define the
+  writer at run time, when its superclasses are the app's own up to a
+  core class.
+
+Each statement must call nothing on the class but Ruby's own `Module`
+methods, `delegate` (the Ruby family's runtime defines it) and class
+methods the app defines. A module whose body is only such a call
+(`module BooleanType; freeze; end`) is declared for it.
+
+The class's own `class << self` keeps its scope there
+(`expr::SINGLETON_BODY`): its constants live on the singleton class,
+and the analyzer qualifies a read of one to `X.singleton_class::NAME`.
+A statement in it runs inside a `class << self` when the class is a
+module, or a class whose superclasses are the app's own up to a core
+class. Spinel and the other targets keep the constants on the class.
+They drop the statements and report each one by name, as they report
+any other dropped class-body call.
+
 ## ERB → Ruby → IR
 
 ### Why compile to Ruby?
@@ -176,6 +228,20 @@ actually uses, producing the same `_buf` output shape).
 Jbuilder deliberately bypasses the seam: a `.json.jbuilder` source is
 already Ruby, so `src/ingest/app.rs` dispatches it separately to
 `src/ingest/jbuilder.rs` with no compile step.
+
+### Markdown templates
+
+`*.md.erb` templates use the ERB handler and the `md` format.
+The lowerer names their methods `<action>_md`, separate from their HTML siblings.
+An explicit `render formats: :md` or a request format of `md` selects the Markdown template.
+The response uses `text/markdown; charset=utf-8`.
+
+A YAML header remains ordinary template text. The compiler does not parse or remove it.
+ERB expressions in the header and body use normal HTML escaping.
+Expressions marked `html_safe` and literal template text remain unchanged.
+
+The Markdown regression in [`tests/emit_and_run.rs`](../../tests/emit_and_run.rs)
+checks both render paths and the HTML sibling against emitted Ruby.
 
 ## Key files
 

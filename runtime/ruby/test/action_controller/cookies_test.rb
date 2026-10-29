@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 require_relative "../test_helper"
 
 # Direct unit tests for `runtime/ruby/action_controller/cookies.rb`.
@@ -208,6 +209,13 @@ class ActionControllerCookiesTest < Minitest::Test
   def test_action_dispatch_cookie_jar_builds_onto_the_same_implementation
     jar = ActionDispatch::Cookies::CookieJar.build(nil, {"a" => "1"})
     assert_instance_of ActionController::CookieJar, jar
+    assert_equal "1", jar["a"]
+  end
+
+  def test_action_dispatch_cookie_jar_new_takes_the_request
+    jar = ActionDispatch::Cookies::CookieJar.new(nil)
+    assert_instance_of ActionController::CookieJar, jar
+    jar["a"] = "1"
     assert_equal "1", jar["a"]
   end
 end

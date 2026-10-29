@@ -196,8 +196,7 @@ fn unwrap_respond_to_inner(expr: &Expr, with_format_dispatch: bool, breadth: For
         ty: expr.ty.clone(),
         effects: expr.effects.clone(),
         leading_blank_line: expr.leading_blank_line,
-        diagnostic: expr.diagnostic.clone(),
-        hint: expr.hint,
+        cold: expr.cold.clone(),
         decisions: expr.decisions,
     }
 }
@@ -653,7 +652,27 @@ pub(crate) fn mime_for_format(fmt: &str) -> &'static str {
         "rss" => "application/rss+xml; charset=utf-8",
         "atom" => "application/atom+xml; charset=utf-8",
         "xml" => "application/xml; charset=utf-8",
+        // Mastodon's `custom_css#show` — Rails' own Mime::Type
+        // registration for `:css`, no charset.
+        "css" => "text/css",
+        "md" => "text/markdown; charset=utf-8",
         _ => "text/html; charset=utf-8",
+    }
+}
+
+/// Reverse of [`mime_for_format`], for a bare `render content_type:
+/// "<mime>"` (no `formats:`/`format:` marker) to resolve to the
+/// format-qualified template the way `formats: :svg` already does —
+/// `resolve_formats_only_render` is the caller. Limited to the MIME
+/// strings a controller plausibly writes BARE: `mime_for_format`'s own
+/// entries that carry no charset suffix, since nobody hand-writes one
+/// of those verbatim as a literal.
+pub(crate) fn format_for_mime(mime: &str) -> Option<&'static str> {
+    match mime {
+        "text/css" => Some("css"),
+        "application/json" => Some("json"),
+        "image/svg+xml" => Some("svg"),
+        _ => None,
     }
 }
 
@@ -1005,6 +1024,9 @@ const RESPONSE_TERMINALS: &[&str] = &[
     "send_data",
     "send_file",
     "render_inertia_json",
+    // Always responds: 409 + X-Inertia-Location, or a 302. Without this
+    // the implicit `head :no_content` runs second and raises.
+    "inertia_location",
 ];
 
 /// Rails' HTTP auth helpers that render the 401 challenge when the

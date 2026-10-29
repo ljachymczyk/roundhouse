@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use super::super::EmittedFile;
 use crate::dialect::{
-    AccessorKind, LibraryClass, LibraryClassOrigin, MethodDef, MethodReceiver, MethodVisibility,
+    AccessorKind, LibraryClass, MethodDef, MethodReceiver, MethodVisibility,
 };
 use crate::expr::{Expr, ExprNode, Literal, RESOLVED_DATA_FACTORY};
 use crate::ty::{Param, ParamKind, Ty};
@@ -43,18 +43,20 @@ impl Drop for ClassSideGuard {
 /// path mirrors `rb_path` under a top-level `sig/` tree with the
 /// extension swapped to `.rbs`.
 pub(super) fn emit_library_class_rbs(lc: &LibraryClass, rb_path: &Path) -> EmittedFile {
-    emit_library_class_rbs_with_factories(lc, rb_path, &[])
+    emit_library_class_rbs_with_factories(lc, rb_path, &[], &[])
 }
 
 /// Emit the `sig/` sidecar for an owner and its Data factory constants. `classes`
-/// supplies lifted custom methods, matched to declarations by their source spans.
+/// supplies lifted custom methods. `factories` is the one owner-constant
+/// association built for this emit; an empty list falls back to a span scan.
 pub(super) fn emit_library_class_rbs_with_factories(
     lc: &LibraryClass,
     rb_path: &Path,
     classes: &[LibraryClass],
+    factories: &[super::library::DataFactoryOwner],
 ) -> EmittedFile {
     let path = sig_path_for(rb_path);
-    let content = render_class(lc, classes);
+    let content = render_class(lc, classes, factories);
     EmittedFile { path, content }
 }
 
@@ -73,7 +75,11 @@ fn sig_path_for(rb_path: &Path) -> PathBuf {
 
 /// Render a library class or module with enclosing namespaces, includes, method
 /// signatures, and admitted Data factories nested under their constant owner.
-fn render_class(lc: &LibraryClass, classes: &[LibraryClass]) -> String {
+fn render_class(
+    lc: &LibraryClass,
+    classes: &[LibraryClass],
+    factories: &[super::library::DataFactoryOwner],
+) -> String {
     let mut s = String::new();
     let name = lc.name.0.as_str();
     let segments: Vec<&str> = name.split("::").collect();
@@ -91,11 +97,24 @@ fn render_class(lc: &LibraryClass, classes: &[LibraryClass]) -> String {
         let pad = "  ".repeat(depth - 1);
         match lc.parent.as_ref() {
             Some(p) => writeln!(s, "{pad}class {last} < {}", p.0.as_str()).unwrap(),
+            None if lc.data_define().is_some() => writeln!(s, "{pad}class {last} < ::Data").unwrap(),
             None => writeln!(s, "{pad}class {last}").unwrap(),
         }
     }
 
     let body_pad = "  ".repeat(depth);
+
+    if let Some((members, _)) = lc.data_define() {
+        writeln!(s, "{body_pad}def self.new: (*untyped, **untyped) -> instance").unwrap();
+        // A `def` in the `Data.define` block replaces the reader, and RBS
+        // rejects a second declaration of one method.
+        let defined = |member: &crate::ident::Symbol| {
+            lc.methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name == *member)
+        };
+        for member in members.iter().filter(|member| !defined(member)) {
+            writeln!(s, "{body_pad}def `{}`: () -> untyped", member.as_str()).unwrap();
+        }
+    }
 
     for inc in &lc.includes {
         writeln!(s, "{body_pad}include {}", inc.0.as_str()).unwrap();
@@ -105,10 +124,7 @@ fn render_class(lc: &LibraryClass, classes: &[LibraryClass]) -> String {
     }
 
     for (name, value) in &lc.constants {
-        let factory = classes.iter().find(|class| {
-            matches!(class.origin, Some(LibraryClassOrigin::DataFactory { declaration_span })
-                if declaration_span == value.span)
-        });
+        let factory = super::library::lifted_data_factory(lc, name.as_str(), classes, factories);
         render_data_factory(&mut s, lc, name.as_str(), value, &body_pad, factory);
     }
 
@@ -186,10 +202,29 @@ fn render_method(m: &MethodDef, enclosing: &[&str]) -> String {
         return render_def(m, enclosing);
     }
     match m.kind {
-        AccessorKind::AttributeReader => render_attr_reader(m, enclosing),
-        AccessorKind::AttributeWriter => render_attr_writer(m, enclosing),
-        AccessorKind::Method => render_def(m, enclosing),
+        AccessorKind::AttributeReader
+            if matches!(&*accessor_body(&m.body).node, ExprNode::Ivar { name } if name == &m.name) =>
+        {
+            render_attr_reader(m, enclosing)
+        }
+        AccessorKind::AttributeWriter if plain_writer(m) => render_attr_writer(m, enclosing),
+        _ => render_def(m, enclosing),
     }
+}
+
+fn accessor_body(body: &Expr) -> &Expr {
+    match &*body.node {
+        ExprNode::Seq { exprs } if exprs.len() == 1 => accessor_body(&exprs[0]),
+        _ => body,
+    }
+}
+
+fn plain_writer(m: &MethodDef) -> bool {
+    let Some(param) = m.params.first() else { return false };
+    matches!(&*accessor_body(&m.body).node,
+        ExprNode::Assign { target: crate::expr::LValue::Ivar { name }, value }
+            if name.as_str() == m.name.as_str().trim_end_matches('=')
+                && matches!(&*accessor_body(value).node, ExprNode::Var { name, .. } if name == &param.name))
 }
 
 fn render_attr_reader(m: &MethodDef, enclosing: &[&str]) -> String {
@@ -274,7 +309,7 @@ fn render_typed_params(params: &[Param], enclosing: &[&str]) -> String {
         let name = p.name.as_str();
         // IR keyword-rest params name the collected Hash, while RBS
         // **T names the type of each keyword value (see rbs ingestion).
-        let param_ty = match (&p.kind, &p.ty) {
+        let param_ty = match (&p.kind, &*p.ty) {
             (ParamKind::KeywordRest, Ty::Hash { value, .. }) => &**value,
             _ => &p.ty,
         };
@@ -488,10 +523,10 @@ mod tests {
 
     #[test]
     fn keyword_rest_renders_values_not_a_nested_hash() {
-        let hash = Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Str) };
+        let hash = Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Str) };
         let params = [
-            Param { name: Symbol::from("mapping"), ty: hash.clone(), kind: ParamKind::Required },
-            Param { name: Symbol::from("opts"), ty: hash, kind: ParamKind::KeywordRest },
+            Param { name: Symbol::from("mapping"), ty: hash.clone().into(), kind: ParamKind::Required },
+            Param { name: Symbol::from("opts"), ty: hash.into(), kind: ParamKind::KeywordRest },
         ];
         assert_eq!(render_typed_params(&params, &[]), "Hash[Symbol, String] mapping, **String opts");
     }

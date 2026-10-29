@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Top-level entry point for the spinel-blog application.
 #
 # Reads a CGI request from ENV + $stdin, dispatches through the router
@@ -25,8 +26,11 @@
 # `test/test_helper.rb` can load the app without loading this one,
 # which starts a server.
 require_relative "boot"
+require_relative "runtime/cgi_io"
 
 module Main
+  # Spinel's class reflection needs a lexical class receiver.
+  FrameworkParseError = ActionDispatch::Http::Parameters::ParseError
 
   # Maps the routes-table controller symbol to a literal `.new`
   # constructor call. Spinel's hash specializations don't accept class
@@ -39,6 +43,19 @@ module Main
     when :comments then CommentsController.new
     else ActiveStorage::Routes.instantiate_controller(sym)
     end
+  end
+
+  # Rails' `request.path_parameters`: the route's captures, with the
+  # controller and action the request was dispatched to. The
+  # controller's own `path_parameters` and params keep the captures alone.
+  def self.route_parameters(controller, matched)
+    out = {}
+    matched.path_params.each { |k, v| out[k] = v }
+    # The dispatched controller and action win over a capture of the same
+    # name: Rails dispatches by these two, so they name what ran.
+    out["controller"] = controller.controller_path
+    out["action"] = matched.action.to_s
+    out
   end
 
   # The controller's params, built the way Rails builds them
@@ -74,7 +91,8 @@ module Main
   # `request_params` merges query and path keys into its body hash.
   # URL-encoded and multipart form data are nested by `ParamBuilder`;
   # JSON is normalized by `ParamBuilder.from_json` to keep typed values
-  # and Rails' default deep-munge behavior. nil where Rails answers 400.
+  # and Rails' default deep-munge behavior. nil where Rails answers 400,
+  # including a JSON body that does not parse (Rails' ParseError).
   def self.request_body_params(req)
     body = {}
     if req.form?
@@ -90,7 +108,7 @@ module Main
       end
       body = ParamBuilder.build(keys, values, present)
     elsif req.json?
-      body = ParamBuilder.from_json(req.json_body_params)
+      body = req.json_body_malformed ? nil : ParamBuilder.from_json(req.json_body_params)
     end
     body
   end
@@ -130,6 +148,13 @@ module Main
         merged[inner] = file
         out[outer] = merged
       end
+    end
+    nil
+  end
+
+  def self.nest_upload_parts(out, parts)
+    parts.each do |part|
+      CgiIo.assign_form_pair(out, part.name, part.file)
     end
     nil
   end
@@ -222,7 +247,33 @@ module Main
       return nil
     end
     res.headers["Content-Type"] = Main.asset_content_type(path)
+    # `config.public_file_server.headers`, as ActionDispatch::Static
+    # sends them on every public/ and /assets/ file.
+    Rails.application.public_file_server_headers.each do |name, value|
+      res.headers[name] = value
+    end
     res.send_file(disk)
+    nil
+  end
+
+  # A 404 the app did not rescue (no route, ActionNotFound,
+  # RecordNotFound), answered as Rails' production exceptions app
+  # (ActionDispatch::PublicExceptions) does: `{"status":404,"error":
+  # "Not Found"}` when the request's format is JSON
+  # (ActionDispatch::MimeNegotiation.json_format?), the HTML page
+  # otherwise. `format_param` is the request's `format` parameter, ""
+  # when it has none.
+  def self.render_not_found(res, format_param, path, req)
+    res.status = 404
+    extension = path.end_with?(".json") ? "json" : ""
+    if ActionDispatch::MimeNegotiation.json_format?(format_param, extension,
+         req.req_headers.fetch("accept", ""), req.req_headers.fetch("x-requested-with", ""),
+         req.req_headers.fetch("content-type", ""))
+      res.headers["Content-Type"] = "application/json; charset=UTF-8"
+      res.body = "{\"status\":404,\"error\":\"Not Found\"}"
+    else
+      res.body = "<h1>404 Not Found</h1>"
+    end
     nil
   end
 
@@ -267,7 +318,7 @@ module Main
 
   # Tep::Server callback. Routes, runs the controller, copies
   # status/body/location back, and persists per-request flash via
-  # cookies (flash_notice / flash_alert) so a `redirect_to … notice:`
+  # cookies (one flash_<key> each) so a `redirect_to … notice:`
   # shows once on the redirect target and is then swept — matching the
   # cookie-backed Rack path in ruby_overlay/main.rb. Session is still a
   # fresh per-request object (not yet cookie-persisted), same as Rack.
@@ -296,6 +347,10 @@ module Main
   # pass are the ones a single request enqueued, and they are far more
   # likely to touch the same rows than not.
   #
+  # A queued job is a closure over its arguments or, for a job whose
+  # arguments serialize, a closure over its ActiveJob payload that runs
+  # it through the generated job registry (runtime/job_registry.rb).
+  #
   # NOTHING IS RETRIED and nothing survives a restart. The queue is a
   # process-local Array — that is the honest shape for a single-worker
   # binary with no store, and it is the ledgered limit rather than an
@@ -312,9 +367,39 @@ module Main
     0
   end
 
+  # Rails' Rack::Runtime and ActionDispatch::RequestId around the whole
+  # request (runtime/action_dispatch/request_id.rb): every response the
+  # app answers carries X-Request-Id and X-Runtime, its error pages
+  # included. They sit behind ActionDispatch::Static, so a file sent
+  # from static/ or public/ carries neither, and the /cable upgrade is
+  # left as Action Cable answers it.
+  #
+  # A gem's middleware (runtime/request_hooks.rb) sits outside all of it,
+  # where its Railtie inserts it: at position 0.
+  def self.dispatch(req, res)
+    unless RequestHooks.request_begin(req, res)
+      Main.dispatch_app(req, res)
+    end
+    RequestHooks.request_end(req, res)
+    nil
+  end
+
+  def self.dispatch_app(req, res)
+    started = ActionDispatch::Runtime.clock_time
+    Main.dispatch_request(req, res)
+    return nil if res.file_path.length > 0 || res.upgrading_ws
+    res.headers[ActionDispatch::RequestId::HEADER] =
+      ActionDispatch::RequestId.make(req.req_headers.fetch("x-request-id", ""))
+    # Rack::Runtime leaves a value the app set itself.
+    unless res.headers.keys.any? { |k| k.downcase == "x-runtime" }
+      res.headers[ActionDispatch::Runtime::HEADER] = ActionDispatch::Runtime.header_value(started)
+    end
+    nil
+  end
+
   # Serve static files or dispatch the complete request path through Router,
   # preserving literal suffix routes while negotiating the response format.
-  def self.dispatch(req, res)
+  def self.dispatch_request(req, res)
     ActionView::ViewHelpers.reset_slots!
     Broadcasts.reset_log!
     # Under RH_SQL_TRACE the request line brackets its queries, so a
@@ -375,8 +460,9 @@ module Main
 
     matched = ActionDispatch::Router.match(verb, request_path, Main.route_table)
     if matched.nil?
-      res.status = 404
-      res.body = "<h1>404 Not Found</h1>"
+      # No route: the format is the `?format=` param, a trusted Accept,
+      # or the path's extension (Main.render_not_found).
+      Main.render_not_found(res, req.req_params.fetch("format", ""), request_path, req)
       return
     end
     # A `(.:format)` EXTENSION the router stripped off the path
@@ -397,27 +483,34 @@ module Main
     request_format = :xml if path_format == "xml"
     # `/service-worker.js`: campfire's raw service-worker template.
     request_format = :js if path_format == "js"
-    # A route-forced format (`get "/rss" => "home#index", :format => "rss"`)
-    # overrides the path-suffix sniff above — the URL carries no extension
-    # but the route pins the response format. Without it every route-pinned
-    # entry fell through to :html and lobsters' /rss and /hottest served the
-    # HTML home page.
+    # A route's default format (`get "/rss" => "home#index", :format =>
+    # "rss"`, `defaults: { format: :json }`) fills in what the request
+    # left out, as in Rails: only when the path carried no extension, and
+    # it is then written to `params[:format]` too. Without it every
+    # route-pinned entry fell through to :html and lobsters' /rss and
+    # /hottest served the HTML home page; with it unconditional,
+    # `/widgets/1.html` on a json-defaulted route was answered as json.
     #
-    # The CRuby overlay writes this as a one-line `request_format =
-    # matched.req_format unless matched.req_format.nil?`. That shape does
-    # not compile here, and neither does binding the read to a guarded
-    # local: `req_format` is `Symbol?`, which spinel stores as a poly
-    # RbVal, while a local seeded from a Symbol literal is a bare `sp_sym`
-    # — the assignment is a type error whatever the nil guard looks like.
-    # COMPARING the poly against literals never materializes a nilable
-    # Symbol, so the supported formats are named here instead. The set
-    # matches the response types the tail of this method can stamp.
-    if matched.req_format == :rss
-      request_format = :rss
-    elsif matched.req_format == :json
-      request_format = :json
-    elsif matched.req_format == :xml
-      request_format = :xml
+    # The CRuby overlay writes this generically (`request_format =
+    # matched.req_format`). That shape does not compile here, and neither
+    # does binding the read to a guarded local: `req_format` is
+    # `Symbol?`, which spinel stores as a poly RbVal, while a local
+    # seeded from a Symbol literal is a bare `sp_sym` - the assignment is
+    # a type error whatever the nil guard looks like. COMPARING the poly
+    # against literals never materializes a nilable Symbol, so the
+    # supported formats are named here instead. The set matches the
+    # response types the tail of this method can stamp.
+    if path_format.empty?
+      if matched.req_format == :rss
+        request_format = :rss
+        matched.path_params["format"] = "rss"
+      elsif matched.req_format == :json
+        request_format = :json
+        matched.path_params["format"] = "json"
+      elsif matched.req_format == :xml
+        request_format = :xml
+        matched.path_params["format"] = "xml"
+      end
     end
 
     controller = Main.instantiate_controller(matched.controller)
@@ -431,7 +524,7 @@ module Main
     end
     controller.params = params
     controller.path_parameters = matched.path_params
-    Main.nest_uploads(controller.params, req.uploads) if req.uploads.length > 0
+    Main.nest_upload_parts(controller.params, req.upload_parts) if req.upload_parts.length > 0
     # Typed request object + per-request context statics. Helpers are
     # module functions with no controller in scope; the emit rewrites
     # their bare `request` reads to `ActionController::Current.request`
@@ -444,6 +537,11 @@ module Main
     request_obj.remote_ip = req.remote_host
     request_obj.referer = req.req_headers.fetch("referer", "")
     request_obj.host = req.req_headers.fetch("host", "localhost")
+    request_obj.path_parameters = Main.route_parameters(controller, matched)
+    # The controller's params, copied into the request's own slot (as
+    # `Request.for` copies, see runtime/action_dispatch/request.rb):
+    # `request.filtered_parameters` reads them.
+    params.each { |k, v| request_obj.params[k] = v }
     fmt_name = "html"
     fmt_name = "json" if request_format == :json
     fmt_name = "rss" if request_format == :rss
@@ -467,7 +565,16 @@ module Main
     # includes `X-Forwarded-Proto`, CSRF/origin/fetch metadata, auth, and
     # content type; keeping one mapping avoids a drifting header allowlist.
     req.req_headers.each do |name, value|
-      request_obj.env[ActionDispatch::Http::Headers.env_name(name)] = value
+      request_obj.env[ActionDispatch::Http::Headers.env_name_from_header(name)] = value
+    end
+    request_obj.env["roundhouse.listener"] = req.listener_transport
+    # config.assume_ssl: TLS ends at a proxy that forwards plain http.
+    # Rails' AssumeSSL marks the request https before the action, so
+    # secure cookies and absolute redirects use https.
+    if AppEnvironment.serving_assume_ssl?
+      request_obj.env["HTTPS"] = "on"
+      request_obj.env["HTTP_X_FORWARDED_PROTO"] = "https"
+      request_obj.env["rack.url_scheme"] = "https"
     end
     # `user_agent` is ALSO a separate reader slot. The overlay twin's
     # `user_agent` reads `@env["HTTP_USER_AGENT"]`; the shared runtime's
@@ -523,7 +630,7 @@ module Main
     # resolves. Same shared ActionController::CookieJar the CRuby overlay uses.
     controller.cookies = ActionController::CookieJar.new(req.cookies)
     # Inbound flash: each message rides its own SIGNED cookie
-    # (flash_notice / flash_alert; runtime/signed_cookies.rb) — one that
+    # (flash_<key>; runtime/signed_cookies.rb) — one that
     # does not verify reads as no message, so a client cannot make the
     # next page show text of its choosing. Load
     # through the constructor (NOT flash[:k]=) so to_persisted's show-once
@@ -531,23 +638,41 @@ module Main
     # `fetch(name, "")` avoids a missing-key raise; a flash message is
     # never empty, so non-empty == present.
     inbound_flash = Tep.str_hash
-    cin = ActionDispatch::SignedCookie.verified(req.cookies.fetch("flash_notice", ""), "flash_notice")
-    inbound_flash["notice"] = cin if cin.length > 0
-    ain = ActionDispatch::SignedCookie.verified(req.cookies.fetch("flash_alert", ""), "flash_alert")
-    inbound_flash["alert"] = ain if ain.length > 0
+    # Every `flash_<key>` cookie, not only notice/alert: lobsters' layout shows `flash[:error]` / `[:success]`.
+    req.cookies.each do |cname, cvalue|
+      if cname.start_with?("flash_")
+        fin = ActionDispatch::SignedCookie.verified(cvalue, cname)
+        inbound_flash[cname[6, cname.length - 6]] = fin if fin.length > 0
+      end
+    end
     controller.flash = ActionDispatch::Flash.new(inbound_flash)
     controller.request_format = request_format
     controller.accepts_any_format = Main.accepts_any_format?(req.req_headers.fetch("accept", ""))
+    # Rails' `Vary: Accept` on a render whose format came from the Accept
+    # header (runtime/action_dispatch/mime_negotiation.rb). A `format`
+    # param - the path extension, `?format=`, a route's own format -
+    # is read instead of Accept.
+    controller.vary_on_accept = ActionDispatch::MimeNegotiation.should_apply_vary_header?(
+      req.req_headers.fetch("accept", ""), req.req_headers.fetch("x-requested-with", ""),
+      req.req_headers.fetch("content-type", ""),
+      controller.params.key?("format") || !matched.req_format.nil?)
 
     begin
       controller.process_action(matched.action)
     rescue ActiveRecord::RecordNotFound, ActionController::RoutingError, AbstractController::ActionNotFound
-      res.status = 404
-      res.body = "<h1>404 Not Found</h1>"
+      # The routed format (extension, route default) is the `format`
+      # param; an html one may still name `?format=`.
+      format_param = request_format == :html ? req.req_params.fetch("format", "") : fmt_name
+      Main.render_not_found(res, format_param, request_path, req)
       return
-    rescue ActionController::ParameterMissing, ActionController::BadRequest
-      # `params.expect` / `params.require` refused the request and the app
-      # did not rescue it: Rails' rescue_responses answer :bad_request.
+    rescue ActionController::ParameterMissing, ActionController::BadRequest,
+           ActionDispatch::Http::Parameters::ParseError => error
+      # The app's handlers have already run. Rails' rescue_responses map
+      # an unhandled ParseError to :bad_request by its exact class name;
+      # an application subclass has no default mapping.
+      # Spinel has no built-in method binding: compare nominal classes,
+      # without consulting any application's subclass matcher.
+      raise if FrameworkParseError === error && error.class != FrameworkParseError
       res.status = 400
       res.body = "<h1>400 Bad Request</h1>"
       return
@@ -557,6 +682,18 @@ module Main
       res.body = "<h1>422 Unprocessable Content</h1>"
       return
     end
+
+    # Compose `Cache-Control` from whatever `response.cache_control`
+    # holds (`expires_in`, `replace`/`merge!`/`[]=`) onto the buffered
+    # header store - a no-op unless the action or one of its filters
+    # touched the store. Then Rails' Rack::ETag and Rack::ConditionalGet
+    # (action_controller/conditional_get.rb): the body ETag, the default
+    # Cache-Control, and a 304 for a matching If-None-Match. Both run
+    # before the status, body and headers are copied below, since a 304
+    # changes all three.
+    controller.commit_cache_control!
+    controller.commit_conditional_get!(req.verb, req.req_headers.fetch("if-none-match", ""))
+    controller.commit_default_headers!
 
     res.status = controller.status
     # The layout wrap happens at the controller's render call sites
@@ -588,11 +725,6 @@ module Main
     elsif controller.content_type != "text/html; charset=utf-8"
       res.headers["Content-Type"] = controller.content_type
     end
-    # Compose `Cache-Control` from whatever `response.cache_control`
-    # holds (`expires_in`, `replace`/`merge!`/`[]=`) onto the buffered
-    # header store, right before it is copied below — a no-op unless
-    # the action or one of its filters touched the store.
-    controller.commit_cache_control!
     # Headers the action set beyond those two — a `Content-Disposition`
     # on a download, the Cache-Control a blob route asks for. A nil
     # value is a header the app UNSET (campfire's `X-Rev` is
@@ -603,26 +735,25 @@ module Main
     while i < n
       k = controller.headers.key_at(i)
       v = controller.headers.val_at(i)
-      res.headers[k] = v unless v.nil?
+      res.headers[Tep.header_name(k)] = v unless v.nil?
       i += 1
     end
 
     # Outbound flash: persist messages set THIS request for the NEXT one.
-    # `to_persisted` returns only notice/alert that differ from the
-    # carried-in value (show-once); clear any inbound cookie that wasn't
-    # re-persisted so a consumed flash doesn't stick on the next nav.
+    # `to_persisted` returns only the entries this request set (show-once);
+    # clear any inbound cookie that wasn't re-persisted so a consumed flash
+    # doesn't stick on the next nav.
     persisted = controller.flash.to_persisted
-    pn = persisted.fetch("notice", "")
-    if pn.length > 0
-      Main.set_flash_cookie(res, "flash_notice", ActionDispatch::SignedCookie.sign(pn, "flash_notice"), request_obj.ssl?)
-    elsif req.cookies.fetch("flash_notice", "").length > 0
-      Main.clear_flash_cookie(res, "flash_notice")
+    persisted.each do |kind, pv|
+      if pv.length > 0
+        fname = "flash_" + kind
+        Main.set_flash_cookie(res, fname, ActionDispatch::SignedCookie.sign(pv, fname), request_obj.ssl?)
+      end
     end
-    pa = persisted.fetch("alert", "")
-    if pa.length > 0
-      Main.set_flash_cookie(res, "flash_alert", ActionDispatch::SignedCookie.sign(pa, "flash_alert"), request_obj.ssl?)
-    elsif req.cookies.fetch("flash_alert", "").length > 0
-      Main.clear_flash_cookie(res, "flash_alert")
+    req.cookies.each do |cname, cvalue|
+      if cname.start_with?("flash_") && cvalue.length > 0 && persisted.fetch(cname[6, cname.length - 6], "").length == 0
+        Main.clear_flash_cookie(res, cname)
+      end
     end
 
     # Outbound cookies: serialize whatever the action recorded via
@@ -726,6 +857,21 @@ end
 # CLI surface. Flags override the PORT/WORKERS env vars; --help exits
 # before any DB or server setup runs. Parsed with a plain while loop
 # (no OptionParser — stdlib optparse isn't in the spinel subset).
+# `./app sidekiq [options]`: the worker role instead of the server. It
+# pulls jobs from Redis and runs them until TERM, and never returns (see
+# runtime/sidekiq_worker.rb). No socket is served, so no in-process
+# drain thread, and a Cable transport only to publish to Redis; jobs a
+# job enqueues still push to Redis.
+if ARGV.length > 0 && ARGV[0] == "sidekiq"
+  SidekiqWorker.prepare_pool(ARGV)
+  Main.configure_default_adapter!
+  Db.checkpoint_in_background!
+  ActiveJob.register_drain
+  # A job's broadcasts go to the web processes through Redis when
+  # config/cable.yml says `adapter: redis` (runtime/redis_cable.rb).
+  Broadcasts.set_transport(Cable::Transport.new) if RedisCable.enabled?
+  SidekiqWorker.cli(ARGV)
+end
 port = (ENV["PORT"] || "3000").to_i
 workers = (ENV["WORKERS"] || "1").to_i
 # `db:migrate` / `db:prepare`, as `bin/rails` names them: run against the
@@ -746,6 +892,8 @@ if command == "db:migrate" || command == "db:prepare"
   end
   exit(0)
 end
+binding_arg = ""
+unix_bind = ENV["UNIX_BIND"].to_s
 i = 0
 while i < ARGV.length
   arg = ARGV[i]
@@ -755,7 +903,10 @@ while i < ARGV.length
     puts ""
     puts "  -p, --port N     listen port (default 3000; PORT env)"
     puts "  -w, --workers N  prefork N processes (default 1; WORKERS env)"
+    puts "  -b, --binding IP bind to IP (BINDING env; default localhost in development, 0.0.0.0 otherwise)"
+    puts "      --unix-bind URL add unix:///absolute/path?mode=600 (UNIX_BIND env; default disabled)"
     puts "  -h, --help       show this help and exit"
+    puts "  sidekiq [options]  run jobs from Redis instead of serving HTTP (sidekiq --help)"
     puts ""
     puts "  OS workers per process: one per core; SPINEL_WORKERS=N caps it"
     puts "  TEP_SERVER=fiber runs the fiber-per-connection server instead"
@@ -771,6 +922,12 @@ while i < ARGV.length
   elsif (arg == "--workers" || arg == "-w") && i + 1 < ARGV.length
     workers = ARGV[i + 1].to_i
     i += 2
+  elsif (arg == "--binding" || arg == "-b") && i + 1 < ARGV.length
+    binding_arg = ARGV[i + 1]
+    i += 2
+  elsif arg == "--unix-bind" && i + 1 < ARGV.length
+    unix_bind = ARGV[i + 1]
+    i += 2
   else
     $stderr.puts "unknown option: " + arg + " (try --help)"
     exit(1)
@@ -780,6 +937,30 @@ if port <= 0 || port > 65535
   $stderr.puts "invalid port: " + port.to_s
   exit(1)
 end
+# The listen address as `rails server` picks it: -b, else BINDING, else
+# localhost in development and 0.0.0.0 in every other environment.
+if binding_arg.empty?
+  binding_env = ENV["BINDING"].to_s
+  rails_env = ENV["RAILS_ENV"].to_s
+  binding_arg = if !binding_env.empty?
+    binding_env
+  elsif rails_env.empty? || rails_env == "development"
+    "localhost"
+  else
+    "0.0.0.0"
+  end
+end
+# An address-specific listener is not shared across prefork processes
+# (SO_REUSEPORT is the every-interface listener's), so -w N > 1 needs it.
+if workers > 1 && binding_arg != "0.0.0.0"
+  $stderr.puts "--workers " + workers.to_s + " needs --binding 0.0.0.0 (one listener per process shares only that address)"
+  exit(1)
+end
+Tep::APP.bind_host = binding_arg
+Sock.sphttp_install_term_handlers
+unix_listener = Tep::UnixListener.new(unix_bind)
+unix_listener.open
+begin
 Main.configure_default_adapter!
 # Serving, so WAL checkpoints move off the request path: a background
 # thread runs them instead of some request's COMMIT
@@ -795,12 +976,14 @@ Broadcasts.set_transport(Cable::Transport.new)
 # reaches this line keeps the inline behaviour rather than dropping work
 # into an Array nobody reads.
 ActiveJob.register_drain
+# Under queue_adapter :sidekiq jobs go to Redis instead; say where.
+SidekiqPush.announce if JobRegistry.sidekiq?
 Thread.new do
   Main.job_loop
 end
-# The server announces itself by the app's own name (the underscored
-# module wrapping its Rails::Application, which ingest writes into
-# config/application.rb), not by the binary's file name.
+# The server announces itself by the app's own name (its GlobalID app
+# name, which ingest writes into config/application.rb), not by the
+# binary's file name.
 Tep::APP.name = Rails.application.global_id_app
 # Tep::Server::Threaded is the thread-per-connection server: a green
 # thread per connection, every wait a park (recv, write, sleep, and the
@@ -814,7 +997,10 @@ Tep::APP.name = Rails.application.global_id_app
 # the environment differing (matz/spinel#4306). HTTP only; see the note
 # at the top of tep/server_scheduled.rb.
 if (ENV["TEP_SERVER"] || "thread") == "fiber"
-  Tep::Server::Scheduled.new(MainApp.new).run(port, workers, false)
+  Tep::Server::Scheduled.new(MainApp.new).run(port, workers, false, unix_listener)
 else
-  Tep::Server::Threaded.new(MainApp.new).run(port, workers, false)
+  Tep::Server::Threaded.new(MainApp.new).run(port, workers, false, unix_listener)
+end
+ensure
+  unix_listener.close
 end

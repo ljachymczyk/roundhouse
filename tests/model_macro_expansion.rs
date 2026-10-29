@@ -599,6 +599,21 @@ siblings = ->(owner) { Comment.where(article_id: owner.id) }
 raise "initial sibling order" unless siblings.call(article).positioned.ids == items.map(&:id)
 raise "default score sequence: #{items.map(&:position_score).inspect}" unless items.map(&:position_score) == [1.0, 2.0, 3.0, 4.0]
 inactive = make.call(article, 5, false)
+ordered = siblings.call(article).order(:position_score)
+ordered_sql = ordered.to_sql
+begin
+  ordered.reorder
+  raise "no-argument reorder was accepted"
+rescue ArgumentError => error
+  raise "wrong reorder error: #{error.message}" unless error.message == "The method .reorder() must contain arguments."
+end
+raise "failed reorder mutated the relation" unless ordered.to_sql == ordered_sql
+loaded = siblings.call(article).order(:position_score)
+loaded_ids = loaded.to_a.map(&:id)
+loaded.clear_ordering
+raise "clear_ordering kept the loaded cache" unless loaded.instance_variable_get(:@records).nil?
+raise "clear_ordering left stale ordered ids reachable" unless loaded.to_a.map(&:id) == loaded_ids
+raise "maximum lost the relation scope" unless ordered.maximum(:position_score) == 5.0
 projected = siblings.call(article).active.positioned.select(:id)
 raise "minimum ignored the relation scope/projection" unless projected.minimum(:position_score) == 1.0
 raise "maximum ignored the relation scope/projection" unless projected.maximum(:position_score) == 4.0
@@ -651,8 +666,10 @@ items[0].update!(position_score: 1e-11)
 items[1].update!(position_score: 2e-11)
 items[2].move_to_position(1)
 raise "rebalance order" unless siblings.call(article).active.positioned.ids == [items[0].id, items[2].id, items[1].id, items[3].id]
-raise "rebalance threshold" unless items[2].send(:rebalance_required?)
-items[2].send(:rebalance_positions)
+# The move ran in `with_lock`'s transaction, so the `after_save_commit`
+# waited for its COMMIT, by which time the move had flagged the rebalance:
+# it ran then, as in Rails, and cleared the flag.
+raise "rebalance threshold" if items[2].send(:rebalance_required?)
 raise "rebalance scores: #{siblings.call(article).active.positioned.pluck(:position_score).inspect}" unless siblings.call(article).active.positioned.pluck(:position_score) == [1.0, 2.0, 3.0, 4.0]
 raise "active sibling exclusion" unless siblings.call(article).active.positioned.count == 4 && !siblings.call(article).active.positioned.ids.include?(inactive.id)
 raise "owner isolation" unless !siblings.call(article).active.positioned.ids.include?(foreign.id)
