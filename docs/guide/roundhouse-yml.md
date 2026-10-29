@@ -137,6 +137,22 @@ The supported subset:
   the five redirect codes Rack's `redirect?` names, not every 3xx),
   `redirect_to`, and the status predicates of `Rack::Response::Helpers`
   (`be_successful`, `be_ok`, `be_not_found`, `be_redirect`, ...).
+- rspec-mocks, read as the Mocha chains Roundhouse serves for Minitest
+  suites: `allow(x).to receive(:m)` is `x.stubs(:m)`, `expect(x).to
+  receive(:m)` is `x.expects(:m)` (once, as in RSpec), `not_to receive`
+  is `.never`; `with`, `and_return`, `and_raise`, `and_yield`, `once`,
+  `twice`, `thrice`, `exactly` / `at_least` / `at_most(n).times`,
+  `receive_messages`, `allow_any_instance_of` / `expect_any_instance_of`
+  (`any_instance`), and `double` / `instance_double` / `class_double` as
+  Mocha's `stub` (the check that the class defines the doubled methods
+  is dropped). In `with`, `anything`, `instance_of`, `kind_of`,
+  `any_args`, `no_args` and `hash_including` keep their meaning; other
+  argument matchers, and a constant, Regexp or Range argument (RSpec
+  matches it with `===`, Mocha with `==`), are refused, as are spies
+  (`have_received`), `and_call_original` and block implementations.
+  What Roundhouse serves of Mocha on each target is what these chains
+  get: on Spinel a stub returning a value from an app method is not
+  served yet, and the test fails at that line.
 
 Roundhouse reads `spec/spec_helper.rb` and `spec/rails_helper.rb`, and
 the `spec/support/` files they load with the generated

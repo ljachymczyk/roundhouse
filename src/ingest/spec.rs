@@ -42,7 +42,11 @@
 //!   `change(receiver, :message)` bare or with `by`, `by_at_least`,
 //!   `by_at_most`, `from`, `to`;
 //! - on a request spec's `response`: `have_http_status`, `redirect_to`,
-//!   and the `Rack::Response::Helpers` status predicates (`be_successful`).
+//!   and the `Rack::Response::Helpers` status predicates (`be_successful`);
+//! - rspec-mocks read into Mocha chains for `lower::mocha` (`allow` /
+//!   `expect(...).to receive`, counts, `with` and its common argument
+//!   matchers, `and_return` / `and_raise` / `and_yield`, `receive_messages`,
+//!   `*_any_instance_of`, `double` / `instance_double` as `stub`).
 
 use crate::det::HashMap;
 
@@ -1247,8 +1251,9 @@ fn desugar(expr: &Expr, ctx: &Ctx<'_>) -> Result<Expr, String> {
                     None => Err("`described_class` in a group that describes no constant".into()),
                 };
             }
+            "double" | "instance_double" | "class_double" => return test_double(expr.span, method.as_str(), args, ctx),
             "expect" | "is_expected" | "expect_any_instance_of" | "allow" | "allow_any_instance_of"
-            | "double" | "instance_double" | "class_double" | "spy" | "pending" | "skip"
+            | "object_double" | "spy" | "instance_spy" | "class_spy" | "pending" | "skip"
             | "aggregate_failures" => {
                 return Err(format!("`{}` here", method.as_str()));
             }
@@ -1294,7 +1299,10 @@ fn expectation(expr: &Expr, ctx: &Ctx<'_>) -> Result<Option<Expr>, String> {
     else {
         return Ok(None);
     };
-    if !matches!(target_method.as_str(), "expect" | "is_expected") {
+    if !matches!(
+        target_method.as_str(),
+        "expect" | "is_expected" | "allow" | "allow_any_instance_of" | "expect_any_instance_of"
+    ) {
         return Ok(None);
     }
     if block.is_some() {
@@ -1304,6 +1312,17 @@ fn expectation(expr: &Expr, ctx: &Ctx<'_>) -> Result<Option<Expr>, String> {
         return Err("`to` / `not_to` without exactly one matcher".into());
     };
     let span = expr.span;
+    // rspec-mocks: `allow(x).to receive(:m)...` and friends.
+    if let Some(base) = mock_base(matcher) {
+        let ([object], None) = (target_args.as_slice(), target_block) else {
+            return Err(format!("`{}` without exactly one object", target_method.as_str()));
+        };
+        let object = desugar(object, ctx)?;
+        return mock_expectation(span, target_method.as_str(), object, positive, matcher, base, ctx).map(Some);
+    }
+    if target_method.as_str() != "expect" && target_method.as_str() != "is_expected" {
+        return Err(format!("`{}` with a matcher other than `receive`", target_method.as_str()));
+    }
     let actual = match (target_method.as_str(), target_args.as_slice(), target_block) {
         ("expect", [actual], None) => desugar(actual, ctx)?,
         ("is_expected", [], None) => self_call("subject", target.span),
@@ -1330,6 +1349,269 @@ fn expectation(expr: &Expr, ctx: &Ctx<'_>) -> Result<Option<Expr>, String> {
     } else {
         Expr::new(span, ExprNode::Seq { exprs: asserts })
     }))
+}
+
+/// The `receive(:m)` / `receive_messages(...)` / `have_received(:m)` a
+/// mock matcher chain starts from, when `matcher` is one.
+fn mock_base(matcher: &Expr) -> Option<&Expr> {
+    let mut base = matcher;
+    while let ExprNode::Send { recv: Some(inner), .. } = &*base.node {
+        base = inner;
+    }
+    match &*base.node {
+        ExprNode::Send { recv: None, method, .. }
+            if matches!(method.as_str(), "receive" | "receive_messages" | "have_received" | "receive_message_chain") =>
+        {
+            Some(base)
+        }
+        _ => None,
+    }
+}
+
+/// rspec-mocks, read into the Mocha chains `lower::mocha` serves (and
+/// hands what it does not serve to `MochaBridge`):
+///
+/// ```ruby
+/// allow(x).to receive(:m).with(a).and_return(v)  # x.stubs(:m).with(a).returns(v)
+/// expect(x).to receive(:m).twice                 # x.expects(:m).twice
+/// expect(x).not_to receive(:m)                   # x.expects(:m).never
+/// allow_any_instance_of(K).to receive(:m)        # K.any_instance.stubs(:m)
+/// allow(x).to receive_messages(a: 1, b: 2)       # x.stubs(:a).returns(1); x.stubs(:b).returns(2)
+/// ```
+///
+/// Both libraries verify message expectations when the example ends and
+/// drop every stub with it; an `expect(x).to receive(:m)` with no count
+/// is exactly once in both. Argument constraints are rspec's own names
+/// where Mocha has the same matcher (`anything`, `instance_of`,
+/// `kind_of`), translated where it spells it differently (`any_args`,
+/// `no_args`, `hash_including`), and refused otherwise. A constant, a
+/// Regexp or a Range given as an argument is refused too: rspec matches
+/// it with `===` (`with(User)` admits a user), Mocha with `==`.
+fn mock_expectation(
+    span: Span,
+    target: &str,
+    object: Expr,
+    positive: bool,
+    matcher: &Expr,
+    base: &Expr,
+    ctx: &Ctx<'_>,
+) -> Result<Expr, String> {
+    let allow = target.starts_with("allow");
+    let head = if target.ends_with("_any_instance_of") {
+        send(Some(object), "any_instance", Vec::new(), span)
+    } else {
+        object
+    };
+    let ExprNode::Send { method: base_method, args: base_args, block: base_block, .. } = &*base.node else {
+        unreachable!("mock_base answers a Send");
+    };
+    if base_block.is_some() {
+        return Err(format!("a block implementation on `{}`", base_method.as_str()));
+    }
+    match base_method.as_str() {
+        "receive" => {}
+        "receive_messages" => {
+            if !allow || !positive || !std::ptr::eq(base, matcher) {
+                return Err("`receive_messages` other than `allow(x).to receive_messages(...)`".into());
+            }
+            let [hash] = base_args.as_slice() else {
+                return Err("`receive_messages` without one Hash".into());
+            };
+            let ExprNode::Hash { entries, .. } = &*hash.node else {
+                return Err("`receive_messages` without one Hash".into());
+            };
+            let mut stubs = Vec::new();
+            for (key, value) in entries {
+                let ExprNode::Lit { value: Literal::Sym { .. } } = &*key.node else {
+                    return Err("`receive_messages` with a key that is not a symbol".into());
+                };
+                let stub = send(Some(head.clone()), "stubs", vec![key.clone()], span);
+                stubs.push(send(Some(stub), "returns", vec![desugar(value, ctx)?], span));
+            }
+            return Ok(Expr::new(span, ExprNode::Seq { exprs: stubs }));
+        }
+        "receive_message_chain" => return Err("`receive_message_chain`".into()),
+        // A spy check reads the calls made so far; Mocha keeps none.
+        other => return Err(format!("`{other}` (test spies)")),
+    }
+    let [name] = base_args.as_slice() else {
+        return Err("`receive` without exactly one message name".into());
+    };
+    let name = match &*name.node {
+        ExprNode::Lit { value: Literal::Sym { .. } } => name.clone(),
+        ExprNode::Lit { value: Literal::Str { value } } => {
+            Expr::new(name.span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(value.as_str()) } })
+        }
+        _ => return Err("`receive` with a message name that is not a literal".into()),
+    };
+    if allow && !positive {
+        return Err("`allow(...).not_to receive` (RSpec refuses it too)".into());
+    }
+
+    // The qualifiers, innermost first.
+    let mut qualifiers: Vec<&Expr> = Vec::new();
+    let mut node = matcher;
+    while !std::ptr::eq(node, base) {
+        let ExprNode::Send { recv: Some(inner), .. } = &*node.node else { break };
+        qualifiers.insert(0, node);
+        node = inner;
+    }
+
+    let mut chain = send(Some(head), if allow { "stubs" } else { "expects" }, vec![name], span);
+    let mut counted = false;
+    let mut pending_count: Option<(String, Expr)> = None;
+    for q in qualifiers {
+        let ExprNode::Send { method, args, block, .. } = &*q.node else { unreachable!() };
+        if block.is_some() {
+            return Err(format!("a block on `{}`", method.as_str()));
+        }
+        let args = args.iter().map(|a| desugar(a, ctx)).collect::<Result<Vec<_>, _>>()?;
+        let one = |what: &str| -> Result<Expr, String> {
+            match args.as_slice() {
+                [a] => Ok(a.clone()),
+                _ => Err(format!("`{what}` without exactly one argument")),
+            }
+        };
+        let q_name = method.as_str();
+        if pending_count.is_some() && !matches!(q_name, "times" | "time") {
+            return Err("`exactly` / `at_least` / `at_most` without `.times`".into());
+        }
+        match q_name {
+            "with" => chain = send(Some(chain), "with", mocha_arguments(args)?, span),
+            "and_return" if !args.is_empty() => chain = send(Some(chain), "returns", args, span),
+            "and_raise" if (1..=2).contains(&args.len()) => chain = send(Some(chain), "raises", args, span),
+            "and_yield" => chain = send(Some(chain), "yields", args, span),
+            "once" | "twice" | "never" if args.is_empty() && !allow => {
+                counted = true;
+                chain = send(Some(chain), q_name, Vec::new(), span);
+            }
+            "thrice" if args.is_empty() && !allow => {
+                counted = true;
+                chain = send(Some(chain), "times", vec![int_lit(3, span)], span);
+            }
+            "exactly" | "at_least" | "at_most" if !allow => {
+                let n = one(q_name)?;
+                // `at_least(:once)` reads without `.times`.
+                if let ExprNode::Lit { value: Literal::Sym { value } } = &*n.node {
+                    let count = match value.as_str() {
+                        "once" => 1,
+                        "twice" => 2,
+                        "thrice" => 3,
+                        _ => return Err(format!("`{q_name}(:{})`", value.as_str())),
+                    };
+                    counted = true;
+                    chain = count_qualifier(chain, q_name, int_lit(count, span), span);
+                } else {
+                    pending_count = Some((q_name.to_string(), n));
+                }
+            }
+            "times" | "time" if args.is_empty() => {
+                let Some((kind, n)) = pending_count.take() else {
+                    return Err("`.times` without `exactly` / `at_least` / `at_most`".into());
+                };
+                counted = true;
+                chain = count_qualifier(chain, &kind, n, span);
+            }
+            other => return Err(format!("`receive(...).{other}`")),
+        }
+    }
+    if pending_count.is_some() {
+        return Err("`exactly` / `at_least` / `at_most` without `.times`".into());
+    }
+    if !positive {
+        if counted {
+            return Err("`not_to receive` with a count".into());
+        }
+        chain = send(Some(chain), "never", Vec::new(), span);
+    }
+    Ok(chain)
+}
+
+fn int_lit(n: i64, span: Span) -> Expr {
+    Expr::new(span, ExprNode::Lit { value: Literal::Int { value: n } })
+}
+
+/// `exactly(n).times` / `at_least(n).times` / `at_most(n).times` in Mocha.
+fn count_qualifier(chain: Expr, kind: &str, n: Expr, span: Span) -> Expr {
+    let method = match kind {
+        "exactly" => "times",
+        other => other,
+    };
+    send(Some(chain), method, vec![n], span)
+}
+
+/// `with(...)`'s arguments as Mocha reads them.
+fn mocha_arguments(args: Vec<Expr>) -> Result<Vec<Expr>, String> {
+    if let [only] = args.as_slice() {
+        if is_bare_call(only, "no_args") {
+            return Ok(Vec::new());
+        }
+    }
+    args.into_iter().map(mocha_argument).collect()
+}
+
+fn mocha_argument(arg: Expr) -> Result<Expr, String> {
+    match &*arg.node {
+        ExprNode::Const { .. } | ExprNode::Lit { value: Literal::Regex { .. } } | ExprNode::Range { .. } => {
+            Err("a constant, Regexp or Range as a `with` argument (rspec matches it with `===`, Mocha with `==`)".into())
+        }
+        ExprNode::Send { recv: None, method, args, block: None, .. } => {
+            let rename = match method.as_str() {
+                "anything" | "instance_of" | "kind_of" => method.as_str(),
+                "an_instance_of" => "instance_of",
+                "a_kind_of" => "kind_of",
+                "any_args" => "any_parameters",
+                "hash_including" => "has_entries",
+                // A plain helper call (a let, a local method) is a value.
+                name if !is_argument_matcher(name) => return Ok(arg),
+                other => return Err(format!("the argument matcher `{other}`")),
+            };
+            let args = args.clone();
+            Ok(send(None, rename, args, arg.span))
+        }
+        _ => Ok(arg),
+    }
+}
+
+/// rspec-mocks' and rspec-expectations' argument matchers, so a call to
+/// one is not mistaken for a plain value.
+fn is_argument_matcher(name: &str) -> bool {
+    matches!(
+        name,
+        "anything" | "any_args" | "no_args" | "instance_of" | "an_instance_of" | "kind_of" | "a_kind_of"
+            | "hash_including" | "hash_excluding" | "hash_not_including" | "array_including"
+            | "array_excluding" | "duck_type" | "boolean" | "satisfy" | "a_string_including"
+            | "a_string_matching" | "a_value" | "a_hash_including" | "a_collection_including"
+            | "an_object_having_attributes" | "having_attributes" | "match_array"
+            | "a_value_within" | "a_truthy_value" | "a_falsey_value" | "a_nil_value"
+    ) || name.starts_with("a_") || name.starts_with("an_")
+}
+
+/// `double("name", m: v)` is Mocha's `stub("name", m: v)`: an object that
+/// answers those messages and refuses any other. `instance_double(K, m:
+/// v)` and `class_double` also check that K defines the messages; that
+/// check is dropped (a stub of a misspelt method passes here and fails
+/// in RSpec), so a suite RSpec passes passes here too.
+fn test_double(span: Span, kind: &str, args: &[Expr], ctx: &Ctx<'_>) -> Result<Expr, String> {
+    let mut args = args.iter().map(|a| desugar(a, ctx)).collect::<Result<Vec<_>, _>>()?;
+    if kind != "double" {
+        if args.is_empty() {
+            return Err(format!("`{kind}` without the class it doubles"));
+        }
+        args.remove(0);
+    }
+    let ok = match args.as_slice() {
+        [] => true,
+        [a] => matches!(&*a.node, ExprNode::Hash { .. } | ExprNode::Lit { value: Literal::Str { .. } }),
+        [a, b] => {
+            matches!(&*a.node, ExprNode::Lit { value: Literal::Str { .. } }) && matches!(&*b.node, ExprNode::Hash { .. })
+        }
+        _ => false,
+    };
+    if !ok {
+        return Err(format!("`{kind}` arguments other than a name and a Hash of answers"));
+    }
+    Ok(send(None, "stub", args, span))
 }
 
 fn is_bare_call(expr: &Expr, name: &str) -> bool {
@@ -2204,11 +2486,72 @@ end
         assert!(ingest_spec_files(src.as_bytes(), "/app/spec/requests/articles_spec.rb").is_err());
     }
 
+    /// The Mocha chain an rspec-mocks statement reads as, as a call
+    /// path: `x.stubs(:m).returns(1)` is `["stubs", "returns"]`.
+    fn chain_of(body: &str) -> Vec<String> {
+        let tms = ingest(&example(body));
+        let mut out = Vec::new();
+        let mut e = &tms[0].tests[0].body;
+        while let ExprNode::Send { recv: Some(r), method, .. } = &*e.node {
+            out.insert(0, method.as_str().to_string());
+            e = r;
+        }
+        out
+    }
+
+    fn refused(body: &str) -> String {
+        ingest_spec_files(example(body).as_bytes(), "/app/spec/models/article_spec.rb").unwrap_err().to_string()
+    }
+
     #[test]
-    fn mocks_are_refused() {
-        for body in ["allow(Article).to receive(:count).and_return(1)", "expect(Article).to receive(:count)"] {
-            let src = format!("describe Article do\n  it \"x\" do\n    {body}\n  end\nend\n");
-            assert!(ingest_spec_files(src.as_bytes(), "/app/spec/models/article_spec.rb").is_err(), "{body}");
+    fn rspec_mocks_become_mocha_chains() {
+        assert_eq!(chain_of("allow(Article).to receive(:count).and_return(1)"), ["stubs", "returns"]);
+        assert_eq!(chain_of("allow(Article).to receive(:count).with(1).and_return(2, 3)"), ["stubs", "with", "returns"]);
+        assert_eq!(chain_of("expect(Article).to receive(:find).with(1).twice"), ["expects", "with", "twice"]);
+        assert_eq!(chain_of("expect(Article).to receive(:find)"), ["expects"]);
+        assert_eq!(chain_of("expect(Article).not_to receive(:destroy_all)"), ["expects", "never"]);
+        assert_eq!(chain_of("expect(Article).to receive(:find).exactly(3).times"), ["expects", "times"]);
+        assert_eq!(chain_of("expect(Article).to receive(:find).at_least(:once)"), ["expects", "at_least"]);
+        assert_eq!(chain_of("allow(Article).to receive(:find).and_raise(ActiveRecord::RecordNotFound)"), ["stubs", "raises"]);
+        assert_eq!(chain_of("allow_any_instance_of(Article).to receive(:valid?).and_return(false)"), ["any_instance", "stubs", "returns"]);
+        let tms = ingest(&example("allow(Article).to receive_messages(count: 1, first: nil)"));
+        let ExprNode::Seq { exprs } = &*tms[0].tests[0].body.node else { panic!() };
+        assert_eq!(exprs.len(), 2);
+    }
+
+    #[test]
+    fn argument_matchers_become_mocha_matchers() {
+        let tms = ingest(&example("allow(Article).to receive(:where).with(hash_including(title: \"x\"), anything, any_args)"));
+        let body = format!("{:?}", tms[0].tests[0].body);
+        assert!(body.contains("has_entries") && body.contains("anything") && body.contains("any_parameters"), "{body}");
+        // `with(no_args)` is Mocha's `with()`.
+        let tms = ingest(&example("expect(Article).to receive(:count).with(no_args)"));
+        let ExprNode::Send { args, .. } = &*tms[0].tests[0].body.node else { panic!() };
+        assert!(args.is_empty());
+        assert!(refused("allow(Article).to receive(:find).with(Article)").contains("==="));
+        assert!(refused("allow(Article).to receive(:find).with(a_string_including(\"x\"))").contains("a_string_including"));
+    }
+
+    #[test]
+    fn doubles_become_mocha_stubs() {
+        let tms = ingest(&example("thing = double(\"thing\", name: \"N\")\n    other = instance_double(Article, title: \"t\")"));
+        let body = format!("{:?}", tms[0].tests[0].body);
+        assert!(body.contains("\"stub\"") && !body.contains("double"), "{body}");
+    }
+
+    #[test]
+    fn unread_mock_forms_are_refused() {
+        for (body, says) in [
+            ("expect(Article).to have_received(:count)", "spies"),
+            ("allow(Article).to receive(:count).and_call_original", "and_call_original"),
+            ("allow(Article).not_to receive(:count)", "allow"),
+            ("allow(Article).to receive(:count) { 1 }", "block"),
+            ("allow(Article).to receive(:count).once", "once"),
+            ("expect(Article).not_to receive(:count).once", "count"),
+            ("thing = spy(\"thing\")", "spy"),
+        ] {
+            let err = refused(body);
+            assert!(err.contains(says), "{body}: {err}");
         }
     }
 
