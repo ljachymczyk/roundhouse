@@ -542,7 +542,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("readonly?", Ty::Bool),
         ("busy_timeout=", Ty::Int),
         ("busy_handler_timeout=", Ty::Int),
-        // A schema-owning app (hindmost's conversation index): the
+        // A schema-owning app (a search index kept in SQLite): the
         // batch answers its last statement's first row; `transaction`
         // answers its block's value (true without one).
         ("execute_batch", Ty::Union { variants: vec![Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) }, Ty::Nil].into() }),

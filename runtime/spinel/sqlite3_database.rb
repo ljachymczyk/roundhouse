@@ -26,8 +26,8 @@
 # locked database for that many milliseconds, which is what the gem's
 # handler does (the gem's also releases Ruby's GVL; this lane has none).
 #
-# And the part a schema-owning app reaches (hindmost's conversation
-# index): `execute_batch` runs every statement of its SQL, binding
+# And the part a schema-owning app reaches (a search index kept
+# in SQLite): `execute_batch` runs every statement of its SQL, binding
 # `bind_vars` to each one that has exactly that many `?`s, and answers
 # the first row of the last statement (nil when it returns none);
 # `transaction` runs `begin <mode> transaction` (deferred by default)

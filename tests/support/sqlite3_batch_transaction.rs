@@ -1,5 +1,5 @@
 //! `SQLite3::Database#execute_batch`, `#transaction` and Float binds,
-//! as a schema-owning app (hindmost's conversation index) calls them.
+//! as a schema-owning app (a search index kept in SQLite) calls them.
 //! Shared by the interpreted lane (CRuby overlay, the sqlite3 gem
 //! itself: `tests/emit_and_run/sqlite3_batch_transaction.rs`) and the
 //! native one (spinel, `runtime/spinel/sqlite3_database.rb`:
