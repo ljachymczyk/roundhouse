@@ -17,7 +17,8 @@
 #
 # As the gem does: `new` opens (READWRITE|CREATE, or READONLY) and raises
 # `SQLite3::CantOpenException` when it cannot; the block form yields the
-# database and closes it after; `execute` binds its `?` parameters,
+# database and closes it after; `execute` binds its parameters (by
+# position, or by name from a Hash),
 # steps the first statement of its SQL and answers its rows, each an Array of column values (Integer,
 # Float, String, nil); `get_first_row` / `get_first_value` read the first
 # of those; a failed prepare or step raises `SQLite3::SQLException`
@@ -110,19 +111,19 @@ module SQLite3
       milliseconds
     end
 
-    # `bind_vars` fill the statement's `?` placeholders in order, as the
-    # gem's `execute(sql, bind_vars = [])` does: one value or an Array of
-    # them, each nil, an Integer, true/false (0/1), a Float (a REAL) or a
-    # String (its bytes, NULs included). Anything else raises rather than
-    # binding as text; the gem would bind a Hash by name.
+    # `bind_vars` fill the statement's placeholders as the gem's
+    # `execute(sql, bind_vars = [])` does (`Statement#bind_params`): one
+    # value or an Array of them, flattened, each taking the next `?`; a
+    # Hash among them binds by name. A value is nil, an Integer,
+    # true/false (0/1), a Float (a REAL) or a String (its bytes, NULs
+    # included). Anything else raises rather than binding as text.
     def execute(sql, bind_vars = [])
-      binds = bind_vars.is_a?(Array) ? bind_vars : [bind_vars]
       @lock.synchronize do
         raise SQLite3::Exception, "cannot use a closed database" if @closed
         stmt = prepare_statement(sql)
         rows = []
         begin
-          binds.each_with_index { |value, i| bind(stmt, i + 1, value) }
+          bind_params(stmt, bind_vars)
           while true
             rc = SQL.sqlite3_step(stmt)
             break if rc == SQL::DONE
@@ -229,7 +230,7 @@ module SQLite3
       first = nil
       begin
         if bind_vars.length == SQL.sqlite3_bind_parameter_count(stmt)
-          bind_vars.each_with_index { |value, i| bind(stmt, i + 1, value) }
+          bind_params(stmt, bind_vars)
         end
         rc = SQL.sqlite3_step(stmt)
         if rc == SQL::ROW
@@ -255,6 +256,37 @@ module SQLite3
         return head if SQL.sqlite3_complete(head) != 0
         from = at + 1
       end
+    end
+
+    # The gem's `Statement#bind_params`: the values flattened, a Hash
+    # binding each value by its key and anything else by position. Only
+    # the positional ones advance the position.
+    def bind_params(stmt, bind_vars)
+      index = 1
+      [bind_vars].flatten.each do |var|
+        if var.is_a?(Hash)
+          var.each { |key, value| bind(stmt, param_index(stmt, key), value) }
+        else
+          bind(stmt, index, var)
+          index += 1
+        end
+      end
+    end
+
+    # The gem's `Statement#bind_param` key: a Symbol or String names a
+    # `:name` placeholder (the colon added when it does not lead), an
+    # Integer is the position itself.
+    def param_index(stmt, key)
+      index =
+        if key.is_a?(Integer)
+          key
+        else
+          name = key.to_s
+          name = ":" + name unless name.start_with?(":")
+          SQL.sqlite3_bind_parameter_index(stmt, name)
+        end
+      raise SQLite3::Exception, "no such bind parameter" if index == 0
+      index
     end
 
     def bind(stmt, idx, value)

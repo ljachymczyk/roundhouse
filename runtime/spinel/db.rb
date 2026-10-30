@@ -145,6 +145,8 @@ module SQL
   # statement ends, and binds only a statement with as many `?`s as values.
   ffi_func :sqlite3_complete,          [:str],                                :int
   ffi_func :sqlite3_bind_parameter_count, [:ptr],                             :int
+  # A Hash of bind values binds each value to its `:name`.
+  ffi_func :sqlite3_bind_parameter_index, [:ptr, :str],                       :int
 
   # Out-params — sqlite3_open writes the db handle here, prepare_v2
   # writes the stmt handle. 8 bytes is enough for a 64-bit pointer.

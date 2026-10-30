@@ -65,6 +65,29 @@ class SqliteBatchProbe
     [ committed, raised, after_raise, opened, inside, rolled, db.transaction_active?, bodies ]
   end
 
+  # The gem's bind forms (`Statement#bind_params`): one value or an
+  # Array, flattened, also through get_first_row/get_first_value; a Hash
+  # binds by name, its key a Symbol or a String with or without the
+  # colon, or an Integer position; an unknown name raises.
+  def self.binds(db)
+    by_name = db.execute("SELECT n FROM notes WHERE body = :body AND score = :score", { body: "d", score: 1.0 })
+    named = db.get_first_value("SELECT :a || :b || :a", { "a" => "x", ":b" => "y" })
+    batch = db.execute_batch("INSERT INTO notes VALUES (:body, :n, 0.0); SELECT count(*) FROM notes", { body: "g", n: 7 })
+    missing = begin
+      db.execute("SELECT :a", { z: 1 })
+    rescue SQLite3::Exception => e
+      e.message
+    end
+    [ db.execute("SELECT ?", "one"),
+      db.get_first_row("SELECT body, n FROM notes WHERE body = ? AND n = ?", [ "d", 4 ]),
+      db.get_first_value("SELECT n FROM notes WHERE body = ?", [ "d" ]),
+      db.execute("SELECT ?, ?, ?", [ [ 1, 2 ], [ 3 ] ]),
+      by_name, named,
+      db.execute("SELECT ?, ?", { 2 => "two", 1 => "one" }),
+      db.execute("SELECT ?, :b", [ 1, { b: 2 } ]),
+      batch, missing ]
+  end
+
   # After `close` the gem raises before asking SQLite (REQUIRE_OPEN_DB).
   # Naming `SQLite3` here also makes the model require the shim.
   def self.after_close(db)
@@ -79,16 +102,18 @@ pub const SCRIPT: &str = r#"db = SQLite3::Database.new(SqliteBatchProbe.path)
 puts SqliteBatchProbe.batch(db).inspect
 puts SqliteBatchProbe.floats(db).inspect
 puts SqliteBatchProbe.transactions(db).inspect
+puts SqliteBatchProbe.binds(db).inspect
 db.close
 puts db.closed?
 puts SqliteBatchProbe.after_close(db)
 "#;
 
-/// The sqlite3 gem's answers (2.10.1 on CRuby 4.0) for `SCRIPT`.
+/// The sqlite3 gem's answers (2.10.1 and 2.10.2 on CRuby 4.0) for `SCRIPT`.
 pub const EXPECTED: &str = concat!(
     "[nil, [\"a;b\", 1], [2], nil, [[\"a;b\", 1], [\"c\", 0]]]\n",
     "[[[\"c\", \"real\"]], 2.5]\n",
     "[\"committed\", \"boom\", false, true, true, true, false, [\"a;b\", \"c\", \"d\"]]\n",
+    "[[[\"one\"]], [\"d\", 4], 4, [[1, 2, 3]], [[4]], \"xyx\", [[\"one\", \"two\"]], [[1, 2]], [4], \"no such bind parameter\"]\n",
     "true\n",
     "cannot use a closed database\n",
 );
