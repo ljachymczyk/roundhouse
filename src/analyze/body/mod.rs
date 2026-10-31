@@ -4630,10 +4630,6 @@ mod tests {
         classes
     }
 
-    fn class_ty(name: &str) -> Ty {
-        Ty::Class { id: ClassId(Symbol::from(name)), args: vec![].into() }
-    }
-
     /// CRuby's Kernel#URI: a String parses to a URI (RBS: `URI::Generic`),
     /// a URI comes back unchanged, and nil or an Integer raises
     /// ArgumentError, so those stay unanswered.

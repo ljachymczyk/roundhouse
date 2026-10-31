@@ -5034,6 +5034,44 @@ end
 }
 
 #[test]
+fn kernel_uri_answers_a_uri_whose_readers_dispatch() {
+    // CRuby's Kernel#URI parses a String to a URI (RBS: `URI::Generic`),
+    // so `URI(url)` is a known receiver: the uri library's readers
+    // dispatch, and a name it does not define is reported. Untyped,
+    // neither would be checked.
+    let app = app_from_files(&[
+        (
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\nend\n",
+        ),
+        (
+            "app/models/hook.rb",
+            r#"class Hook < ApplicationRecord
+  def origin(url)
+    uri = URI(url)
+    URI(url).bogus_never_registered
+    [uri.scheme, uri.host, uri.port, uri.path]
+  end
+end
+"#,
+        ),
+    ]);
+
+    let failures = send_dispatch_failures(&app);
+
+    assert!(
+        failures.iter().any(|f| f == "bogus_never_registered"),
+        "`URI(url)` is not typed as a URI; failures = {failures:?}",
+    );
+    for name in ["scheme", "host", "port", "path"] {
+        assert!(
+            !failures.iter().any(|f| f == name),
+            "`{name}` is a URI::Generic reader and must dispatch; failures = {failures:?}",
+        );
+    }
+}
+
+#[test]
 fn repeated_before_action_replaces_the_earlier_declaration() {
     // campfire's shape: the RoomScoped concern declares
     // `before_action :set_room`, and MessagesController, which includes
