@@ -1851,7 +1851,7 @@ fn report_ruby_only_sends(app: &App, target: BuildTarget) {
             || app.library_classes.iter().any(|class| class.methods.iter().any(|method| method.name.as_str() == name))
             || app.controllers.iter().any(|controller| controller.actions().any(|action| action.name.as_str() == name))
     };
-    let kernel: Vec<&str> = ["Rational", "Integer", "Float", "throw", "catch", "update_attribute", "attribute_in_database", "create_or_find_by", "create_or_find_by!"]
+    let kernel: Vec<&str> = ["Rational", "Integer", "Float", "URI", "throw", "catch", "update_attribute", "attribute_in_database", "create_or_find_by", "create_or_find_by!"]
         .into_iter()
         .filter(|name| !defines(name))
         .collect();
@@ -1864,6 +1864,8 @@ fn report_ruby_only_sends(app: &App, target: BuildTarget) {
                 (None, "Rational") if kernel.contains(&"Rational") => Some("Kernel#Rational"),
                 (None, "Integer") if kernel.contains(&"Integer") => Some("Kernel#Integer"),
                 (None, "Float") if kernel.contains(&"Float") => Some("Kernel#Float"),
+                // The uri library is the ruby family's and spinel's `packages/uri`; no strict runtime carries it.
+                (None, "URI") if kernel.contains(&"URI") => Some("Kernel#URI"),
                 (None, "throw") if kernel.contains(&"throw") => Some("Kernel#throw"),
                 (None, "catch") if kernel.contains(&"catch") => Some("Kernel#catch"),
                 (_, "update_attribute") if kernel.contains(&"update_attribute") => Some("ActiveRecord::Base#update_attribute"),
@@ -7439,7 +7441,7 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
     }
     let bundled = matches!(
         name,
-        "URI::HTTP" | "URI::HTTPS" | "URI::Error" | "URI::InvalidURIError" | "Net::OpenTimeout" | "Net::ReadTimeout"
+        "URI::Generic" | "URI::HTTP" | "URI::HTTPS" | "URI::Error" | "URI::InvalidURIError" | "Net::OpenTimeout" | "Net::ReadTimeout"
         | "SocketError"
         | "Net::HTTPRedirection" | "Net::HTTPOK" | "StringIO" | "OpenSSL::OpenSSLError"
         | "Net::HTTPSuccess" | "Net::HTTPBadResponse" | "Zlib::DataError" | "OpenSSL::Random"

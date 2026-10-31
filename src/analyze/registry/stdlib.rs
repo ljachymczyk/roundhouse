@@ -1100,8 +1100,30 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     for parser in ["URI::RFC2396_Parser", "URI::RFC3986_Parser"] {
         register_stdlib_class(classes, parser, &[], &[("escape", Ty::Str), ("unescape", Ty::Str)]);
     }
-    register_stdlib_class(classes, "URI::HTTP", &[], &[]);
+    // What `URI(x)` (Kernel#URI) answers: RBS signs it
+    // `(URI::Generic | string) -> URI::Generic`, and the readers below
+    // carry the uri library's own signatures (`attr_reader host: String?`).
+    // Only readers that spinel's `packages/uri` defines too are listed, so
+    // a typed call has a runtime behind it on every lane that accepts it.
+    // `URI.parse` above stays `Untyped` for now: retyping it would move
+    // types in every app that calls it.
+    let opt_str = || Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() };
+    let opt_int = || Ty::Union { variants: vec![Ty::Int, Ty::Nil].into() };
+    register_stdlib_class(classes, "URI::Generic", &[], &[
+        ("scheme", opt_str()), ("userinfo", opt_str()), ("host", opt_str()),
+        ("hostname", opt_str()), ("port", opt_int()), ("path", opt_str()),
+        ("query", opt_str()), ("fragment", opt_str()), ("default_port", opt_int()),
+        ("to_s", Ty::Str), ("==", Ty::Bool),
+    ]);
+    register_stdlib_class(classes, "URI::HTTP", &[], &[("request_uri", Ty::Str)]);
     register_stdlib_class(classes, "URI::HTTPS", &[], &[]);
+    // CRuby's ancestry: URI::HTTPS < URI::HTTP < URI::Generic.
+    for (owner, parent) in [("URI::HTTP", "URI::Generic"), ("URI::HTTPS", "URI::HTTP")] {
+        let cls = classes.entry(ClassId(Symbol::from(owner))).or_default();
+        if cls.parent.is_none() {
+            cls.parent = Some(ClassId(Symbol::from(parent)));
+        }
+    }
     // `res.is_a?(Net::HTTPSuccess)` — lobsters' Github; spinel's
     // `packages/net` defines the same response family.
     for response in ["Net::HTTPRedirection", "Net::HTTPOK", "Net::HTTPSuccess"] {

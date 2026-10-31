@@ -552,6 +552,34 @@ impl<'a> BodyTyper<'a> {
         false
     }
 
+    /// The value of `URI(arg)`, as CRuby's Kernel#URI answers it: a URI
+    /// object is returned unchanged, so it keeps its own class; a String
+    /// parses to a `URI::Generic` (RBS's return type, the class every URI
+    /// shares). An argument still unresolved or gradual is taken as RBS
+    /// takes it. A known other type (nil, an Integer) is not answered:
+    /// CRuby raises ArgumentError there.
+    fn kernel_uri(&self, arg: Option<&Ty>) -> Option<Ty> {
+        let generic = || Ty::Class { id: ClassId(Symbol::from("URI::Generic")), args: vec![].into() };
+        match arg {
+            None | Some(Ty::Str | Ty::Var { .. } | Ty::Untyped) => Some(generic()),
+            Some(ty @ Ty::Class { id, .. }) => {
+                let mut current = Some(id);
+                let mut seen = crate::det::HashSet::default();
+                while let Some(cid) = current {
+                    if cid.0.as_str() == "URI::Generic" {
+                        return Some(ty.clone());
+                    }
+                    if !seen.insert(cid) {
+                        break;
+                    }
+                    current = self.classes.get(cid).and_then(|c| c.parent.as_ref());
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
     pub fn new(classes: &'a HashMap<ClassId, ClassInfo>) -> Self {
         Self {
             classes,
@@ -2382,6 +2410,15 @@ impl<'a> BodyTyper<'a> {
                     && !self.app_defines(ctx.self_ty.as_ref(), method)
                 {
                     return if method.as_str() == "Integer" { Ty::Int } else { Ty::Float };
+                }
+                // `URI(x)`: Kernel#URI from the uri library, which the
+                // ruby family bundles and spinel's `packages/uri` defines.
+                if recv.is_none() && method.as_str() == "URI" && args.len() == 1 && block.is_none()
+                    && matches!(dispatched, Ty::Var { .. } | Ty::Untyped)
+                    && !self.app_defines(ctx.self_ty.as_ref(), method)
+                    && let Some(ty) = self.kernel_uri(args[0].ty.as_ref())
+                {
+                    return ty;
                 }
                 if recv.is_none() && method.as_str() == "Array" && args.len() == 1
                     && block.is_none()
@@ -4585,6 +4622,87 @@ mod tests {
             let mut expr = send(None, "Array", vec![var("x")]);
             assert_eq!(BodyTyper::new(&empty_classes()).analyze_expr(&mut expr, &ctx), array_of(elem));
         }
+    }
+
+    fn stdlib_classes() -> HashMap<ClassId, ClassInfo> {
+        let mut classes = empty_classes();
+        crate::analyze::registry::stdlib::register(&mut classes);
+        classes
+    }
+
+    fn class_ty(name: &str) -> Ty {
+        Ty::Class { id: ClassId(Symbol::from(name)), args: vec![].into() }
+    }
+
+    /// CRuby's Kernel#URI: a String parses to a URI (RBS: `URI::Generic`),
+    /// a URI comes back unchanged, and nil or an Integer raises
+    /// ArgumentError, so those stay unanswered.
+    #[test]
+    fn kernel_uri_answers_a_uri_or_the_uri_it_was_given() {
+        let classes = stdlib_classes();
+        for (arg, want) in [
+            (Ty::Str, Some(class_ty("URI::Generic"))),
+            (Ty::Untyped, Some(class_ty("URI::Generic"))),
+            (class_ty("URI::Generic"), Some(class_ty("URI::Generic"))),
+            (class_ty("URI::HTTP"), Some(class_ty("URI::HTTP"))),
+            (class_ty("URI::HTTPS"), Some(class_ty("URI::HTTPS"))),
+            (Ty::Nil, None),
+            (Ty::Int, None),
+            (optional_str(), None),
+            (class_ty("Article"), None),
+        ] {
+            let ctx = ctx_with_local("x", arg.clone());
+            let mut expr = send(None, "URI", vec![var("x")]);
+            let got = BodyTyper::new(&classes).analyze_expr(&mut expr, &ctx);
+            match want {
+                Some(want) => assert_eq!(got, want, "URI({arg:?})"),
+                None => assert!(
+                    !matches!(&got, Ty::Class { id, .. } if id.0.as_str().starts_with("URI::")),
+                    "URI({arg:?}) answered {got:?}"
+                ),
+            }
+        }
+    }
+
+    /// An app method named `URI` is the app's own, as for `Array`.
+    #[test]
+    fn kernel_uri_does_not_capture_an_app_method() {
+        let owner = ClassId(Symbol::from("Owner"));
+        let mut classes = stdlib_classes();
+        let mut info = ClassInfo::default();
+        info.instance_methods.insert(Symbol::from("URI"), Ty::Int);
+        classes.insert(owner.clone(), info);
+        let mut ctx = ctx_with_local("x", Ty::Str);
+        ctx.self_ty = Some(Ty::Class { id: owner, args: vec![].into() });
+        let mut expr = send(None, "URI", vec![var("x")]);
+        assert_eq!(BodyTyper::new(&classes).analyze_expr(&mut expr, &ctx), Ty::Int);
+    }
+
+    /// The readers carry the uri library's signatures, and URI::HTTPS
+    /// reaches them through URI::HTTP and URI::Generic as in CRuby.
+    #[test]
+    fn a_uri_answers_its_component_readers() {
+        let classes = stdlib_classes();
+        let optional_int = Ty::Union { variants: vec![Ty::Int, Ty::Nil].into() };
+        for recv in ["URI::Generic", "URI::HTTP", "URI::HTTPS"] {
+            for (method, want) in [
+                ("scheme", optional_str()),
+                ("host", optional_str()),
+                ("hostname", optional_str()),
+                ("port", optional_int.clone()),
+                ("path", optional_str()),
+                ("query", optional_str()),
+                ("fragment", optional_str()),
+                ("to_s", Ty::Str),
+            ] {
+                let ctx = ctx_with_local("u", class_ty(recv));
+                let mut expr = send(Some(var("u")), method, vec![]);
+                assert_eq!(BodyTyper::new(&classes).analyze_expr(&mut expr, &ctx), want, "{recv}#{method}");
+            }
+        }
+        let ctx = ctx_with_local("u", class_ty("URI::HTTPS"));
+        let mut expr = send(Some(var("u")), "request_uri", vec![]);
+        assert_eq!(BodyTyper::new(&classes).analyze_expr(&mut expr, &ctx), Ty::Str);
     }
 
     #[test]

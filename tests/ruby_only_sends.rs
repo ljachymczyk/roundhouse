@@ -3,14 +3,14 @@
 //! `with_object`, `Array[...]`, `Hash[...]`, `Array.try_convert` (a nested
 //! splat), `include?` on a `Class` value,
 //! Kernel's `Rational(...)` (what a rational literal ingests as) and
-//! Kernel's `Integer(...)` and `Float(...)`.
+//! Kernel's `Integer(...)` and `Float(...)`, and the uri library's `URI(...)`.
 //!
 //! The other emitters render each as the method name on its receiver,
 //! which nothing there defines, so every one refuses the construct by name
 //! instead of exiting 0 with a call that cannot run. The Ruby family emits
 //! them and builds (the runs are in `array_fetch_runs`,
 //! `array_batches_typing`, `container_index_constructor`,
-//! `include_query_receivers` and `rational_literal`).
+//! `include_query_receivers`, `rational_literal` and `kernel_uri`).
 
 use std::process::Command;
 
@@ -63,6 +63,9 @@ const MODEL: &str = r#"class Article < ApplicationRecord
 
   #: (String) -> Float
   def self.ratio(text) = Float(text)
+
+  #: (String) -> String?
+  def self.host_of(text) = URI(text).host
 end
 "#;
 
@@ -74,7 +77,7 @@ const SERVICE: &str = r#"class RowUnpack
 end
 "#;
 
-const REFUSED: [&str; 12] = [
+const REFUSED: [&str; 13] = [
     "Array#fetch",
     "Array#each_slice",
     "Array#each_cons",
@@ -87,6 +90,7 @@ const REFUSED: [&str; 12] = [
     "Module#include?",
     "Kernel#Integer",
     "Kernel#Float",
+    "Kernel#URI",
 ];
 
 fn build(root: &std::path::Path, target: &str) -> (bool, String) {
