@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 # Rails' `db:migrate` and `db:prepare` for an emitted app, over the
 # adapter seam (`ActiveRecord.adapter`).
 #
