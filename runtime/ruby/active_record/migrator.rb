@@ -14,7 +14,9 @@
 # As in Rails: `schema_migrations` lists the versions applied; each
 # pending migration runs in its own transaction and records its version
 # when it succeeds; a failure rolls that migration back and stops.
-# SQLite-only, like the rest of the emitted DDL.
+# The statements are SQLite's. A PostgreSQL tree (apply_postgresql_tree)
+# loads the schema at boot as before and records nothing; db:migrate and
+# db:prepare refuse there.
 
 module ActiveRecord
   # A migration that cannot run, or a database whose migration state
@@ -48,8 +50,24 @@ module ActiveRecord
 
     # Does the database track migrations (Rails or `prepare` set it up)?
     def self.set_up?
-      rows = ActiveRecord.adapter.select_rows("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'")
-      !rows.empty?
+      sql = if postgresql?
+              "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'schema_migrations'"
+            else
+              "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+            end
+      !ActiveRecord.adapter.select_rows(sql).empty?
+    end
+
+    # Is the database PostgreSQL? Its migrations are not rendered.
+    def self.postgresql?
+      Db.adapter_name == "postgresql"
+    end
+
+    # db:migrate and db:prepare run SQLite statements only.
+    def self.refuse_postgresql!
+      if postgresql?
+        raise MigrationError, "the migrations are rendered for SQLite only; this database is PostgreSQL"
+      end
     end
 
     # Does the database hold any table at all?
@@ -71,6 +89,7 @@ module ActiveRecord
 
     # Run every pending migration. Answers how many ran.
     def self.migrate(migrations, environment)
+      refuse_postgresql!
       if !set_up?
         raise MigrationError, "the database does not track migrations (no schema_migrations table); db:prepare sets up a new one"
       end
@@ -101,6 +120,7 @@ module ActiveRecord
     # newer than it; one that was set up gets migrated. Answers how many
     # migrations ran.
     def self.prepare(schema_statements, schema_versions, migrations, environment)
+      refuse_postgresql!
       if set_up?
         return migrate(migrations, environment)
       end
@@ -119,6 +139,12 @@ module ActiveRecord
     # keeps that build's behaviour: the schema's tables are created if
     # missing, and nothing is recorded.
     def self.boot(schema_statements, schema_versions, migrations, environment)
+      # PostgreSQL: the schema, as the server loaded it before migrations
+      # were tracked; nothing is recorded or reported
+      if postgresql?
+        schema_statements.each { |sql| ActiveRecord.adapter.execute_ddl(sql) }
+        return []
+      end
       if set_up?
         return pending(migrations).map { |m| m[0] }
       end
