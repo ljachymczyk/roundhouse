@@ -450,6 +450,8 @@ raise "nothing pending" unless m.pending(all).empty?
 more = all + [["20991231000001", "", "ALTER TABLE articles ADD COLUMN subtitle TEXT NOT NULL DEFAULT ''"]]
 raise "one applied" unless m.migrate(more, "development") == 1
 raise "recorded" unless m.applied_versions.include?("20991231000001")
+raise "current_version: #{m.current_version}" unless m.current_version == 20991231000001
+raise "migrations_paths" unless m.migrations_paths == ["db/migrate"]
 raise "column" unless ActiveRecord.adapter.select_rows("SELECT subtitle FROM articles").is_a?(Array)
 # its first statement succeeds, its second fails: the first is rolled back
 broken = more + [["20991231000002", "", "ALTER TABLE articles ADD COLUMN rank INTEGER", "ALTER TABLE no_such_table ADD COLUMN x TEXT"]]
