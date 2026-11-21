@@ -14,7 +14,7 @@ use crate::App;
 use crate::dialect::ModelBodyItem;
 use crate::expr::ExprNode;
 use crate::ident::{ClassId, Symbol};
-use crate::ty::Ty;
+use crate::ty::{FnTy, Ty};
 
 pub(in crate::analyze) fn register(
     classes: &mut HashMap<ClassId, ClassInfo>,
@@ -259,7 +259,47 @@ pub(in crate::analyze) fn register(
     // the name resolve. The `Pagy` surface below is `pagy.rbs` verbatim;
     // a method that is not listed (`page_url`, `in`, `options`, the `_js`
     // helpers, ...) is "no known method on Pagy" -- the refusal.
-    if app.gem_lock.as_ref().is_some_and(|lock| lock.has("pagy")) {
+    if app.gem_lock.as_ref().is_some_and(|lock| lock.has("pagy")) && crate::ingest::pagy_locked_before_43(app) {
+        // pagy9.rb: the API before 43, beside the extras the initializers load.
+        app_ctrl.class_methods.insert(Symbol::from("pagy"), Ty::Untyped);
+        if app.pagy.array {
+            app_ctrl.class_methods.insert(Symbol::from("pagy_array"), Ty::Untyped);
+        }
+        let nullable_int = Ty::Union { variants: vec![Ty::Int, Ty::Nil].into() };
+        let mut pagy = ClassInfo::default();
+        let series_item = Ty::Union { variants: vec![Ty::Int, Ty::Str, Ty::Sym].into() };
+        let Ty::Union { variants: param } = param_value_ty(true) else { unreachable!() };
+        let var = Ty::Union { variants: std::iter::once(Ty::Int).chain(param.iter().cloned()).collect::<Vec<_>>().into() };
+        for (m, ty) in [
+            ("page", Ty::Int),
+            ("limit", Ty::Int),
+            ("count", Ty::Int),
+            ("offset", Ty::Int),
+            ("last", Ty::Int),
+            ("pages", Ty::Int),
+            ("from", Ty::Int),
+            ("to", Ty::Int),
+            ("in", Ty::Int),
+            ("prev", nullable_int.clone()),
+            ("next", nullable_int),
+            ("series", Ty::Array { elem: std::sync::Arc::new(series_item) }),
+            ("vars", Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(var) }),
+        ] {
+            pagy.instance_methods.insert(Symbol::from(m), ty);
+        }
+        classes.insert(ClassId(Symbol::from("Pagy")), pagy);
+        for module in ["Pagy::Backend", "Pagy::Frontend"] {
+            let mut info = ClassInfo::default();
+            info.is_module = true;
+            classes.insert(ClassId(Symbol::from(module)), info);
+        }
+        let mut variable_error = ClassInfo::default();
+        variable_error.parent = Some(ClassId(Symbol::from("ArgumentError")));
+        classes.insert(ClassId(Symbol::from("Pagy::VariableError")), variable_error);
+        let mut overflow_error = ClassInfo::default();
+        overflow_error.parent = Some(ClassId(Symbol::from("Pagy::VariableError")));
+        classes.insert(ClassId(Symbol::from("Pagy::OverflowError")), overflow_error);
+    } else if app.gem_lock.as_ref().is_some_and(|lock| lock.has("pagy")) {
         app_ctrl.class_methods.insert(Symbol::from("pagy"), Ty::Untyped);
         let nullable_int = Ty::Union { variants: vec![Ty::Int, Ty::Nil].into() };
         let mut pagy = ClassInfo::default();
@@ -446,9 +486,9 @@ pub(in crate::analyze) fn register(
     // with BOTH block parameters, because a block yielding two values
     // that names one leaves the second bound to nothing and everything
     // compared against it untyped.
-    let yields_two = |first: (&str, Ty), second: (&str, Ty), verdict: Ty| Ty::Fn {
+    let yields_two = |first: (&str, Ty), second: (&str, Ty), verdict: Ty| Ty::Fn(Box::new(FnTy {
         params: Vec::new().into(),
-        block: Some(std::sync::Arc::new(Ty::Fn {
+        block: Some(std::sync::Arc::new(Ty::Fn(Box::new(FnTy {
             params: [first, second]
                 .into_iter()
                 .map(|(name, ty)| crate::ty::Param {
@@ -460,11 +500,11 @@ pub(in crate::analyze) fn register(
             block: None,
             ret: std::sync::Arc::new(verdict),
             effects: crate::effect::EffectSet::default(),
-        })),
+        })))),
         // The block's verdict, or nil once the challenge is rendered.
         ret: std::sync::Arc::new(Ty::Untyped),
         effects: crate::effect::EffectSet::default(),
-    };
+    }));
     let str_hash = || Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Str) };
     for m in ["authenticate_or_request_with_http_basic", "authenticate_with_http_basic"] {
         app_ctrl.class_methods.insert(
@@ -676,7 +716,7 @@ fn register_inertia(classes: &mut HashMap<ClassId, ClassInfo>, app_ctrl: &mut Cl
     for name in ["prop", "lazy_prop"] {
         page.instance_methods.insert(
             Symbol::from(name),
-            Ty::Fn {
+            Ty::Fn(Box::new(FnTy {
                 params: vec![
                     crate::ty::Param {
                         name: Symbol::from("key"),
@@ -692,7 +732,7 @@ fn register_inertia(classes: &mut HashMap<ClassId, ClassInfo>, app_ctrl: &mut Cl
                 block: None,
                 ret: std::sync::Arc::new(Ty::Nil),
                 effects: crate::effect::EffectSet::default(),
-            },
+            })),
         );
     }
     if let Some(methods) = parsed.get(&ClassId(Symbol::from("ActionController::Base"))) {
@@ -702,7 +742,7 @@ fn register_inertia(classes: &mut HashMap<ClassId, ClassInfo>, app_ctrl: &mut Cl
     }
     app_ctrl.class_methods.insert(
         Symbol::from("inertia_errors"),
-        Ty::Fn {
+        Ty::Fn(Box::new(FnTy {
             params: vec![crate::ty::Param {
                 name: Symbol::from("errors"),
                 ty: Ty::Untyped.into(),
@@ -711,7 +751,7 @@ fn register_inertia(classes: &mut HashMap<ClassId, ClassInfo>, app_ctrl: &mut Cl
             block: None,
             ret: std::sync::Arc::new(Ty::Nil),
             effects: crate::effect::EffectSet::default(),
-        },
+        })),
     );
     // A literal props hash never leaves `InertiaRails.optional` / `.defer`
     // in the tree: ingest unwraps them. A helper that returns those

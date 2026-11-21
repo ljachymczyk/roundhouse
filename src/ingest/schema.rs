@@ -108,6 +108,11 @@ pub fn ingest_schema_with_generated_expression_dialect(
             verb @ ("add_check_constraint" | "add_index" | "add_reference" | "add_belongs_to") => {
                 if let Err(gap) = apply_table_verb(verb, &call_arguments(call), file, &mut schema, dialect) { gaps.push(gap); }
             }
+            // Dumped ahead of the tables (`create_schema`, then
+            // `enable_extension`), as the PostgreSQL DDL creates them.
+            verb @ ("enable_extension" | "disable_extension" | "create_schema" | "drop_schema") => {
+                if let Err(gap) = apply_database_object_verb(verb, &call_arguments(call), file, &mut schema) { gaps.push(gap); }
+            }
             _ => {}
         }
     });
@@ -222,6 +227,7 @@ pub fn ingest_migration_with_generated_expression_dialect(
 const UNSUPPORTED_VERBS: &[&str] = &[
     "create_join_table",
     "drop_join_table",
+    "rename_schema",
     "reversible",
     "revert",
     "up_only",
@@ -814,12 +820,159 @@ fn apply_table_verb(
                 }
             }
         }
-        // Extensions don't affect column typing; skipped like before.
-        "enable_extension" | "disable_extension" => {}
+        // Extensions and schemas don't affect column typing. They are
+        // recorded for the PostgreSQL DDL, which creates them ahead of the
+        // tables.
+        "enable_extension" | "disable_extension" | "create_schema" | "drop_schema" => apply_database_object_verb(verb, args, file, schema)?,
         // Anything else receiver-less is arbitrary migration Ruby
         // (`say`, backfill helpers) — not schema-affecting.
         _ => {}
     }
+    Ok(())
+}
+
+/// `enable_extension` / `disable_extension` / `create_schema` /
+/// `drop_schema` with a literal name, folded into the schema's
+/// [`Schema::extensions`] and [`Schema::schemas`]. A name that is not a
+/// literal is left out of what the call creates, as every one was before;
+/// a call with such a name that could remove what is already recorded is
+/// refused (see [`unread_name`]).
+///
+/// Each verb follows what Rails runs. `enable_extension` is `CREATE
+/// EXTENSION IF NOT EXISTS`, so enabling one already recorded keeps its
+/// place and schema. `drop_schema` (and `create_schema` with `force:`) is
+/// `DROP SCHEMA ... CASCADE`; see [`drop_folded_schema`]. `disable_extension`
+/// with `force: :cascade` also drops whatever depends on the extension
+/// (other extensions, columns of its types), which the fold can't tell,
+/// so it is refused.
+fn apply_database_object_verb(verb: &str, args: &[Node<'_>], file: &str, schema: &mut Schema) -> Result<(), IngestError> {
+    let Some(name) = args.first().and_then(name_value) else { return unread_name(verb, args, file, schema) };
+    // Rails' PostgreSQL adapter takes the last two dot-separated parts
+    // as the schema and the extension (`name.to_s.split(".").values_at(-2, -1)`).
+    let parts: Vec<&str> = name.split('.').collect();
+    let bare = parts.last().copied().unwrap_or_default();
+    match verb {
+        "enable_extension" => {
+            if !schema.extensions.iter().any(|e| e.name.as_str() == bare) {
+                let in_schema = (parts.len() > 1).then(|| Symbol::from(parts[parts.len() - 2]));
+                schema.extensions.push(crate::schema::Extension { name: Symbol::from(bare), schema: in_schema });
+            }
+        }
+        "disable_extension" => {
+            // A keyword splat (`**{ force: :cascade }`, `**options`)
+            // hides the `force:` it may carry.
+            let splat = args.iter().skip(1).any(|arg| {
+                arg.as_keyword_hash_node().is_some_and(|hash| hash.elements().iter().any(|e| e.as_assoc_splat_node().is_some()))
+            });
+            if splat {
+                return Err(IngestError::Unsupported {
+                    file: file.into(),
+                    message: format!("disable_extension \"{name}\" with a ** keyword splat may carry force: :cascade, which drops what depends on the extension and is not modelled; a db/schema.rb dumped after it holds the result"),
+                });
+            }
+            // Rails adds CASCADE only for `force: :cascade`; any other
+            // literal is a plain drop.
+            if let Some(force) = kwarg_value(args.iter().skip(1), "force") {
+                let plain = force.as_false_node().is_some()
+                    || force.as_nil_node().is_some()
+                    || force.as_true_node().is_some()
+                    || force.as_symbol_node().is_some_and(|s| s.unescaped() != b"cascade");
+                if !plain {
+                    let option = if force.as_symbol_node().is_some() { "force: :cascade" } else { "a non-literal force:" };
+                    return Err(IngestError::Unsupported {
+                        file: file.into(),
+                        message: format!("disable_extension \"{name}\" with {option} can drop what depends on the extension (other extensions, columns of its types), which is not modelled; a db/schema.rb dumped after it holds the result"),
+                    });
+                }
+            }
+            schema.extensions.retain(|e| e.name.as_str() != bare);
+        }
+        "create_schema" => {
+            // `force:` (anything but a literal false or nil, or a `**`
+            // splat that may carry it) is `drop_schema` first.
+            if create_schema_forced(args) {
+                drop_folded_schema(&name, &format!("create_schema \"{name}\" with force:"), file, schema)?;
+            }
+            if !schema.schemas.iter().any(|s| s.as_str() == name) {
+                schema.schemas.push(Symbol::from(name.as_str()));
+            }
+        }
+        _ => drop_folded_schema(&name, &format!("drop_schema \"{name}\""), file, schema)?,
+    }
+    Ok(())
+}
+
+/// `create_schema`'s `force:`: anything but a literal false or nil, or a
+/// `**` splat that may carry it, runs `drop_schema` first.
+fn create_schema_forced(args: &[Node<'_>]) -> bool {
+    args.iter().skip(1).any(|arg| arg.as_keyword_hash_node().is_some_and(|hash| hash.elements().iter().any(|e| e.as_assoc_splat_node().is_some())))
+        || kwarg_value(args.iter().skip(1), "force").is_some_and(|force| force.as_false_node().is_none() && force.as_nil_node().is_none())
+}
+
+/// A call whose name the fold can't read (`disable_extension target`).
+/// Rails still runs it, so one that could remove what is already recorded
+/// (`disable_extension` an extension, `drop_schema` or a forced
+/// `create_schema` a schema and the extensions in it) is refused rather
+/// than skipped, which would create at boot what the migration removed.
+/// With nothing recorded it changes nothing the fold holds, unless it is
+/// a `disable_extension` with `force:`, refused as a literal one is.
+fn unread_name(verb: &str, args: &[Node<'_>], file: &str, schema: &Schema) -> Result<(), IngestError> {
+    let (call, removes) = match verb {
+        // Its only keyword is `force:`, so one given (or a `**` splat) may cascade to what the fold can't see.
+        "disable_extension" => ("disable_extension", !schema.extensions.is_empty() || args.iter().skip(1).any(|arg| arg.as_keyword_hash_node().is_some())),
+        "drop_schema" => ("drop_schema", !schema.schemas.is_empty() || !schema.extensions.is_empty()),
+        "create_schema" if create_schema_forced(args) => ("create_schema with force:", !schema.schemas.is_empty() || !schema.extensions.is_empty()),
+        _ => return Ok(()),
+    };
+    if !removes {
+        return Ok(());
+    }
+    Err(IngestError::Unsupported {
+        file: file.into(),
+        message: format!("{call} with a name that is not a literal may remove a schema or extension recorded before it, or what depends on one, which boot would then create; a db/schema.rb dumped after it holds the result"),
+    })
+}
+
+/// The schema an extension's qualifier names, as PostgreSQL reads it.
+/// Rails writes it unquoted (`SCHEMA EXTENSIONS`), so it folds to
+/// lowercase unless the qualifier is itself quoted (`'"Ext".pgcrypto'`).
+/// `create_schema` and `drop_schema` quote their names, which keep their
+/// case.
+fn extension_schema(qualifier: &str) -> String {
+    match qualifier.strip_prefix('"').and_then(|q| q.strip_suffix('"')) {
+        Some(quoted) => quoted.replace("\"\"", "\""),
+        None => qualifier.to_ascii_lowercase(),
+    }
+}
+
+/// Rails' `DROP SCHEMA ... CASCADE`, folded. A schema that holds none of
+/// the recorded extensions is removed. One that may hold an extension is
+/// refused: CASCADE also drops what depends on that extension in other
+/// schemas (another extension, a column of its type), which the fold
+/// can't tell. An extension enabled without a schema is in the first
+/// schema on the search path. The fold reads no search path (neither
+/// `schema_search_path` nor a role's or database's setting), so it takes
+/// the extension to be in `public`: PostgreSQL's default, `"$user", public`,
+/// puts it there unless a schema named after the user exists (#2260).
+fn drop_folded_schema(name: &str, call: &str, file: &str, schema: &mut Schema) -> Result<(), IngestError> {
+    let held: Vec<&str> = schema
+        .extensions
+        .iter()
+        .filter(|e| match &e.schema {
+            Some(s) => extension_schema(s.as_str()) == name,
+            None => name == "public",
+        })
+        .map(|e| e.name.as_str())
+        .collect();
+    if !held.is_empty() {
+        let unqualified = name == "public" && schema.extensions.iter().any(|e| e.schema.is_none());
+        let note = if unqualified { " (an extension enabled without a schema is taken to be in public, where PostgreSQL's default search path puts it unless a schema named after the user exists)" } else { "" };
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: format!("{call} drops the schema with CASCADE, taking extension {}{note} and what depends on it in other schemas (other extensions, columns of its types), which is not modelled; a db/schema.rb dumped after it holds the result", held.join(", ")),
+        });
+    }
+    schema.schemas.retain(|s| s.as_str() != name);
     Ok(())
 }
 
@@ -863,7 +1016,7 @@ fn fold_column(
     }
     let generated_option = has_generated_column_options(option_args);
     let generated = ty == "virtual" || generated_option;
-    let col = if generated {
+    let mut col = if generated {
         if verb == "change_column" {
             return Err(IngestError::Unsupported {
                 file: file.into(),
@@ -906,6 +1059,7 @@ fn fold_column(
         }
         col
     };
+    let mut promoted_others: Vec<Symbol> = Vec::new();
     if let Some(table) = schema.tables.get(&Symbol::from(t)) {
         // This fold replaces a same-named column for both
         // verbs. Do not let an ordinary add/change erase the
@@ -933,11 +1087,22 @@ fn fold_column(
         let mut candidate = table.clone();
         candidate.columns.retain(|existing| existing.name != col.name);
         candidate.columns.push(col.clone());
+        promote_native_generated(&mut candidate, dialect);
+        if let Some(promoted) = candidate.columns.last() {
+            col = promoted.clone();
+        }
+        // Not only the folded column: a change to an operand may move another's expression out of the shared grammar.
+        promoted_others = candidate.columns.iter().filter(|c| c.name != col.name && c.generated.as_ref().is_some_and(|g| g.native)).map(|c| c.name.clone()).collect();
         if table.columns.iter().any(|column| column.generated.is_some()) || col.generated.is_some() {
             validate_generated_migration_candidate(&candidate, verb, file, dialect)?;
         }
     }
     if let Some(table) = schema.tables.get_mut(&Symbol::from(t)) {
+        for other in table.columns.iter_mut().filter(|c| promoted_others.contains(&c.name)) {
+            if let Some(generated) = other.generated.as_mut() {
+                generated.native = true;
+            }
+        }
         match table.columns.iter().position(|x| x.name == col.name) {
             // `change_column` redefines the column where it stands.
             Some(at) if verb == "change_column" => table.columns[at] = col,
@@ -1315,6 +1480,31 @@ fn refuse_indexed_generated_column_mutation(
 /// Keep migration-derived schema state unchanged when a candidate
 /// mutation breaks a generated expression or another generated-table
 /// invariant. Expressions remain source SQL; renames never rewrite them.
+/// Under [`GeneratedExpressionDialect::OtherDatabase`], a generated
+/// expression the shared grammar can't read is the app's database's own SQL:
+/// it is kept as written, marked native, when nothing else about the column
+/// is refused.
+fn promote_native_generated(table: &mut Table, dialect: GeneratedExpressionDialect) {
+    if dialect != GeneratedExpressionDialect::OtherDatabase {
+        return;
+    }
+    for at in 0..table.columns.len() {
+        let column = &table.columns[at];
+        if column.generated.as_ref().is_none_or(|g| g.native)
+            || crate::schema::generated::validate_column_with_dialect(table, column, dialect).is_ok()
+        {
+            continue;
+        }
+        let mut native = column.clone();
+        if let Some(generated) = native.generated.as_mut() {
+            generated.native = true;
+        }
+        if crate::schema::generated::validate_column_with_dialect(table, &native, dialect).is_ok() {
+            table.columns[at] = native;
+        }
+    }
+}
+
 fn validate_generated_migration_candidate(
     table: &Table,
     verb: &str,
@@ -2223,6 +2413,7 @@ fn table_from_create_table(
     if table.primary_key_columns.iter().any(|k| !table.columns.iter().any(|c| &c.name == k)) {
         gaps.push(IngestError::Unsupported { file: file.into(), message: format!("primary key on {table_name} names a column the schema does not model") });
     }
+    promote_native_generated(&mut table, dialect);
     let invalid_generated = crate::schema::generated::validate_table_with_dialect(&table, dialect);
     for (column, reason) in &invalid_generated {
         gaps.push(IngestError::Unsupported {
@@ -2546,10 +2737,16 @@ struct ColumnOpts {
     /// `change_column` keeps the old default only when it was not.
     default_given: bool,
     limit: Option<u32>,
+    /// A decimal's `precision:` and `scale:` (PostgreSQL's `numeric(p,s)` rounds to them).
+    precision: Option<u32>,
+    scale: Option<u32>,
+    /// A `precision:`/`scale:` written as a value the column type can't hold (a negative scale).
+    unheld_decimal: Option<String>,
     /// A present array option is non-scalar unless explicitly false or nil.
     array: bool,
-    /// `default: []`, which `default_value` reads as no default.
-    empty_array_default: bool,
+    /// An array literal `default:` (`[]`, `[0]`, `["a"]`), as JSON, which
+    /// `default_value` reads as no default.
+    array_default: Option<String>,
     /// `collation:` with a value ([`Column::collated`]).
     collated: bool,
 }
@@ -2672,6 +2869,19 @@ fn json_literal(node: &Node<'_>) -> Option<String> {
     None
 }
 
+/// Whether an array column's JSON default holds only elements of the
+/// column's kind: integers for an integer column, strings for a string
+/// one (`lower::array_columns::stores_element`). Any other default is
+/// dropped, as one that ingest cannot read.
+fn array_default_matches(json: &str, col_type: &ColumnType) -> bool {
+    let Ok(serde_json::Value::Array(elements)) = serde_json::from_str::<serde_json::Value>(json) else { return false };
+    match col_type {
+        ColumnType::Integer | ColumnType::BigInt => elements.iter().all(|e| e.as_i64().is_some()),
+        ColumnType::String { .. } | ColumnType::Text => elements.iter().all(|e| e.is_string()),
+        _ => elements.is_empty(),
+    }
+}
+
 /// Collect column options while retaining array metadata omitted by the normalized column type.
 fn parse_column_opts<'pr>(nodes: impl Iterator<Item = &'pr Node<'pr>>) -> ColumnOpts {
     let mut opts = ColumnOpts::default();
@@ -2691,7 +2901,7 @@ fn parse_column_opts<'pr>(nodes: impl Iterator<Item = &'pr Node<'pr>>) -> Column
                         opts.default_expression = Some((node_span(value), sql_default_expression(value)));
                     }
                     opts.json_default = json_default_value(value);
-                    opts.empty_array_default = value.as_array_node().is_some_and(|a| a.elements().iter().next().is_none());
+                    opts.array_default = value.as_array_node().and_then(|_| opts.json_default.clone());
                 }
                 "limit" => {
                     if let Some(n) = integer_value(value) {
@@ -2700,6 +2910,11 @@ fn parse_column_opts<'pr>(nodes: impl Iterator<Item = &'pr Node<'pr>>) -> Column
                         }
                     }
                 }
+                "precision" | "scale" => match integer_value(value).map(u32::try_from) {
+                    Some(Ok(n)) => if key == "precision" { opts.precision = Some(n) } else { opts.scale = Some(n) },
+                    Some(Err(_)) => opts.unheld_decimal = Some(format!("{key} {}", integer_value(value).unwrap_or_default())),
+                    None => {}
+                },
                 "array" => {
                     opts.array = match bool_value(value) {
                         Some(enabled) => enabled,
@@ -2844,6 +3059,14 @@ fn generated_column_from_options(
                     };
                     opts.limit = Some(limit);
                 }
+                "precision" | "scale" => {
+                    let Some(n) = integer_value(&value).and_then(|n| u32::try_from(n).ok()) else {
+                        return Err(unsupported(format!(
+                            "generated column {key} for {table}.{col_name} must be a non-negative integer"
+                        )));
+                    };
+                    if key == "precision" { opts.precision = Some(n) } else { opts.scale = Some(n) }
+                }
                 "default" => {
                     return Err(unsupported(format!(
                         "generated columns cannot also have a default: {table}.{col_name}"
@@ -2879,6 +3102,7 @@ fn generated_column_from_options(
         } else {
             GeneratedColumnStorage::Virtual
         },
+        native: false,
     });
     Ok(column)
 }
@@ -2931,7 +3155,19 @@ fn column_with_type(
         "integer" | "smallint" => ColumnType::Integer,
         "bigint" => ColumnType::BigInt,
         "float" => ColumnType::Float,
-        "decimal" | "numeric" => ColumnType::Decimal { precision: None, scale: None },
+        "decimal" | "numeric" => {
+            if let Some(unheld) = &opts.unheld_decimal {
+                return Err(IngestError::Unsupported {
+                    file: file.into(),
+                    message: format!("decimal {unheld} for {table}.{col_name} is beyond what this build carries"),
+                });
+            }
+            let narrow = |n: Option<u32>, what: &str| n.map(u8::try_from).transpose().map_err(|_| IngestError::Unsupported {
+                file: file.into(),
+                message: format!("decimal {what} {} for {table}.{col_name} is beyond what this build carries", n.unwrap_or_default()),
+            });
+            ColumnType::Decimal { precision: narrow(opts.precision, "precision")?, scale: narrow(opts.precision.and(opts.scale), "scale")? }
+        }
         "string" | "inet" | "cidr" | "macaddr" | "enum" => ColumnType::String { limit: opts.limit },
         "text" | "citext" => ColumnType::Text,
         "boolean" => ColumnType::Boolean,
@@ -2983,14 +3219,16 @@ fn column_with_type(
         None
     };
 
+    let array_default = opts.array_default.clone().filter(|json| array_default_matches(json, &col_type));
     Ok(Column {
         name: Symbol::from(col_name),
         col_type,
         nullable: opts.nullable.unwrap_or(true),
-        // An array column's `default: []` is kept as `[]`; a target that
+        // An array column's literal default (`[]`, `[0]`, `["a"]`) is kept
+        // as JSON when each element is of the column's kind; a target that
         // stores the Array reads it (`Column::stored_default`).
-        default: if opts.array && opts.empty_array_default {
-            Some("[]".into())
+        default: if opts.array {
+            array_default
         } else if !opts.array && matches!(type_name, "json" | "jsonb") {
             opts.json_default.clone()
         } else {

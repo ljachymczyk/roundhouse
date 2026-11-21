@@ -46,6 +46,9 @@ require_relative "active_support_number_helper"
 require_relative "json_builder"
 
 module ActiveSupport
+  class DelegationError < ::NoMethodError
+  end
+
   # `ActiveSupport::JSON` — Rails' JSON coder over the json library.
   #
   # `encode` is `value.as_json.to_json` with Rails' default HTML-entity
@@ -370,18 +373,40 @@ module ActiveSupport
   end
 
   # Not a `reject!` on each: `errors` holds each detail's full message index for index, so both lose the same entries.
-  def self.errors_delete(errors, details, attribute)
+  # A nil `type_kind` is Rails' `delete(attribute)`, every error on it; otherwise only the entries
+  # whose type is that one — a Symbol type (type_symbolic true), or the message a String type was
+  # added with, which is what Rails' `Error#type` answers for it.
+  def self.errors_delete(errors, details, attribute, type_symbolic, type_kind)
     deleted = []
     i = details.length - 1
     while i >= 0
-      if details[i].attribute == attribute
-        deleted.unshift(details[i].message)
+      detail = details[i]
+      matched = detail.attribute == attribute
+      if matched && !type_kind.nil?
+        matched = detail.symbolic == type_symbolic && detail.kind == type_kind
+      end
+      if matched
+        deleted.unshift(detail.message)
         details.delete_at(i)
         errors.delete_at(i)
       end
       i -= 1
     end
     deleted.empty? ? nil : deleted
+  end
+
+  # Rails' `group_by_attribute`: each attribute with errors, in the order
+  # of its first one, to its `ActiveModel::Error`s — `Enumerable#group_by`
+  # over the errors, so a plain Hash with no default, not `details`. Same
+  # grouping as `errors_details`; reached from `lower::errors_index`.
+  def self.errors_group_by_attribute(details)
+    out = {}
+    details.each do |detail|
+      key = detail.attribute.to_sym
+      out[key] = [] unless out.key?(key)
+      out[key] << detail
+    end
+    out
   end
 
   # Rails' `details`: each attribute's errors, in the order of its first
@@ -503,6 +528,24 @@ module ActiveSupport
     return details if others.equal?(details)
     others.each { |error| errors_import(errors, details, error, nil, names, before, between, after) }
     others
+  end
+
+  # Rails' `errors.copy!(other)`: the record's own errors go, and each of
+  # the other's is taken as a copy — same attribute, kind and message, and
+  # a full message naming the attribute as THIS model names it, which is
+  # what `errors_import` builds. The copies are this record's own details,
+  # so clearing one errors object's leaves the other's whole. Copying a
+  # record's own errors is a no-op, as Rails' deep_dup of them is.
+  def self.errors_copy(errors, details, others, names, before, between, after)
+    return details if others.equal?(details)
+    errors.clear
+    details.clear
+    # Each copy's Strings are its own, as Rails' deep_dup of an error dups its attribute and type.
+    others.each do |error|
+      copy = ActiveRecord::ErrorDetail.new(error.attribute.dup, error.kind.dup, error.message.dup, error.full_message.dup, error.symbolic, error.optionless)
+      errors_import(errors, details, copy, nil, names, before, between, after)
+    end
+    details
   end
 
   # `ActiveSupport::MessageVerifier::InvalidSignature` — what a signed
@@ -1757,6 +1800,93 @@ module ActiveSupport
       i = i + 1
     end
     sign + out + rest
+  end
+
+  # bigdecimal/util's `String#to_d` (`BigDecimal.interpret_loosely`): leading whitespace skipped, a sign, then the
+  # longest decimal it can read (`_` only between digits, an exponent only with digits); none reads as a signed zero.
+  def self.loose_decimal_text(raw)
+    # Not by character: the grammar is single-byte ASCII, and a byte string indexes in constant time.
+    text = raw.b
+    i = 0
+    n = text.length
+    i = i + 1 while i < n && " \t\n\v\f\r".include?(text[i].to_s)
+    sign = ""
+    signed = false
+    if i < n && (text[i] == "+" || text[i] == "-")
+      sign = text[i] == "-" ? "-" : ""
+      signed = true
+      i = i + 1
+    end
+    # A special value only as the whole rest (trailing whitespace allowed): `"Infinityjunk"` reads as a zero.
+    rest = text[i, n].to_s.rstrip
+    return sign + "Infinity" if rest == "Infinity"
+    # Not a signed one: bigdecimal reads `NaN` before any sign, so `+NaN` is a zero.
+    return "NaN" if !signed && rest == "NaN"
+    int_part = loose_digits(text, i)
+    i = loose_digits_end(text, i)
+    frac_part = ""
+    if i < n && text[i] == "."
+      frac_part = loose_digits(text, i + 1)
+      i = loose_digits_end(text, i + 1)
+    end
+    return sign + "0" if int_part.empty? && frac_part.empty?
+    exponent = ""
+    if i < n && (text[i] == "e" || text[i] == "E" || text[i] == "d" || text[i] == "D")
+      j = i + 1
+      exp_sign = ""
+      if j < n && (text[j] == "+" || text[j] == "-")
+        exp_sign = text[j].to_s
+        j = j + 1
+      end
+      exp_digits = loose_digits(text, j)
+      exponent = "e" + exp_sign + exp_digits unless exp_digits.empty?
+    end
+    sign + (int_part.empty? ? "0" : int_part) + (frac_part.empty? ? "" : "." + frac_part) + exponent
+  end
+
+  # The digits from `at` on, an `_` kept out between two of them.
+  def self.loose_digits(text, at)
+    out = +""
+    j = at
+    n = text.length
+    while j < n
+      c = text[j].to_s
+      if c >= "0" && c <= "9"
+        out << c
+      elsif !(c == "_" && !out.empty? && j + 1 < n && text[j + 1].to_s >= "0" && text[j + 1].to_s <= "9")
+        break
+      end
+      j = j + 1
+    end
+    out
+  end
+
+  def self.loose_digits_end(text, at)
+    j = at
+    n = text.length
+    seen = false
+    while j < n
+      c = text[j].to_s
+      if c >= "0" && c <= "9"
+        seen = true
+      elsif !(c == "_" && seen && j + 1 < n && text[j + 1].to_s >= "0" && text[j + 1].to_s <= "9")
+        break
+      end
+      j = j + 1
+    end
+    j
+  end
+
+  # `to_d` on what a String's or nil's position holds (a request param, a nullable column): nil is zero, as
+  # bigdecimal/util's `NilClass#to_d`, and a shape with no `to_d` raises.
+  # A value the analysis could not type takes the Numeric reopens' `to_d` too.
+  def self.loose_to_d(value)
+    return BigDecimal("0") if value.nil?
+    return value if value.is_a?(BigDecimal)
+    return BigDecimal(value) if value.is_a?(Integer)
+    return BigDecimal(float_decimal_text(value)) if value.is_a?(Float)
+    raise NoMethodError, "undefined method 'to_d' for a value that is neither a String nor a number" unless value.is_a?(String)
+    BigDecimal(loose_decimal_text(value))
   end
 
   # Not `f.to_s` as it is: `Float#to_d` keeps the shortest digits but cuts them at 16 without rounding (bigdecimal's BIGDECIMAL_DOUBLE_FIGURES).

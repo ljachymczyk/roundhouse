@@ -89,6 +89,13 @@ fn register_connection_surface(classes: &mut HashMap<ClassId, ClassInfo>) {
 /// What a record of no model known here answers, from the runtime's signatures: its class's `primary_key` and
 /// `base_class`, and its `id` (orm_adapter's `value.send(value.class.primary_key)` over a record of any model).
 fn register_record_key_surface(classes: &mut HashMap<ClassId, ClassInfo>) {
+    // The connection reopen's table description, for a record of a model a gem declares (Doorkeeper's
+    // `self.class.columns` in its Application mixin), as for the app's models.
+    let base = classes.entry(ClassId(Symbol::from("ActiveRecord::Base"))).or_default();
+    base.class_methods.entry(Symbol::from("columns")).or_insert_with(|| {
+        Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: ClassId(Symbol::from("ActiveRecord::Column")), args: vec![].into() }) }
+    });
+    base.class_methods.entry(Symbol::from("column_names")).or_insert_with(|| Ty::Array { elem: std::sync::Arc::new(Ty::Str) });
     const BASE: &str = include_str!("../../../runtime/ruby/active_record/base.rbs");
     const KEYS: &str = include_str!("../../../runtime/spinel/active_record_attribute_keys.rbs");
     let id = ClassId(Symbol::from("ActiveRecord::Base"));
@@ -633,13 +640,26 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_node(classes, "Arel::Nodes::Quoted", &[], &[("to_s", Ty::Str), ("to_sql", Ty::Str)]);
     register_node(classes, "Arel::Nodes::Not", &[], &[("to_s", Ty::Str), ("to_sql", Ty::Str)]);
     register_node(classes, "Arel::Nodes::NamedFunction", &[], &[("to_s", Ty::Str), ("to_sql", Ty::Str)]);
-    for order in ["Arel::Nodes::Ascending", "Arel::Nodes::Descending"] {
+    // An ordering's `expr` is what it sorts by: the column's attribute
+    // for a term `relation.order_values` builds from a Symbol or Hash,
+    // or the SQL literal an app ordering wraps
+    // (`Arel::Nodes::Ascending.new(Arel.sql("LOWER(title)"))`), kept as
+    // given as Rails' Arel::Nodes::Unary keeps it. `name` still reads on
+    // the attribute arm.
+    let ordering_expr = Ty::Union { variants: vec![arel_attribute_ty.clone(), sql_literal.clone()].into() };
+    for order in ["Arel::Nodes::Ordering", "Arel::Nodes::Ascending", "Arel::Nodes::Descending"] {
         let node = Ty::Class { id: ClassId(Symbol::from(order)), args: vec![].into() };
         register_node(
             classes,
             order,
             &[],
-            &[("nulls_first", node.clone()), ("nulls_last", node), ("to_s", Ty::Str), ("to_sql", Ty::Str)],
+            &[
+                ("expr", ordering_expr.clone()),
+                ("nulls_first", node.clone()),
+                ("nulls_last", node),
+                ("to_s", Ty::Str),
+                ("to_sql", Ty::Str),
+            ],
         );
     }
     register_node(classes, "Arel::Nodes::Predicate", &[], &[("to_s", Ty::Str), ("to_sql", Ty::Str)]);
@@ -678,6 +698,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     ] {
         arel_attribute.instance_methods.insert(Symbol::from(pred), arel_node.clone());
     }
+    arel_attribute.instance_methods.insert(Symbol::from("name"), Ty::Str);
     classes.insert(ClassId(Symbol::from("Arel::Attribute")), arel_attribute);
 
     // `Arel::Node` boolean combinators chain into nodes; `where(node)`

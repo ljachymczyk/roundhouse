@@ -72,6 +72,24 @@ mod class_param_or_assign_app;
 mod class_param_or_assign;
 #[path = "spinel_toolchain/addressable.rs"]
 mod addressable;
+#[path = "spinel_toolchain/conditional_definitions.rs"]
+mod conditional_definitions;
+#[path = "support/ordered_options_app.rs"]
+mod ordered_options_app;
+#[path = "spinel_toolchain/ordered_options.rs"]
+mod ordered_options;
+#[path = "support/class_ext_app.rs"]
+mod class_ext_app;
+#[path = "spinel_toolchain/class_ext.rs"]
+mod class_ext;
+#[path = "support/aasm_gem.rs"]
+mod aasm_gem;
+#[path = "spinel_toolchain/aasm.rs"]
+mod aasm;
+#[path = "support/view_component_gem.rs"]
+mod view_component_gem;
+#[path = "spinel_toolchain/view_component.rs"]
+mod view_component;
 #[path = "support/class_attribute.rs"]
 mod class_attribute;
 #[path = "support/class_configuration.rs"]
@@ -94,6 +112,10 @@ mod data_factory;
 mod data_record_siblings_contract;
 #[path = "spinel_toolchain/data_record_siblings.rs"]
 mod data_record_siblings;
+#[path = "support/database_routes.rs"]
+mod database_routes_contract;
+#[path = "spinel_toolchain/database_routes.rs"]
+mod database_routes;
 #[path = "support/relation_fork.rs"]
 mod relation_fork_contract;
 #[path = "spinel_toolchain/relation_fork.rs"]
@@ -190,6 +212,10 @@ mod route_default_format;
 mod route_request_defaults_contract;
 #[path = "spinel_toolchain/route_request_defaults.rs"]
 mod route_request_defaults;
+#[path = "support/after_initialize_boot.rs"]
+mod after_initialize_boot_contract;
+#[path = "spinel_toolchain/after_initialize_boot.rs"]
+mod after_initialize_boot;
 #[path = "support/json_params.rs"]
 mod json_params_contract;
 #[path = "spinel_toolchain/json_params.rs"]
@@ -308,6 +334,14 @@ mod stdlib_scan_zlib;
 mod stdlib_rexml_include_contract;
 #[path = "spinel_toolchain/stdlib_rexml_include.rs"]
 mod stdlib_rexml_include;
+#[path = "support/gem_reopen_source.rs"]
+mod gem_reopen_source_contract;
+#[path = "spinel_toolchain/gem_reopen_source.rs"]
+mod gem_reopen_source;
+#[path = "support/gem_nested_once.rs"]
+mod gem_nested_once_contract;
+#[path = "spinel_toolchain/gem_nested_once.rs"]
+mod gem_nested_once;
 #[path = "support/stdlib_singleton.rs"]
 mod stdlib_singleton_contract;
 #[path = "spinel_toolchain/stdlib_singleton.rs"]
@@ -579,20 +613,52 @@ fn real_blog_spinel_tests_pass() {
     if std::env::var_os("RH_SPINEL_BUNDLE_COLLECT").is_some() {
         panic!("spinel bundle collect: not bundled");
     }
+    // Not `make spinel-test` on PRs and pushes: it compiles the whole runtime once per test file, four times the
+    // lane's longest test; Full validation (ROUNDHOUSE_SPINEL_SLIM=0) still builds each file alone, as the tree ships.
+    let (target, files) = if std::env::var("ROUNDHOUSE_SPINEL_SLIM").is_ok_and(|v| v == "0") {
+        ("spinel-test".to_string(), 0)
+    } else {
+        let makefile = std::fs::read_to_string(scratch.join("Makefile")).expect("read Makefile");
+        let tests: Vec<&str> = makefile
+            .split("SPINEL_TESTS := \\\n")
+            .nth(1)
+            .expect("Makefile lists SPINEL_TESTS")
+            .lines()
+            .map(|l| l.trim().trim_end_matches('\\').trim())
+            .take_while(|l| !l.is_empty())
+            .collect();
+        assert!(tests.len() > 1, "SPINEL_TESTS: {tests:?}");
+        let requires: String = tests
+            .iter()
+            .map(|t| format!("require_relative {:?}\n", t.trim_start_matches("test/")))
+            .collect();
+        std::fs::write(scratch.join("test/all_spinel_tests.rb"), requires).expect("write test/all_spinel_tests.rb");
+        ("build/test/all_spinel_tests".to_string(), tests.len())
+    };
     let output = Command::new("make")
-        .arg("spinel-test")
+        .arg(&target)
         .current_dir(&scratch)
         .output()
-        .expect("spawn make spinel-test");
-
+        .expect("spawn make");
     assert!(
         output.status.success(),
-        "make spinel-test failed\n\
+        "make {target} failed\n\
          \n=== stdout ===\n{}\n\
          \n=== stderr ===\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+    if files > 0 {
+        let run = Command::new(scratch.join(&target)).current_dir(&scratch).output().expect("run the suite");
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            run.status.success(),
+            "{target} failed\n=== stdout ===\n{stdout}\n=== stderr ===\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        // Every file's driver ran: one all-green line each.
+        assert_eq!(stdout.matches(" tests passed").count(), files, "{stdout}");
+    }
 }
 
 /// Exercise the shipped CLI/spin package, not the pre-spin_shape test overlay.
@@ -879,3 +945,6 @@ fn full_forwarding_keeps_the_native_argument_contract() {
     run.assert_passes();
     assert_eq!(run.stdout, "full forwarding contract passed\n");
 }
+
+#[path = "spinel_toolchain/data_declaration_composition.rs"]
+mod data_declaration_composition;

@@ -23,6 +23,25 @@ pub struct Schema {
     /// says: every schema built or ingested outside an application.
     #[serde(default, skip_serializing_if = "generated::GeneratedExpressionDialect::is_portable")]
     pub expression_dialect: generated::GeneratedExpressionDialect,
+    /// `create_schema "name"`, in order: the PostgreSQL schemas Rails'
+    /// `db:schema:load` creates before anything goes into them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schemas: Vec<Symbol>,
+    /// `enable_extension "name"` (or `"schema.name"`), in order, less any
+    /// a later `disable_extension` removed: what Rails' PostgreSQL adapter
+    /// creates ahead of the tables. Column typing never reads them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<Extension>,
+}
+
+/// One `enable_extension`: the extension, and the schema it goes into
+/// when the name is qualified (`"extensions.pgcrypto"`). Unqualified, it
+/// goes into the first schema on the search path, as PostgreSQL puts it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Extension {
+    pub name: Symbol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<Symbol>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -159,6 +178,11 @@ pub struct GeneratedColumn {
     /// Source SQL retained from `as:` or `GENERATED ALWAYS AS (...)`.
     pub expression: String,
     pub storage: GeneratedColumnStorage,
+    /// The expression is the app's own database's SQL, outside the grammar
+    /// SQLite and PostgreSQL read alike (`config/database.yml` names another
+    /// database than SQLite): only a tree that runs on that database carries it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub native: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

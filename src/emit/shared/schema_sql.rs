@@ -157,8 +157,14 @@ impl Dialect {
             return None;
         }
         if col.array_stored {
-            // `default: []`, the only array default ingest keeps.
-            return Some(format!("'{}'", raw.replace('\'', "''")));
+            // The array default ingest keeps, as JSON (`[]`, `[0]`,
+            // `["a"]`): SQLite stores that JSON text; PostgreSQL its own
+            // array literal (`'{}'`, `'{0}'`, `'{"a"}'`).
+            let literal = match self {
+                Dialect::Sqlite => raw.to_string(),
+                Dialect::Postgres => postgres_array_literal(raw)?,
+            };
+            return Some(format!("'{}'", literal.replace('\'', "''")));
         }
         match &col.col_type {
             ColumnType::Integer | ColumnType::BigInt => {
@@ -256,7 +262,7 @@ pub fn render_schema_statements(schema: &Schema) -> Vec<String> {
 /// unsupported generated expressions and virtual tables on PostgreSQL.
 pub fn render_schema_statements_for(schema: &Schema, dialect: Dialect) -> Result<Vec<String>, String> {
     validate_schema_for_dialect(schema, dialect)?;
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<String> = database_object_statements(schema, dialect);
     for (_name, table) in &schema.tables {
         // A virtual table is built by its MODULE, not from a column
         // list: no types, no NOT NULL, no AUTOINCREMENT key, and the
@@ -288,10 +294,14 @@ pub fn render_schema_statements_for(schema: &Schema, dialect: Dialect) -> Result
                 lines.push(dialect.key_column(col));
                 continue;
             }
-            // A stored array column holds the Array as JSON text
-            // (`lower::array_columns`).
+            // A stored array column (`lower::array_columns`) holds the
+            // Array as JSON text in SQLite, and in PostgreSQL as an array
+            // of its element (`text[]`, `integer[]`).
             let col_type = if col.array_stored {
-                dialect.column_type(&ColumnType::Text)
+                match dialect {
+                    Dialect::Sqlite => dialect.column_type(&ColumnType::Text),
+                    Dialect::Postgres => format!("{}[]", dialect.column_type(&col.col_type)),
+                }
             } else {
                 dialect.column_type(&col.col_type)
             };
@@ -1191,6 +1201,22 @@ fn sqlite_type(ct: &ColumnType) -> &'static str {
     }
 }
 
+/// PostgreSQL's array literal for an array default kept as JSON
+/// (`[0]` -> `{0}`, `["a"]` -> `{"a"}`): an integer bare, a string
+/// double-quoted with `\` and `"` backslash-escaped, the same element
+/// rule as runtime/spinel/array_column_pg.rb. `None` for any other JSON.
+fn postgres_array_literal(json: &str) -> Option<String> {
+    let serde_json::Value::Array(elements) = serde_json::from_str::<serde_json::Value>(json).ok()? else { return None };
+    let elements = elements
+        .iter()
+        .map(|e| match e {
+            serde_json::Value::String(s) => Some(format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))),
+            _ => e.as_i64().map(|n| n.to_string()),
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(format!("{{{}}}", elements.join(",")))
+}
+
 /// Map a Roundhouse `ColumnType` to the type Rails' PostgreSQL adapter
 /// creates for it (`NATIVE_DATABASE_TYPES`; `datetime` is Rails 7+'s
 /// `timestamp(6)`), in the spelling `pg_dump` prints.
@@ -1221,6 +1247,25 @@ fn postgres_type(ct: &ColumnType) -> String {
         ColumnType::Uuid => "uuid".into(),
         ColumnType::Interval => "interval".into(),
     }
+}
+
+/// The schemas and extensions `db/schema.rb` declares, as Rails'
+/// PostgreSQL adapter creates them ahead of the tables: each
+/// `create_schema`, then each `enable_extension` (`CREATE EXTENSION IF
+/// NOT EXISTS "pgcrypto"`, with ` SCHEMA <name>` unquoted for a qualified
+/// one, as Rails writes it). A schema is `IF NOT EXISTS`, as every
+/// statement here is, because boot runs these on every start. SQLite
+/// has neither, so it gets none.
+fn database_object_statements(schema: &Schema, dialect: Dialect) -> Vec<String> {
+    if dialect != Dialect::Postgres {
+        return Vec::new();
+    }
+    let schemas = schema.schemas.iter().map(|s| format!("CREATE SCHEMA IF NOT EXISTS {}", dialect.ident(s.as_str())));
+    let extensions = schema.extensions.iter().map(|e| match &e.schema {
+        Some(s) => format!("CREATE EXTENSION IF NOT EXISTS {} SCHEMA {}", dialect.ident(e.name.as_str()), s.as_str()),
+        None => format!("CREATE EXTENSION IF NOT EXISTS {}", dialect.ident(e.name.as_str())),
+    });
+    schemas.chain(extensions).collect()
 }
 
 #[cfg(test)]

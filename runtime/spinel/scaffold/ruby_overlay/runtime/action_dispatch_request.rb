@@ -166,6 +166,11 @@ module ActionDispatch
       query_string.empty? ? path : "#{path}?#{query_string}"
     end
 
+    # Rack's PATH_INFO, which `path` reads here.
+    def path_info
+      path
+    end
+
     # No middleware rewrites paths here, so original_* == current.
     def original_fullpath = fullpath
 
@@ -383,6 +388,13 @@ module ActionDispatch
 
     def inertia?
       !@env["HTTP_X_INERTIA"].to_s.empty?
+    end
+
+    # Rails' `parameters`: every param the request carries, by a String or a Symbol, the same Hash `params` answers
+    # from then on, so a write through either is seen by both.
+    def parameters
+      @params = @params.with_indifferent_access unless @params.is_a?(ActiveSupport::HashWithIndifferentAccess)
+      @params
     end
 
     # Query-string params only (Rails' GET-vs-POST split); lobsters'

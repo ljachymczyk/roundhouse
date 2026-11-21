@@ -854,6 +854,12 @@ module ActiveRecord
       @destroyed = false
     end
 
+    # Seat this record on `records`, loaded by a relation built off its
+    # has_many `name`, through that association's inverse. A model whose
+    # has_many has one answers it (generated); any other seats nothing.
+    def _set_inverse_from_queries(name, records)
+    end
+
     # ---- Class-level CRUD -------------------------------------------
 
     def self.all
@@ -1235,6 +1241,12 @@ module ActiveRecord
       nil
     end
 
+    # Rails' `restore_attributes`: every pending change written back, the
+    # names it restored. None here, for the same reason.
+    def restore_attributes
+      changes_to_save.keys
+    end
+
     # `id` never appears in the subclass `attributes` hash, so the
     # created-vs-updated question is answered by the save path itself
     # rather than the snapshot diff.
@@ -1384,11 +1396,12 @@ module ActiveRecord
     # transaction a plain `reload` already gives the guarantee Rails
     # extracts from the row lock: the enclosing `BEGIN` serializes
     # writers, so nothing can land between this read and a following
-    # write in the same transaction. A Postgres adapter would spell
-    # the `lock` argument as `FOR UPDATE` / `FOR SHARE` here; this
-    # runtime keeps the Rails signature — `lock` may be `true` or a
-    # String locking clause (`lock!("FOR UPDATE NOWAIT")`) — but
-    # doesn't need either under SQLite; both are accepted and ignored.
+    # write in the same transaction. This runtime keeps the Rails
+    # signature — `lock` may be `true` or a String locking clause
+    # (`lock!("FOR UPDATE NOWAIT")`) — but doesn't need either under
+    # SQLite; both are accepted and ignored. On PostgreSQL the ruby
+    # family's reopen (active_record/connection.rb) takes the row lock
+    # the clause names before this reload.
     def lock!(lock = nil)
       # Rails passes `reload(lock: lock)`; this runtime ignores the
       # clause under SQLite, so a bare reload keeps the same guarantee.
@@ -1484,6 +1497,12 @@ module ActiveRecord
       ok = @errors.empty?
       after_validation
       ok
+    end
+
+    # Not ActiveModel's `ValidationError`: on a record Rails raises the `RecordInvalid` that `save!` does.
+    def validate!
+      raise RecordInvalid, self unless valid?
+      true
     end
 
     # ---- Equality ---------------------------------------------------

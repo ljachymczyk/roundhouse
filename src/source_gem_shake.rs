@@ -193,43 +193,65 @@ pub(crate) fn shake(app: &App) -> Option<App> {
 /// An error in a gem's code the program does not reach becomes a note: the Spinel tree leaves that
 /// code out (`shake`), and the ruby family runs the installed gem, so no emitted program holds it.
 pub fn demote_unreached_gem_errors(app: &App, diags: &mut [crate::diagnostic::Diagnostic]) {
-    use crate::diagnostic::Severity;
-    if !diags.iter().any(|d| d.severity == Severity::Error) {
+    if !diags.iter().any(|d| d.severity == crate::diagnostic::Severity::Error) {
         return;
     }
-    let Some(gems) = Gems::of(app) else { return };
-    let reached = gems.reach(app);
-    let mut unreached: Vec<crate::span::Span> = Vec::new();
-    for c in app.library_classes.iter().filter(|c| gems.is_gem(c)) {
-        let owner = c.name.0.as_str();
-        let class_reached = reached.classes.contains(owner);
-        for m in &c.methods {
-            let kept = class_reached
-                && m.body.decisions & crate::expr::UNCALLED_DEFINER == 0
-                && (matches!(m.kind, AccessorKind::AttributeReader | AccessorKind::AttributeWriter)
-                    || IMPLICIT.contains(&m.name.as_str())
-                    || reached.methods.contains(&(owner.to_string(), m.receiver == MethodReceiver::Class, m.name.to_string())));
-            if !kept && !m.body.span.is_synthetic() {
-                unreached.push(m.body.span);
-            } else if !reached.may_pass_block(&gems, owner, m.name.as_str()) {
-                block_given_branches(&m.body, &mut unreached);
+    if let Some(unreached) = UnreachedGemCode::of(app) {
+        unreached.demote(diags);
+    }
+}
+
+/// The gem code an app does not reach, read once so the demotion can follow a step that rewrites
+/// the app's bodies (an in-place `constantize` lowering drops a name a gem class is reached by).
+pub struct UnreachedGemCode(Vec<crate::span::Span>);
+
+impl UnreachedGemCode {
+    pub fn of(app: &App) -> Option<Self> {
+        let gems = Gems::of(app)?;
+        let reached = gems.reach(app);
+        let mut unreached: Vec<crate::span::Span> = Vec::new();
+        for c in app.library_classes.iter().filter(|c| gems.is_gem(c)) {
+            let owner = c.name.0.as_str();
+            let class_reached = reached.classes.contains(owner);
+            for m in &c.methods {
+                let kept = class_reached
+                    && m.body.decisions & crate::expr::UNCALLED_DEFINER == 0
+                    && (matches!(m.kind, AccessorKind::AttributeReader | AccessorKind::AttributeWriter)
+                        || IMPLICIT.contains(&m.name.as_str())
+                        || reached.methods.contains(&(owner.to_string(), m.receiver == MethodReceiver::Class, m.name.to_string())));
+                if !kept && !m.body.span.is_synthetic() {
+                    unreached.push(m.body.span);
+                } else if !reached.may_pass_block(&gems, owner, m.name.as_str()) {
+                    block_given_branches(&m.body, &mut unreached);
+                }
+            }
+            if !class_reached {
+                unreached.extend(c.include_spans.iter().copied().filter(|s| !s.is_synthetic()));
+                unreached.extend(c.constants.iter().map(|(_, v)| v.span).filter(|s| !s.is_synthetic()));
             }
         }
-        if !class_reached {
-            unreached.extend(c.include_spans.iter().copied().filter(|s| !s.is_synthetic()));
-            unreached.extend(c.constants.iter().map(|(_, v)| v.span).filter(|s| !s.is_synthetic()));
+        unreached.extend(app.views.iter().filter(|v| gems.unreached_action_view(v.name.as_str(), &reached)).map(|v| v.body.span).filter(|s| !s.is_synthetic()));
+        // Not only library classes: a gem's controller no route dispatches to runs no action either.
+        let unrouted = crate::ingest::unreachable_views::unrouted_gem_controllers(app);
+        for c in app.controllers.iter().filter(|c| unrouted.contains(c.name.0.as_str())) {
+            unreached.extend(c.actions().map(|a| a.body.span).chain(c.class_methods().map(|m| m.body.span)).filter(|s| !s.is_synthetic()));
         }
+        Some(UnreachedGemCode(unreached))
     }
-    unreached.extend(app.views.iter().filter(|v| gems.unreached_action_view(v.name.as_str(), &reached)).map(|v| v.body.span).filter(|s| !s.is_synthetic()));
-    // Not only library classes: a gem's controller no route dispatches to runs no action either.
-    let unrouted = crate::ingest::unreachable_views::unrouted_gem_controllers(app);
-    for c in app.controllers.iter().filter(|c| unrouted.contains(c.name.0.as_str())) {
-        unreached.extend(c.actions().map(|a| a.body.span).chain(c.class_methods().map(|m| m.body.span)).filter(|s| !s.is_synthetic()));
+
+    /// Whether `span` lies in gem code the app does not reach.
+    pub fn covers(&self, span: &crate::span::Span) -> bool {
+        self.0.iter().any(|u| u.file == span.file && u.start <= span.start && span.end <= u.end)
     }
-    let within = |span: &crate::span::Span| unreached.iter().any(|u| u.file == span.file && u.start <= span.start && span.end <= u.end);
-    for d in diags.iter_mut().filter(|d| d.severity == Severity::Error && !d.span.is_synthetic() && within(&d.span)) {
-        d.severity = Severity::Info;
-        d.message.push_str(" (in a gem's code the app does not reach: the Spinel tree leaves it out)");
+
+    /// [`demote_unreached_gem_errors`] over this code.
+    pub fn demote(&self, diags: &mut [crate::diagnostic::Diagnostic]) {
+        use crate::diagnostic::Severity;
+        let within = |span: &crate::span::Span| self.0.iter().any(|u| u.file == span.file && u.start <= span.start && span.end <= u.end);
+        for d in diags.iter_mut().filter(|d| d.severity == Severity::Error && !d.span.is_synthetic() && within(&d.span)) {
+            d.severity = Severity::Info;
+            d.message.push_str(" (in a gem's code the app does not reach: the Spinel tree leaves it out)");
+        }
     }
 }
 
@@ -307,6 +329,24 @@ fn drop_block_given(e: &mut Expr) {
     {
         *e = else_branch.clone();
     }
+}
+
+/// `ruby2_keywords(:set_slot)` and its kin lose the names trim left out, and go when none is left: Ruby raises
+/// NameError on a name its class does not define. Not a name the class never defined (`private_class_method :new`
+/// names an inherited method).
+fn keeps_a_named_method(call: &mut Expr, dropped: &HashSet<(bool, String)>) -> bool {
+    let ExprNode::Send { recv: None, method, args, .. } = &mut *call.node else { return true };
+    let class_side = match method.as_str() {
+        "ruby2_keywords" | "private" | "protected" | "public" | "module_function" => false,
+        "private_class_method" | "public_class_method" => true,
+        _ => return true,
+    };
+    let gone = |a: &Expr| matches!(&*a.node, ExprNode::Lit { value: Literal::Sym { value } } if dropped.contains(&(class_side, value.to_string())));
+    if args.is_empty() || !args.iter().all(|a| matches!(&*a.node, ExprNode::Lit { value: Literal::Sym { .. } })) {
+        return true;
+    }
+    args.retain(|a| !gone(a));
+    !args.is_empty()
 }
 
 fn mounted(app: &App, file: FileId) -> bool {
@@ -407,8 +447,25 @@ impl<'a> Gems<'a> {
         }
         let mut written_consts: HashSet<String> = HashSet::default();
         fn consts_in(e: &crate::expr::Expr, out: &mut HashSet<String>) {
-            if let ExprNode::Const { path } = &*e.node {
-                out.insert(path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::"));
+            match &*e.node {
+                ExprNode::Const { path } => {
+                    out.insert(path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::"));
+                }
+                // A module named by a string (`"::Doorkeeper::SecretStoring::Sha256Hash"`), or one a string built on its
+                // namespace may name, is a value its class methods are called on, as a written one is.
+                ExprNode::Lit { value: Literal::Str { value } }
+                    if value.trim_start_matches("::").starts_with(|c: char| c.is_ascii_uppercase())
+                        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '_') =>
+                {
+                    out.insert(value.trim_start_matches("::").to_string());
+                }
+                ExprNode::StringInterp { parts }
+                    if let Some(crate::expr::InterpPart::Text { value }) = parts.first()
+                        && let Some(namespace) = value.trim_start_matches("::").strip_suffix("::") =>
+                {
+                    out.insert(format!("{namespace}::*"));
+                }
+                _ => {}
             }
             e.node.for_each_child(&mut |c| consts_in(c, out));
         }
@@ -418,6 +475,12 @@ impl<'a> Gems<'a> {
             }
         }
         crate::lower::for_each_emit_body_ref(app, &mut |e| consts_in(e, &mut written_consts));
+        let built: Vec<String> = written_consts.iter().filter_map(|w| w.strip_suffix("::*").map(str::to_string)).collect();
+        written_consts.retain(|w| !w.ends_with("::*"));
+        for namespace in built {
+            let prefix = format!("{namespace}::");
+            written_consts.extend(entries.keys().filter(|k| k.strip_prefix(prefix.as_str()).is_some_and(|rest| !rest.contains("::")) && !unloadable.contains(k.as_str())).map(|k| k.to_string()));
+        }
         let mut gems = Gems { names, written_consts, entries, defined, owners, sinks, app_mixins: HashSet::default(), app_classes, unloadable, model_copies };
         gems.app_mixins = gems.mixed_into_the_app(app);
         Some(gems)
@@ -481,6 +544,18 @@ impl<'a> Gems<'a> {
 
     fn known(&self, name: &str) -> bool {
         self.entries.contains_key(name)
+    }
+
+    /// The gem classes directly under `namespace` (`RailsSettings::Fields`).
+    fn children_of(&self, namespace: &str) -> Vec<String> {
+        let prefix = format!("{namespace}::");
+        self.entries
+            .keys()
+            .filter(|name| name.strip_prefix(prefix.as_str()).is_some_and(|rest| !rest.contains("::")))
+            // Not a class whose file requires a feature that is absent: it never exists for a string to name.
+            .filter(|name| !self.unloadable.contains(name.as_str()))
+            .map(|name| name.to_string())
+            .collect()
     }
 
     /// A name read inside `context` may be any enclosing namespace's (`Atoms::Entity` in `Parslet`).
@@ -831,6 +906,8 @@ impl<'a> Gems<'a> {
                 drop_block_given(&mut m.body);
                 blocks_dropped += usize::from(m.body != before);
             }
+            let before: HashSet<(bool, String)> =
+                c.methods.iter().map(|m| (m.receiver == MethodReceiver::Class, m.name.to_string())).collect();
             let owner = c.name.0.to_string();
             c.methods.retain(|m| {
                 // Not one ingest proved never runs (`absence_guards`' gated classes), `initialize` included: no instance is made.
@@ -841,6 +918,10 @@ impl<'a> Gems<'a> {
                     || IMPLICIT.contains(&m.name.as_str())
                     || reached.methods.contains(&(owner.clone(), m.receiver == MethodReceiver::Class, m.name.to_string()))
             });
+            let kept: HashSet<(bool, String)> =
+                c.methods.iter().map(|m| (m.receiver == MethodReceiver::Class, m.name.to_string())).collect();
+            let dropped: HashSet<(bool, String)> = before.difference(&kept).cloned().collect();
+            c.unknown_calls.retain_mut(|call| keeps_a_named_method(call, &dropped));
         }
         // A model's copy of a gem module's method (Devise's `Models.config` writers, copied onto `User`) goes with the
         // original: a call on the model reaches the original through the model's ancestors, so an unreached original
@@ -865,7 +946,14 @@ impl<'a> Gems<'a> {
             });
         }
         let views_before = trimmed.views.len();
-        trimmed.views.retain(|v| !self.unreached_action_view(v.name.as_str(), reached));
+        // Nor a gem's template no request reaches (`ingest::unreachable_views`): view_component's preview pages,
+        // whose routes the engine draws only for previews, call route helpers no route defines.
+        let gem_view = |v: &crate::dialect::View| {
+            app.source_path(v.body.span.file).is_some_and(|p| p.contains("/.roundhouse/source_gems/") || p.starts_with(".roundhouse/source_gems/"))
+        };
+        trimmed
+            .views
+            .retain(|v| !self.unreached_action_view(v.name.as_str(), reached) && !(app.unreachable_views.contains(&v.name) && gem_view(v)));
         let after: usize = trimmed.library_classes.iter().map(|c| c.methods.len() + 1).sum();
         (after != before || copies_dropped > 0 || blocks_dropped > 0 || trimmed.views.len() != views_before).then_some(trimmed)
     }
@@ -1188,7 +1276,8 @@ impl<'a> Scan<'a> {
     }
 
     /// The calls `send(name)` on `target` makes by `name`.
-    fn send_by(&mut self, target: &Target, name: &Expr, rest: &[Expr]) {
+    /// `rest` is `None` when the arguments come later and are not known here (a `method(name)`'s call).
+    fn send_by(&mut self, target: &Target, name: &Expr, rest: Option<&[Expr]>) {
         let mut names = names_of(name, &self.locals, self.gems, self.context, 2);
         // Not a parameter's callers: Ruby calls `method_missing` and its kin with no call site to read.
         let implicit = self.context.is_some_and(|(_, _, m)| IMPLICIT.contains(&m));
@@ -1226,7 +1315,7 @@ impl<'a> Scan<'a> {
             None => g.may_answer(target, sink),
         } || (from_callers && !matches!(target, Target::Any) && g.may_answer(target, sink))).collect()).unwrap_or_default();
         for sink in sinks {
-            self.pass(sink, Some(rest));
+            self.pass(sink, rest);
         }
         match names {
             Some(names) => self.calls.extend(names.iter().map(|n| n.call(target))),
@@ -1267,7 +1356,7 @@ fn sends_by_parameter(e: &Expr, params: &[crate::dialect::Param]) -> bool {
             return;
         }
         if let ExprNode::Send { method, args, .. } = &*e.node {
-            if matches!(method.as_str(), "send" | "public_send" | "__send__")
+            if matches!(method.as_str(), "send" | "public_send" | "__send__" | "method" | "public_method")
                 && matches!(args.first().map(|a| &*a.node), Some(ExprNode::Var { name, .. }) if params.iter().any(|p| p.name == *name))
             {
                 *found = true;
@@ -1393,12 +1482,26 @@ fn scan(e: &Expr, s: &mut Scan<'_>) {
             s.consts.push((s.context.map(|c| c.0.to_string()), name));
         }
         // A gem class named by a string, as `constantize` takes one (Devise's `@@mailer = "Devise::Mailer"`).
+        // Rooted too (doorkeeper's `default = "::Doorkeeper::SecretStoring::Sha256Hash"`).
         ExprNode::Lit { value: Literal::Str { value } }
-            if value.starts_with(|c: char| c.is_ascii_uppercase())
-                && value.chars().all(|c| c.is_ascii_alphanumeric() || c == ':')
+            if value.trim_start_matches("::").starts_with(|c: char| c.is_ascii_uppercase())
+                && value.chars().all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '_')
                 && s.gems.is_some_and(|g| g.known(value.trim_start_matches("::"))) =>
         {
             s.consts.push((None, value.trim_start_matches("::").to_string()));
+        }
+        // A gem class named by a string built on a namespace (`"::RailsSettings::Fields::#{field_class_name}"` that
+        // rails-settings-cached `const_get`s): any class directly under it may be the one.
+        ExprNode::StringInterp { parts }
+            if let Some(crate::expr::InterpPart::Text { value }) = parts.first()
+                && let Some(namespace) = value.trim_start_matches("::").strip_suffix("::")
+                && namespace.starts_with(|c: char| c.is_ascii_uppercase())
+                && namespace.chars().all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '_')
+                && let Some(gems) = s.gems =>
+        {
+            for child in gems.children_of(namespace) {
+                s.consts.push((None, child));
+            }
         }
         ExprNode::Send { recv, method, args, block, .. } => {
             let target = match recv {
@@ -1483,10 +1586,25 @@ fn scan(e: &Expr, s: &mut Scan<'_>) {
                         s.pass(value.as_str(), Some(&args[1..]));
                     }
                 }
-                // Not dropped as unknown: svg-graph's `init_with` reaches its option writers by `send(key.to_s + "=", value)`.
-                Some(_) if by_name && matches!(method.as_str(), "send" | "public_send" | "__send__") => {
+                // Not dropped as unknown: svg-graph's `init_with` reaches its option writers by `send(key.to_s + "=", value)`,
+                // and Doorkeeper's `Credentials.from_request` its readers by `self.method(method)` over a configured list.
+                // Not a `method` read outside a gem method: Hashie's `method(method_key)` is also scanned with no context, where
+                // it would reach every method of the app's mixins (Devise's class accessors on User, which nothing types).
+                Some(_) if by_name
+                    && (matches!(method.as_str(), "send" | "public_send" | "__send__")
+                        || (s.context.is_some() && matches!(method.as_str(), "method" | "public_method"))) =>
+                {
                     let own = s.context.is_none() && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef));
-                    s.send_by(if own { &Target::AppSelf } else { &target }, &args[0], &args[1..]);
+                    let rest = if matches!(method.as_str(), "method" | "public_method") { None } else { Some(&args[1..]) };
+                    s.send_by(if own { &Target::AppSelf } else { &target }, &args[0], rest);
+                    // The Method is called later, maybe with a block (`method(name).call { … }`), as a `method(:name)` is.
+                    if matches!(method.as_str(), "method" | "public_method") {
+                        let every = match &target {
+                            Target::Virtual(c, _) if !c.starts_with('\u{0}') => format!("{c}\u{1}*"),
+                            _ => "*".to_string(),
+                        };
+                        s.calls.push((Target::Any, format!("{BLOCK}{every}")));
+                    }
                 }
                 _ => {}
             }
@@ -1764,6 +1882,52 @@ mod tests {
         (owner.to_string(), class_side, name.to_string())
     }
 
+    /// A gem class the app names only as a string it constantizes is reached (the app names
+    /// another of the gem's classes, so the gem compiles from source). On a target that
+    /// refuses `constantize`, the in-place lowering replaces the call and its name, so the
+    /// unreached gem code is read before it: an error in the class stays an error.
+    #[test]
+    fn a_constantized_gem_class_stays_reached_across_the_in_place_lowering() {
+        let mut app = spinel_app(
+            &[("notify (1.0)", &[])],
+            &[
+                ("notify-1.0/lib/notify.rb", "require \"notify/clock\"\nrequire \"notify/mailer\"\n"),
+                ("notify-1.0/lib/notify/clock.rb", "module Notify\n  class Clock\n    def self.stamp(text)\n      text + \"!\"\n    end\n  end\nend\n"),
+                ("notify-1.0/lib/notify/mailer.rb", "module Notify\n  class Mailer\n    def self.deliver(text)\n      text.upcase\n    end\n  end\nend\n"),
+            ],
+            &[(
+                "app/models/article.rb",
+                "class Article < ApplicationRecord\n",
+                "class Article < ApplicationRecord\n  def stamped\n    Notify::Clock.stamp(title)\n  end\n\n  def notified\n    \"Notify::Mailer\".constantize.deliver(title)\n  end\n\n",
+            )],
+        );
+        assert!(reached(&app).classes.contains("Notify::Mailer"));
+        let deliver = app
+            .library_classes
+            .iter()
+            .find(|c| c.name.0.as_str() == "Notify::Mailer")
+            .and_then(|c| c.methods.iter().find(|m| m.name.as_str() == "deliver"))
+            .expect("the gem's mailer")
+            .body
+            .span;
+        let error = || vec![crate::diagnostic::Diagnostic::unsupported(deliver, None, "probe", "an error in the gem's mailer")];
+
+        let target = BuildTarget::Rust;
+        assert!(crate::lower::constantize::applies(&app, target));
+        let before = UnreachedGemCode::of(&app).expect("the app compiles a gem from source");
+        crate::emit::diagnostics::scope(|| crate::lower::constantize::lower_in_place(&mut app, target));
+
+        // What the rewritten app reaches no longer holds the mailer, so its error would be a note.
+        assert!(!reached(&app).classes.contains("Notify::Mailer"));
+        let mut after = error();
+        demote_unreached_gem_errors(&app, &mut after);
+        assert_eq!(after[0].severity, crate::diagnostic::Severity::Info);
+        // Read before the lowering, it stays an error.
+        let mut kept = error();
+        before.demote(&mut kept);
+        assert_eq!(kept[0].severity, crate::diagnostic::Severity::Error);
+    }
+
     /// `tests/support/auto_source_gem.rs`'s gems: a class only an unreached
     /// method builds, and writers reached by a name built at run time.
     #[test]
@@ -1959,7 +2123,24 @@ pub(crate) fn compiled_on_the_ruby_family(app: &App) -> crate::det::HashSet<Stri
         }
         false
     };
-    let mut kept: crate::det::HashSet<String> = app.auto_source_gems.iter().filter(|g| needs_railties(g)).cloned().collect();
+    // Nor its gemspec alone: a gem may require a framework it does not declare (view_component's `require "action_view"`,
+    // with only activesupport in its dependencies), and the real gem would load the real framework too.
+    let requires_the_framework = |gem: &str| {
+        let Some(version) = lock.version_of(gem) else { return false };
+        fn requires(items: &[crate::app::ProgramItem]) -> bool {
+            items.iter().any(|item| match item {
+                crate::app::ProgramItem::Require { feature, relative: false, .. } => matches!(
+                    feature.split('/').next(),
+                    Some("rails" | "action_view" | "action_controller" | "action_dispatch" | "active_model" | "active_record" | "action_mailer" | "active_job" | "action_text" | "active_storage")
+                ),
+                crate::app::ProgramItem::Branch { then_items, else_items, .. } => requires(then_items) || requires(else_items),
+                _ => false,
+            })
+        }
+        app.file_programs.iter().filter(|p| crate::ingest::source_gems::file_of(&p.source, gem, version)).any(|p| requires(&p.items))
+    };
+    let mut kept: crate::det::HashSet<String> =
+        app.auto_source_gems.iter().filter(|g| needs_railties(g) || requires_the_framework(g)).cloned().collect();
     loop {
         let more: Vec<String> = app
             .auto_source_gems
