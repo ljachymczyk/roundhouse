@@ -45,6 +45,8 @@ struct Use {
     at_load: bool,
     /// `insert_before 0`: in front of all of Rails' own middleware, not after it.
     outermost: bool,
+    /// The constants its block reads without a scope (`Settings` in `Settings.mode`), which Ruby looks up in `lexical` first.
+    block_constants: Vec<String>,
 }
 
 pub(super) struct MiddlewareLoop {
@@ -180,7 +182,19 @@ pub(super) fn read<V: Vfs + ?Sized>(vfs: &V, dir: &Path, gem_libs: &[PathBuf]) -
         // Not stacked: a class neither a source gem nor the app defines (`Rack::Deflater`) stays the ledger's warning, as before.
         if let Some(class) = resolve(&u, defines) {
             application_taken.push(u.span.start);
-            if u.outermost {
+            let namespaced = || {
+                u.block_constants.iter().find_map(|name| {
+                    u.lexical.iter().map(|cref| format!("{cref}::{name}")).find(|found| defines.contains(found)).map(|found| (name, found))
+                })
+            };
+            if u.outermost && let Some((name, found)) = namespaced() {
+                diags.push(Diagnostic::unsupported(
+                    u.span,
+                    None,
+                    "railtie middleware",
+                    format!("the block of `insert_before 0, {class}` reads `{name}` as `{found}`: the emitted stack copies the block to the top level, where `{name}` is not looked up in the app's namespace"),
+                ));
+            } else if u.outermost {
                 // A later `insert_before 0` goes in front of an earlier one.
                 outermost.insert(0, (class, u.span, u.block));
             } else {
@@ -266,7 +280,7 @@ fn env_writes_by_class<V: Vfs + ?Sized>(vfs: &V, files: &[PathBuf], defined: &Ha
         let receiver = value.receiver()?;
         let path = constant_path_of(&receiver)?;
         let rooted = receiver.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p));
-        resolve(&Use { path, rooted, lexical: lexical.to_vec(), span: Span::default(), ordered: false, block: None, at_load: false, outermost: false }, defined)
+        resolve(&Use { path, rooted, lexical: lexical.to_vec(), span: Span::default(), ordered: false, block: None, at_load: false, outermost: false, block_constants: Vec::new() }, defined)
     };
     let read_owner = |body: Node<'_>, lexical: &[String]| -> Owner {
         let mut owner = Owner::default();
@@ -275,7 +289,7 @@ fn env_writes_by_class<V: Vfs + ?Sized>(vfs: &V, files: &[PathBuf], defined: &Ha
                 for arg in include.arguments().map(|a| a.arguments().iter().collect::<Vec<_>>()).unwrap_or_default() {
                     let Some(path) = constant_path_of(&arg) else { continue };
                     let rooted = arg.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p));
-                    let u = Use { path, rooted, lexical: lexical.to_vec(), span: Span::default(), ordered: false, block: None, at_load: false, outermost: false };
+                    let u = Use { path, rooted, lexical: lexical.to_vec(), span: Span::default(), ordered: false, block: None, at_load: false, outermost: false, block_constants: Vec::new() };
                     owner.includes.extend(resolve(&u, defined));
                 }
                 continue;
@@ -469,13 +483,27 @@ fn read_class_body_use(stmt: &Node<'_>, file: crate::span::FileId, lexical: &[St
         ));
         return;
     };
+    let block_constants = block.as_ref().and_then(|b| b.body()).map(|body| {
+        let mut bare = BareConstants(Vec::new());
+        ruby_prism::Visit::visit(&mut bare, &body);
+        bare.0
+    });
     // Braces, not `do … end`: nested in the stack's `A.new(B.new(app) { … })`, a `do` would bind to `A.new`.
     let block = block.map(|b| {
         let params = b.parameters().map(|p| String::from_utf8_lossy(p.location().as_slice()).into_owned()).unwrap_or_default();
         let body = b.body().map(|body| String::from_utf8_lossy(body.location().as_slice()).into_owned()).unwrap_or_default();
         format!("{{ {params}\n{body}\n}}")
     });
-    uses.push(Use { path, rooted, lexical: lexical.to_vec(), span, ordered: false, block, at_load: true, outermost });
+    uses.push(Use { path, rooted, lexical: lexical.to_vec(), span, ordered: false, block, at_load: true, outermost, block_constants: block_constants.unwrap_or_default() });
+}
+
+/// The constants a block reads without a scope, in reading order: `Settings` in `Settings.mode` and in `Settings::Mode`.
+struct BareConstants(Vec<String>);
+
+impl<'pr> ruby_prism::Visit<'pr> for BareConstants {
+    fn visit_constant_read_node(&mut self, node: &ruby_prism::ConstantReadNode<'pr>) {
+        self.0.push(constant_id_str(&node.name()).to_string());
+    }
 }
 
 #[derive(PartialEq)]
@@ -822,7 +850,7 @@ fn read_initializer(
             _ => None,
         };
         match class {
-            Some((path, rooted)) => uses.push(Use { path, rooted, lexical: lexical.to_vec(), span, ordered, block: None, at_load: false, outermost: false }),
+            Some((path, rooted)) => uses.push(Use { path, rooted, lexical: lexical.to_vec(), span, ordered, block: None, at_load: false, outermost: false, block_constants: Vec::new() }),
             None => diags.push(Diagnostic::unsupported(
                 span,
                 None,
@@ -980,6 +1008,26 @@ mod tests {
         let refused: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
         assert_eq!(refused.len(), 4, "{refused:?}");
         assert!(refused.iter().all(|m| m.contains("is stacked more than once with a block")), "{refused:?}");
+    }
+
+    /// The stack copies an `insert_before 0` block to the top level, so a block that reads a constant from the app's
+    /// namespace is refused rather than emitted where that constant is not found. The `use` stack is left as it is.
+    #[test]
+    fn an_insertion_at_0_whose_block_reads_a_namespaced_constant_is_refused() {
+        let application = "module Blog\n  class Application < Rails::Application\n    config.middleware.insert_before(0, Gate) { |gate| gate.mode = Settings.mode }\n    config.middleware.insert_before(0, Probe) { |probe| probe.mode = Blog::Settings.mode }\n    config.middleware.use(Other) { |other| other.mode = Settings.mode }\n  end\nend\n";
+        let classes = "class Gate\nend\nclass Probe\nend\nclass Other\nend\nmodule Blog\n  class Settings\n  end\nend\n";
+        let map = [("/app/config/application.rb", application), ("/app/lib/gate.rb", classes)]
+            .iter()
+            .map(|(path, text)| (PathBuf::from(path), text.as_bytes().to_vec()))
+            .collect();
+        let super::Stack { classes, outermost, blocks, diags, .. } =
+            super::read(&MapVfs::new(map), std::path::Path::new("/app"), &[]);
+        assert_eq!(outermost, ["Probe"]);
+        assert_eq!(classes, ["Other"]);
+        assert!(!blocks.contains_key("Gate"), "{blocks:?}");
+        let refused: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].contains("reads `Settings` as `Blog::Settings`"), "{refused:?}");
     }
 
     /// A forwarded block (`&configure`) is not text the stack can copy, so the class is not stacked without it.
