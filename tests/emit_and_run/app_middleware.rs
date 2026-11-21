@@ -317,6 +317,110 @@ puts "outermost cookies passed"
     assert!(stdout.contains("outermost cookies passed"), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
 }
 
+const PROBE_COOKIES: &str = r#"class ProbeCookies
+  def initialize(app)
+    @app = app
+  end
+
+  def call(env)
+    status, headers, body = @app.call(env)
+    cookies = headers["set-cookie"]
+    headers["x-cookies"] = cookies.is_a?(Array) ? "Array:#{cookies.length}" : cookies.class.to_s
+    [status, headers, body]
+  end
+end
+"#;
+
+const COOKIE_PAIRS: &str = r#"class CookiePairsController < ApplicationController
+  def two
+    cookies[:first] = "1"
+    cookies[:second] = "2"
+    render plain: "two"
+  end
+
+  def one
+    cookies[:first] = "1"
+    render plain: "one"
+  end
+end
+"#;
+
+/// The blog with `ProbeCookies` inserted at 0 and a controller that sets one cookie or two.
+fn with_cookie_pairs() -> emit_and_run::Overlay {
+    with_application_lines(emit_and_run::real_blog(), "    config.middleware.insert_before 0, ProbeCookies\n")
+        .write("lib/probe_cookies.rb", PROBE_COOKIES)
+        .write("app/controllers/cookie_pairs_controller.rb", COOKIE_PAIRS)
+        .edit(
+            "config/routes.rb",
+            "  root \"articles#index\"\n",
+            "  root \"articles#index\"\n  get \"cookie_pairs/two\", to: \"cookie_pairs#two\"\n  get \"cookie_pairs/one\", to: \"cookie_pairs#one\"\n",
+        )
+}
+
+const COOKIE_PAIRS_ASSERTIONS: &str = r#"
+require "rack"
+app, = Rack::Builder.parse_file("config.ru")
+status, headers, _body = app.call(Rack::MockRequest.env_for("http://localhost/cookie_pairs/two"))
+cookies = headers["set-cookie"]
+raise "two: #{status} #{headers.inspect}" unless status == 200 && headers["x-cookies"] == "Array:2" && cookies.is_a?(Array) && cookies.length == 2
+raise "two lines: #{cookies.inspect}" unless cookies[0].start_with?("first=1;") && cookies[1].start_with?("second=2;") && cookies.none? { |line| line.include?("\n") }
+status, headers, _body = app.call(Rack::MockRequest.env_for("http://localhost/cookie_pairs/one"))
+raise "one: #{status} #{headers.inspect}" unless status == 200 && ["String", "Array:1"].include?(headers["x-cookies"])
+puts "outermost cookie pairs passed"
+"#;
+
+/// Rack 3 gives the middleware two or more cookies as an Array of Strings, one cookie each, never joined by "\n".
+#[test]
+fn the_middleware_inserted_at_0_gets_two_cookies_as_an_array() {
+    let run = with_cookie_pairs().run_ruby(COOKIE_PAIRS_ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("outermost cookie pairs passed"), "{}", run.stdout);
+}
+
+// Not served over HTTP, as the adapter tests above: the emitted adapter runs on CRuby over a stand-in server.
+#[test]
+fn the_spinel_adapter_hands_the_middleware_inserted_at_0_two_cookies_as_an_array() {
+    let (tree, errors) = with_cookie_pairs().emit(BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let adapter = std::fs::read_to_string(tree.join("runtime/gem_middleware.rb")).expect("gem_middleware.rb");
+    let script = format!(
+        r#"{adapter}
+{PROBE_COOKIES}
+module Tep
+  def self.str_hash = {{}}
+end
+Res = Struct.new(:status, :headers, :body, :file_path, :streaming, :set_cookies, :header_fields)
+Req = Struct.new(:verb, :path, :raw_query, :remote_host, :http_version, :req_headers, :raw_body, :listener_transport)
+module Main
+  def self.dispatch_app(req, res)
+    res.status = 200
+    res.headers["x-request-id"] = "id"
+    res.body = +"page"
+    res.set_cookies << "first=1; path=/"
+    res.set_cookies << "second=2; path=/" unless req.path == "/one"
+  end
+end
+def run(path)
+  res = Res.new(0, {{}}, +"", +"", false, [], [["link", "</a>"]])
+  OutermostMiddleware.dispatch(Req.new("GET", path, "", "127.0.0.1", "HTTP/1.1", {{}}, "", "tcp"), res)
+  res
+end
+# Two cookies: an Array inside the middleware, and one Set-Cookie line each on the server's response.
+res = run("/two")
+raise "two: #{{res.to_h}}" unless res.headers == {{ "x-request-id" => "id", "x-cookies" => "Array:2" }} && res.set_cookies == ["first=1; path=/", "second=2; path=/"]
+# The app's repeated header fields stay with its own headers.
+raise "fields: #{{res.to_h}}" unless res.header_fields == [["link", "</a>"]]
+# One cookie: a String, as Rack::Response sets it.
+res = run("/one")
+raise "one: #{{res.to_h}}" unless res.headers["x-cookies"] == "String" && res.set_cookies == ["first=1; path=/"]
+puts "outermost adapter cookie pairs passed"
+"#
+    );
+    let out = std::process::Command::new("ruby").args(["-e", &script]).output().expect("spawn ruby");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("outermost adapter cookie pairs passed"), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+}
+
 const OUTERMOST_AND_USE: &str = "    config.middleware.insert_before 0, ProbeGate\n    config.middleware.use ProbeUse\n";
 
 /// The test harness's request through `OutermostMiddleware.around`: the gate at 0 answers first, then the `use` stack, then the routes.

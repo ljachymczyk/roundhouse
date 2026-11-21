@@ -10917,7 +10917,8 @@ fn spinel_replace_headers(cookie_note: &str) -> String {
     res.header_fields.pop while res.header_fields.length > 0
     headers.each do |name, value|
       key = name.to_s
-      # Not one header line: Rack 3 gives a repeated header as an Array, and Set-Cookie as one per line.
+      # Not one header line: Rack 3 gives a repeated header as an Array. A String is split at "\n" too, which Rack 3
+      # does not allow but an older middleware may still write.
       values = value.is_a?(Array) ? value.map {{ |part| part.to_s }} : value.to_s.split("\n")
       if key.downcase == "set-cookie"
         values.each {{ |cookie| res.set_cookies << cookie }}
@@ -11148,6 +11149,7 @@ module OutermostMiddleware
       @res = res
       @app_body = nil
       @body = nil
+      @headers = {{}}
     end
 
     def dispatch_app(path)
@@ -11156,14 +11158,24 @@ module OutermostMiddleware
       @app_body = @res.body
       @body = [@app_body]
       # Rails' Cookies middleware sits inside these, so the response they get carries the Set-Cookie lines.
-      if @res.set_cookies.length > 0
-        # Not overwritten: a controller's own `response.headers["set-cookie"]` is already among the headers.
-        handed = OutermostMiddleware.cookie_lines(@res.headers.delete("set-cookie"))
-        @res.set_cookies.each {{ |cookie| handed << cookie }}
-        @res.headers["set-cookie"] = handed.join("\n")
-        @res.set_cookies.pop while @res.set_cookies.length > 0
+      # Not overwritten: a controller's own `response.headers["set-cookie"]` is already among the headers.
+      cookies = OutermostMiddleware.cookie_lines(@res.headers.delete("set-cookie"))
+      @res.set_cookies.each {{ |cookie| cookies << cookie }}
+      @res.set_cookies.pop while @res.set_cookies.length > 0
+      # Not the server's own headers: they hold Strings, and Rack 3 gives two or more cookies as an Array.
+      @headers = {{}}
+      @res.headers.each {{ |name, value| @headers[name] = value }}
+      if cookies.length == 1
+        @headers["set-cookie"] = cookies[0]
+      elsif cookies.length > 1
+        @headers["set-cookie"] = cookies
       end
-      [@res.status, @res.headers, @body]
+      [@res.status, @headers, @body]
+    end
+
+    # The headers of the rest of the stack, as it left them.
+    def app_headers?(headers)
+      headers.equal?(@headers)
     end
 
     # The body of the rest of the stack, as it left it: the same Array holding the same String.
@@ -11205,8 +11217,8 @@ module OutermostMiddleware
     response = OutermostMiddleware.stack.call(env)
     res.status = response[0].to_i
     # Not merged into the app's headers: a response of the middleware's own carries only its own.
-    if response[1].equal?(res.headers)
-      OutermostMiddleware.take_set_cookies(res)
+    if exchange.app_headers?(response[1])
+      OutermostMiddleware.take_headers(res, response[1])
     else
       OutermostMiddleware.replace_headers(res, response[1])
     end
@@ -11225,13 +11237,23 @@ module OutermostMiddleware
   end
 
 {replace_headers}
-  # The Set-Cookie lines the rest of the stack handed up in the headers, back onto the server's response.
-  def self.take_set_cookies(res)
-    OutermostMiddleware.cookie_lines(res.headers.delete("set-cookie")).each {{ |cookie| res.set_cookies << cookie }}
+  # The headers the rest of the stack answered with, back onto the server's response: each Set-Cookie line on its own.
+  # Not replace_headers: the server's repeated header fields are the app's own, and stay.
+  def self.take_headers(res, headers)
+    res.headers = Tep.str_hash
+    headers.each do |name, value|
+      key = name.to_s
+      if key.downcase == "set-cookie"
+        OutermostMiddleware.cookie_lines(value).each {{ |cookie| res.set_cookies << cookie }}
+      else
+        res.headers[key] = value.is_a?(Array) ? value.map {{ |part| part.to_s }}.join(", ") : value.to_s
+      end
+    end
   end
 
-  # A Set-Cookie value as Rack 3 gives it: an Array of lines, or lines joined by "\n".
-  # Not shared with replace_headers: that text is GemMiddleware's too, which stays as it is.
+  # A Set-Cookie value a middleware hands back: an Array with one cookie each, or a String. A String is split at "\n"
+  # too, which Rack 3 does not allow but an older middleware may still write.
+  # Not shared with replace_headers: that text is GemMiddleware's too.
   def self.cookie_lines(value)
     return [] if value.nil?
     value.is_a?(Array) ? value.map {{ |part| part.to_s }} : value.to_s.split("\n")
