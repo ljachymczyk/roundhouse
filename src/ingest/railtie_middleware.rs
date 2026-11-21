@@ -451,6 +451,15 @@ fn read_class_body_use(stmt: &Node<'_>, file: crate::span::FileId, lexical: &[St
         _ => (false, None),
     };
     let target = class.and_then(|only| constant_path_of(only).map(|path| (path, only.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p)))));
+    if call.block().is_some() && block.is_none() {
+        diags.push(Diagnostic::unsupported(
+            span,
+            None,
+            "railtie middleware",
+            format!("`{}` with a forwarded block (`&block`): only a literal block is put on the emitted stack", constant_id_str(&call.name())),
+        ));
+        return;
+    }
     let Some((path, rooted)) = target else {
         diags.push(Diagnostic::unsupported(
             span,
@@ -971,6 +980,27 @@ mod tests {
         let refused: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
         assert_eq!(refused.len(), 4, "{refused:?}");
         assert!(refused.iter().all(|m| m.contains("is stacked more than once with a block")), "{refused:?}");
+    }
+
+    /// A forwarded block (`&configure`) is not text the stack can copy, so the class is not stacked without it.
+    #[test]
+    fn a_middleware_given_a_forwarded_block_is_not_stacked() {
+        let application = "module Blog\n  class Application < Rails::Application\n    configure = ->(gate) { gate.mode = :on }\n    config.middleware.use(Gate, &configure)\n    config.middleware.insert_before(0, Probe, &configure)\n    config.middleware.use Other\n  end\nend\n";
+        let classes = "class Gate\nend\nclass Probe\nend\nclass Other\nend\n";
+        let map = [("/app/config/application.rb", application), ("/app/lib/gate.rb", classes)]
+            .iter()
+            .map(|(path, text)| (PathBuf::from(path), text.as_bytes().to_vec()))
+            .collect();
+        let super::Stack { classes, outermost, blocks, application_taken, .. } =
+            super::read(&MapVfs::new(map), std::path::Path::new("/app"), &[]);
+        assert_eq!(classes, ["Other"]);
+        assert!(outermost.is_empty(), "{outermost:?}");
+        assert!(blocks.is_empty(), "{blocks:?}");
+        assert_eq!(application_taken.len(), 1, "{application_taken:?}");
+        let engine = "module Gem\n  class Gate\n  end\n  class Engine < ::Rails::Engine\n    configure = ->(gate) { gate.mode = :on }\n    config.app_middleware.use(Gate, &configure)\n  end\nend\n";
+        let (classes, diags) = read(&[("/gem/lib/gem.rb", engine)]);
+        assert!(classes.is_empty(), "{classes:?}");
+        assert!(diags.iter().any(|d| d.contains("with a forwarded block")), "{diags:?}");
     }
 
     /// An Engine's own `config.middleware` runs only for a request routed into the engine, so the app's stack leaves it out.
