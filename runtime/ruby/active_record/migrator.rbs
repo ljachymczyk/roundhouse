@@ -8,6 +8,10 @@ module ActiveRecord
   module Migrator
     SCHEMA_MIGRATIONS_DDL: String
     INTERNAL_METADATA_DDL: String
+    MIGRATIONS_PATHS: Array[String]
+
+    def self.migrations_paths: () -> Array[String]
+    def self.current_version: () -> Integer
 
     def self.set_up?: () -> bool
     def self.any_tables?: () -> bool

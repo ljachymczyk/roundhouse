@@ -25,6 +25,26 @@ module ActiveRecord
   module Migrator
     SCHEMA_MIGRATIONS_DDL = "CREATE TABLE IF NOT EXISTS \"schema_migrations\" (\"version\" varchar NOT NULL PRIMARY KEY)"
     INTERNAL_METADATA_DDL = "CREATE TABLE IF NOT EXISTS \"ar_internal_metadata\" (\"key\" varchar NOT NULL PRIMARY KEY, \"value\" varchar, \"created_at\" datetime(6) NOT NULL, \"updated_at\" datetime(6) NOT NULL)"
+    MIGRATIONS_PATHS = ["db/migrate"]
+
+    # Rails' `ActiveRecord::Migrator.migrations_paths`. The emitted app
+    # carries its migrations in `Migrations.all`, so a path an app adds
+    # here is kept but read by nothing.
+    def self.migrations_paths
+      MIGRATIONS_PATHS
+    end
+
+    # Rails' `ActiveRecord::Migrator.current_version`: the newest version
+    # `schema_migrations` lists, 0 before any.
+    def self.current_version
+      return 0 unless set_up?
+      newest = 0
+      applied_versions.each do |version|
+        n = version.to_i
+        newest = n if n > newest
+      end
+      newest
+    end
 
     # Does the database track migrations (Rails or `prepare` set it up)?
     def self.set_up?
