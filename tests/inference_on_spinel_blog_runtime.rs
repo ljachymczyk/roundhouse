@@ -716,7 +716,13 @@ fn untyped_subexpressions_baseline() {
     // active_record/relation.rb), so the record is the list's nil arm.
     // MEASURED 1471 on merging main 2d9d16d0c (1465) with the uuid casts'
     // +6 (1470 less 1464), which add up.
-    const CEILING: usize = 1471;
+    // MEASURED 1503 on db:migrate (main 878d9c5e4: 1471): `ActiveRecord::Migrator`
+    // runs `db:migrate` / `db:prepare` over the adapter seam. Its parameters and
+    // the rows it reads back are vars on this RBS-less probe: +32 (`boot` +8,
+    // `load_schema` +9, `prepare` +7, `pending` +5, `migrate` +2,
+    // `record_environment` +1), every other method's count unchanged, and
+    // migrator.rbs types all 32.
+    const CEILING: usize = 1503;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \
