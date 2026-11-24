@@ -16808,26 +16808,113 @@ fn schema_rb_version(source: &[u8]) -> Option<u128> {
 }
 
 /// The versions a structure.sql dump records: the quoted values of its
-/// `INSERT INTO "schema_migrations"` statements only, so a default or a
-/// comment that happens to read like a version does not count.
+/// `INSERT INTO "schema_migrations"` statements only, so a default, another
+/// table's insert or a commented-out insert that happens to read like a
+/// version does not count.
 fn structure_sql_versions(text: &str) -> std::collections::HashSet<String> {
     let mut versions = std::collections::HashSet::new();
-    let mut rest = text;
-    while let Some(at) = rest.find("INSERT INTO") {
-        let statement = &rest[at..];
-        let end = statement.find(';').unwrap_or(statement.len());
-        let (head, values) = statement[..end].split_once("VALUES").unwrap_or(("", ""));
-        let table = head["INSERT INTO".len().min(head.len())..].trim().split_whitespace().next().unwrap_or("");
-        if table.trim_matches('"').rsplit('.').next().map(|t| t.trim_matches('"')) == Some("schema_migrations") {
-            for quoted in values.split('\'').skip(1).step_by(2) {
-                if !quoted.is_empty() && quoted.chars().all(|c| c.is_ascii_digit()) {
-                    versions.insert(quoted.to_string());
-                }
+    for statement in sql_statements(text) {
+        let Some(rest) = strip_prefix_ignore_case(statement.trim_start(), "INSERT INTO") else { continue };
+        let table = rest.split(|c: char| c.is_whitespace() || c == '(').find(|t| !t.is_empty()).unwrap_or("");
+        if table.rsplit('.').next().map(|t| t.trim_matches('"')) != Some("schema_migrations") {
+            continue;
+        }
+        let Some(at) = rest.to_ascii_uppercase().find("VALUES") else { continue };
+        for literal in sql_string_literals(&rest[at..]) {
+            if !literal.is_empty() && literal.chars().all(|c| c.is_ascii_digit()) {
+                versions.insert(literal);
             }
         }
-        rest = &statement[end..];
     }
     versions
+}
+
+fn strip_prefix_ignore_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then(|| &text[prefix.len()..])
+}
+
+/// A SQL script split at the semicolons that end its statements, with `--`
+/// and (nested) `/* */` comments dropped; a semicolon or comment marker
+/// inside a quoted literal or identifier stays part of it.
+fn sql_statements(text: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' => {
+                current.push(c);
+                while let Some(d) = chars.next() {
+                    current.push(d);
+                    if d == c {
+                        // a doubled quote is an escaped one
+                        if chars.peek() == Some(&c) {
+                            current.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                for d in chars.by_ref() {
+                    if d == '\n' {
+                        break;
+                    }
+                }
+                current.push('\n');
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut depth = 1;
+                while depth > 0 {
+                    match chars.next() {
+                        Some('/') if chars.peek() == Some(&'*') => {
+                            chars.next();
+                            depth += 1;
+                        }
+                        Some('*') if chars.peek() == Some(&'/') => {
+                            chars.next();
+                            depth -= 1;
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+                current.push(' ');
+            }
+            ';' => statements.push(std::mem::take(&mut current)),
+            _ => current.push(c),
+        }
+    }
+    statements.push(current);
+    statements
+}
+
+/// The contents of the single-quoted literals in a comment-free SQL fragment.
+fn sql_string_literals(fragment: &str) -> Vec<String> {
+    let mut literals = Vec::new();
+    let mut chars = fragment.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\'' {
+            continue;
+        }
+        let mut literal = String::new();
+        while let Some(d) = chars.next() {
+            if d == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    literal.push(chars.next().unwrap());
+                } else {
+                    break;
+                }
+            } else {
+                literal.push(d);
+            }
+        }
+        literals.push(literal);
+    }
+    literals
 }
 
 #[cfg(test)]
@@ -16843,6 +16930,16 @@ mod structure_sql_version_tests {
         let mut versions: Vec<String> = structure_sql_versions(dump).into_iter().collect();
         versions.sort();
         assert_eq!(versions, ["20261101000000", "20261104000000", "20261105000000"]);
+    }
+
+    #[test]
+    fn a_commented_out_insert_does_not_count() {
+        let dump = "-- INSERT INTO schema_migrations (version) VALUES ('20261102000000');\n\
+            /* INSERT INTO schema_migrations (version) VALUES ('20261103000000'); /* nested */ */\n\
+            INSERT INTO schema_migrations (version) VALUES ('20261101000000'); -- ('20261104000000')\n\
+            INSERT INTO notes (body) VALUES ('; INSERT INTO schema_migrations (version) VALUES (''20261105000000'')');\n";
+        let versions: Vec<String> = structure_sql_versions(dump).into_iter().collect();
+        assert_eq!(versions, ["20261101000000"]);
     }
 
     #[test]

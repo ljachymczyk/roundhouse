@@ -594,3 +594,67 @@ end
     assert_eq!(out[0], r#"UPDATE "articles" SET "title" = 'it''s untitled' WHERE "title" IS NULL"#);
     assert!(out[1..].join("\n").contains("CREATE TABLE articles__rh_alter ("), "{out:?}");
 }
+
+#[test]
+fn a_child_rebuilt_after_its_parents_key_is_renamed_keeps_the_key_and_its_rows() {
+    let ms = record(&[
+        ("db/migrate/20260101000001_create_articles.rb", CREATE_ARTICLES),
+        ("db/migrate/20260101000002_create_comments.rb", CREATE_COMMENTS),
+        (
+            "db/migrate/20260101000003_rename_key.rb",
+            r#"
+class RenameKey < ActiveRecord::Migration[8.1]
+  def change
+    rename_column :articles, :id, :article_key
+  end
+end
+"#,
+        ),
+        (
+            "db/migrate/20260101000004_body_default.rb",
+            r#"
+class BodyDefault < ActiveRecord::Migration[8.1]
+  def change
+    change_column_default :comments, :body, from: nil, to: "none"
+  end
+end
+"#,
+        ),
+    ]);
+    let rebuild = sql(&ms[3]).join("\n");
+    assert!(rebuild.contains("FOREIGN KEY (article_id) REFERENCES articles (article_key)"), "{rebuild}");
+    assert!(!rebuild.contains("REFERENCES articles (id)"), "{rebuild}");
+
+    // Run it as db:migrate does, one transaction per migration, with rows
+    // in both tables before the rename; the copied child rows must still
+    // satisfy their foreign key.
+    let migration = |m: &Migration| format!("BEGIN;\n{}COMMIT;\n", sql(m).iter().map(|s| format!("{s};\n")).collect::<String>());
+    let script = format!(
+        "PRAGMA foreign_keys = ON;\n{}{}\
+         INSERT INTO articles (id, title, created_at, updated_at) VALUES (7, 'a', '2026-01-01', '2026-01-01');\n\
+         INSERT INTO comments (id, article_id, body) VALUES (1, 7, 'first');\n\
+         {}{}\
+         SELECT 'rows', id, article_id, body FROM comments;\n\
+         SELECT 'violations', count(*) FROM pragma_foreign_key_check;\n\
+         SELECT 'target', \"table\", \"to\" FROM pragma_foreign_key_list('comments');\n",
+        migration(&ms[0]),
+        migration(&ms[1]),
+        migration(&ms[2]),
+        migration(&ms[3]),
+    );
+    let Ok(mut child) = std::process::Command::new("sqlite3")
+        .args(["-bail", ":memory:"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    else {
+        return;
+    };
+    use std::io::Write;
+    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+    let done = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&done.stdout);
+    assert!(done.status.success(), "sqlite3 rejected the migrations: {}\n{script}", String::from_utf8_lossy(&done.stderr));
+    assert_eq!(stdout.lines().collect::<Vec<_>>(), ["rows|1|7|first", "violations|0", "target|articles|article_key"], "{script}");
+}
