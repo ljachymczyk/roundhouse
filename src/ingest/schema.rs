@@ -528,6 +528,14 @@ fn apply_table_verb(
             if let (Some(old), Some(new)) = (arg_name(0), arg_name(1)) {
                 if let Some(mut table) = schema.tables.shift_remove(&Symbol::from(old.as_str())) {
                     table.name = Symbol::from(new.clone());
+                    // an index carrying the generated name follows the table's
+                    // (Rails' rename_table_indexes)
+                    for idx in &mut table.indexes {
+                        let cols: Vec<&str> = idx.columns.iter().map(|c| c.as_str()).collect();
+                        if idx.name.as_str() == default_index_name(&old, &cols) {
+                            idx.name = Symbol::from(default_index_name(&new, &cols));
+                        }
+                    }
                     schema.tables.insert(Symbol::from(new.clone()), table);
                     // Foreign keys follow the table: SQLite and PostgreSQL both retarget them.
                     for fk in schema.tables.values_mut().flat_map(|t| t.foreign_keys.iter_mut()).filter(|fk| fk.to_table.0.as_str() == old) {
@@ -580,6 +588,47 @@ fn apply_table_verb(
                     for col in &mut table.columns {
                         if col.name.as_str() == old {
                             col.name = Symbol::from(new.clone());
+                        }
+                    }
+                    // the indexes and foreign keys over it follow the column,
+                    // as SQLite's RENAME COLUMN carries them: left on the old
+                    // name, the schema's CREATE INDEX named a column that no
+                    // longer exists
+                    for idx in &mut table.indexes {
+                        for c in &mut idx.columns {
+                            if c.as_str() == old {
+                                *c = Symbol::from(new.clone());
+                            }
+                        }
+                    }
+                    for key in table.foreign_keys.iter_mut().flat_map(|fk| fk.from_columns.iter_mut()) {
+                        if key.as_str() == old {
+                            *key = Symbol::from(new.clone());
+                        }
+                    }
+                    // an index over it carrying the generated name is
+                    // renamed for the new column (Rails'
+                    // rename_column_indexes)
+                    for idx in &mut table.indexes {
+                        let cols: Vec<&str> = idx.columns.iter().map(|c| c.as_str()).collect();
+                        if !cols.contains(&new.as_str()) {
+                            continue;
+                        }
+                        let old_cols: Vec<&str> =
+                            cols.iter().map(|c| if *c == new.as_str() { old.as_str() } else { c }).collect();
+                        if idx.name.as_str() == default_index_name(&t, &old_cols) {
+                            idx.name = Symbol::from(default_index_name(&t, &cols));
+                        }
+                    }
+                }
+                // keys in any table that point at the column follow it too, as
+                // SQLite's RENAME COLUMN rewrites their REFERENCES (self-references included)
+                for fk in schema.tables.values_mut().flat_map(|table| table.foreign_keys.iter_mut()) {
+                    if fk.to_table.0.as_str() == t {
+                        for key in &mut fk.to_columns {
+                            if key.as_str() == old {
+                                *key = Symbol::from(new.clone());
+                            }
                         }
                     }
                 }
@@ -4274,6 +4323,100 @@ mod tests {
         }
         let err = ingest_migration(remove.as_bytes(), "2_remove.rb", &mut schema).unwrap_err();
         assert!(err.to_string().contains("index_typed_events"), "{err}");
+    }
+
+    #[test]
+    fn rename_column_carries_its_indexes_and_foreign_keys() {
+        let schema = fold(&[
+            r#"
+            class CreatePosts < ActiveRecord::Migration[8.0]
+              def change
+                create_table :posts do |t|
+                  t.string :titel
+                  t.references :writer, foreign_key: { to_table: :users }
+                  t.index [:titel, :writer_id]
+                end
+              end
+            end
+            "#,
+            r#"
+            class Fix < ActiveRecord::Migration[8.0]
+              def change
+                rename_column :posts, :titel, :title
+                rename_column :posts, :writer_id, :author_id
+              end
+            end
+            "#,
+        ]);
+        let posts = &schema.tables[&Symbol::from("posts")];
+        let columns: Vec<Vec<&str>> =
+            posts.indexes.iter().map(|i| i.columns.iter().map(|c| c.as_str()).collect()).collect();
+        assert_eq!(columns, [vec!["author_id"], vec!["title", "author_id"]]);
+        assert_eq!(posts.foreign_keys[0].from_columns[0].as_str(), "author_id");
+        // the generated names follow, as Rails' rename_column_indexes
+        let names: Vec<&str> = posts.indexes.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["index_posts_on_author_id", "index_posts_on_title_and_author_id"]);
+    }
+
+    #[test]
+    fn rename_column_retargets_the_keys_that_reference_it() {
+        // `posts.author_id REFERENCES authors(id)`: renaming `authors.id`
+        // rewrites the reference, as SQLite's RENAME COLUMN does
+        let schema = fold(&[
+            r#"
+            class Create < ActiveRecord::Migration[8.0]
+              def change
+                create_table :authors do |t|
+                  t.references :mentor, foreign_key: { to_table: :authors }
+                end
+                create_table :posts do |t|
+                  t.references :author, foreign_key: true
+                end
+              end
+            end
+            "#,
+            r#"
+            class Rekey < ActiveRecord::Migration[8.0]
+              def change
+                rename_column :authors, :id, :author_key
+              end
+            end
+            "#,
+        ]);
+        for table in ["posts", "authors"] {
+            let fk = &schema.tables[&Symbol::from(table)].foreign_keys[0];
+            assert_eq!(fk.to_table.0.as_str(), "authors");
+            let to: Vec<&str> = fk.to_columns.iter().map(|c| c.as_str()).collect();
+            assert_eq!(to, ["author_key"], "{table}");
+        }
+    }
+
+    #[test]
+    fn rename_table_renames_the_indexes_carrying_the_generated_name() {
+        let schema = fold(&[
+            r#"
+            class CreatePosts < ActiveRecord::Migration[8.0]
+              def change
+                create_table :posts do |t|
+                  t.string :title
+                  t.string :slug
+                  t.index :title
+                  t.index :slug, name: "by_slug"
+                end
+              end
+            end
+            "#,
+            r#"
+            class Rename < ActiveRecord::Migration[8.0]
+              def change
+                rename_table :posts, :articles
+              end
+            end
+            "#,
+        ]);
+        let articles = &schema.tables[&Symbol::from("articles")];
+        let names: Vec<&str> = articles.indexes.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["index_articles_on_title", "by_slug"]);
     }
 
     #[test]
