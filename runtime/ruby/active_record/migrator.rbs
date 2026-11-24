@@ -14,6 +14,8 @@ module ActiveRecord
     def self.current_version: () -> Integer
 
     def self.set_up?: () -> bool
+    def self.postgresql?: () -> bool
+    def self.refuse_postgresql!: () -> void
     def self.any_tables?: () -> bool
     def self.applied_versions: () -> Array[String]
     def self.pending: (Array[Array[String]] migrations) -> Array[Array[String]]

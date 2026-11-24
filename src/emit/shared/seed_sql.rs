@@ -351,9 +351,12 @@ fn sql_str(s: &str) -> String {
 /// loaded from it is one the emitted app's `db:migrate` knows the state of
 /// (it is the development database, as `storage/development.sqlite3` is):
 /// a migration newer than schema.rb stays pending. Empty for an app
-/// without migrations.
+/// without migrations, and for PostgreSQL, whose emitted app does not
+/// track migrations.
 pub fn render_migration_stamps(app: &App) -> String {
-    if app.migrations.is_empty() {
+    if app.migrations.is_empty()
+        || crate::emit::shared::schema_sql::Dialect::current() != crate::emit::shared::schema_sql::Dialect::Sqlite
+    {
         return String::new();
     }
     let mut out = String::new();
