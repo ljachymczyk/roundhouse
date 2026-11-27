@@ -169,7 +169,7 @@ impl Dialect {
             return Some(format!("'{}'", literal.replace('\'', "''")));
         }
         match &col.col_type {
-            ColumnType::Integer | ColumnType::BigInt => {
+            ColumnType::Integer | ColumnType::BigInt | ColumnType::Reference { .. } => {
                 raw.parse::<i64>().ok().map(|n| n.to_string())
             }
             ColumnType::Float | ColumnType::Decimal { .. } => {
@@ -501,7 +501,18 @@ pub fn render_migration_step(
                 ));
             }
             out.push(format!("DROP TABLE {}", d.ident(name)));
-            out.push(format!("ALTER TABLE {} RENAME TO {}", d.ident(&temp), d.ident(name)));
+            // Copied back under the table's own name, as Rails' `alter_table` moves it twice: a rename would leave the
+            // child rows the DROP orphaned counted as deferred violations, so COMMIT would fail.
+            out.push(create_table_sql(after, d, false, &every_table)?);
+            if !kept.is_empty() {
+                out.push(format!(
+                    "INSERT INTO {} ({cols}) SELECT {cols} FROM {}",
+                    d.ident(name),
+                    d.ident(&temp),
+                    cols = kept.join(", ")
+                ));
+            }
+            out.push(format!("DROP TABLE {}", d.ident(&temp)));
             out.extend(after.indexes.iter().map(|i| create_index_sql(after, i, d, false, source)));
             out
         }

@@ -724,7 +724,9 @@ fn apply_table_verb(
                 // index and, below, its foreign key
                 let options = &args[2.min(args.len())..];
                 let mut id = reference_column(&name);
-                id.nullable = parse_column_opts(options.iter()).nullable.unwrap_or(true);
+                let opts = parse_column_opts(options.iter());
+                id.nullable = opts.nullable.unwrap_or(true);
+                id.default = opts.default;
                 let (cols, idxs) = reference_definition(&t, id, options, file)?;
                 if let Some(table) = schema.tables.get_mut(&Symbol::from(t.as_str())) {
                     // A column under the logical name goes only when it is a reference an
@@ -3623,7 +3625,13 @@ pub fn record_migration(source: &[u8], file: &str, fold: &mut MigrationFold) -> 
     let version: String = stem.chars().take_while(|c| c.is_ascii_digit()).collect();
     let mut migration = Migration { version, file: file.into(), steps: Vec::new(), not_renderable: None, in_schema: false };
     super::sources::register(file, &String::from_utf8_lossy(source));
-    let result = super::prism::parse(source, file);
+    // Silent: a migration that does not parse is a pending one this fold cannot render, not an error for an app whose schema file stands.
+    let result = super::prism::parse_silent(source);
+    if result.errors().next().is_some() {
+        migration.not_renderable = Some("the migration does not parse".into());
+        unknown.push((None, file.to_string()));
+        return migration;
+    }
     let root = result.node();
     let Some(class) = find_first_class(&root) else {
         migration.not_renderable = Some("no migration class".into());
@@ -3729,7 +3737,12 @@ pub fn record_migration(source: &[u8], file: &str, fold: &mut MigrationFold) -> 
                 walk_calls(&stmt, &mut |inner| {
                     if inner.receiver().is_none() {
                         let v = constant_id_str(&inner.name()).to_string();
-                        if apply_migration_verb(&v, inner, file, schema, GeneratedExpressionDialect::Portable).is_err() && is_schema_verb(&v) {
+                        if !is_schema_verb(&v) {
+                            // A helper's body is not read, so it may have changed any table.
+                            if !matches!(v.as_str(), "say" | "say_with_time" | "puts" | "raise" | "table_exists?" | "column_exists?" | "index_exists?" | "foreign_key_exists?") {
+                                unknown.push((None, file.to_string()));
+                            }
+                        } else if apply_migration_verb(&v, inner, file, schema, GeneratedExpressionDialect::Portable).is_err() {
                             unknown.push((first_table(inner), file.to_string()));
                         }
                     }
@@ -3765,6 +3778,10 @@ fn data_only_sql(call: &ruby_prism::CallNode<'_>) -> Option<String> {
         return None;
     }
     let sql = string_value(&args[0])?;
+    // A second statement after the first could be DDL the fold does not see.
+    if sql.trim_end().trim_end_matches(';').contains(';') {
+        return None;
+    }
     let head = sql.trim_start().split_whitespace().next().unwrap_or("").to_ascii_uppercase();
     matches!(head.as_str(), "UPDATE" | "INSERT" | "DELETE").then_some(sql)
 }
@@ -3829,6 +3846,10 @@ fn record_verb(
         }
     }
     apply_migration_verb(verb, call, file, schema, GeneratedExpressionDialect::Portable)?;
+    // Folded, but rendered as a plain CREATE TABLE it would stop the migration where Rails skips an existing table.
+    if verb == "create_table" && kwarg_value(args.iter(), "if_not_exists").is_some_and(|v| bool_value(&v) != Some(false)) {
+        return Err(IngestError::Unsupported { file: file.into(), message: format!("`create_table :{table}, if_not_exists:` is not rendered as SQL") });
+    }
     match verb {
         "create_table" => {
             if let Some(t) = schema.tables.get(&Symbol::from(table.as_str())) {
@@ -3863,6 +3884,8 @@ fn record_verb(
                 if added.iter().any(|c| {
                     c.generated.as_ref().is_some_and(|g| matches!(g.storage, GeneratedColumnStorage::Stored))
                         || (!c.nullable && c.generated.is_none() && c.default.is_none() && c.default_expression.is_none())
+                        // SQLite's ADD COLUMN takes no expression default (`CURRENT_TIMESTAMP`, `(…)`)
+                        || c.default_expression.is_some()
                 }) {
                     steps.push(S::RebuildTable { before: b.clone(), after: a.clone() });
                     return Ok(steps);

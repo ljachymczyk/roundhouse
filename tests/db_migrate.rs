@@ -188,8 +188,8 @@ end
         "ALTER TABLE articles ADD COLUMN subtitle TEXT NOT NULL DEFAULT ''"
     );
     let rest = out[1..].join("\n");
-    // SQLite's procedure: new definition, rows copied, old dropped, renamed
-    // into place, indexes and the foreign key kept
+    // Rails' alter_table: rows moved to a copy, the table made again under
+    // its name and the rows moved back, indexes and the foreign key kept
     assert!(rest.contains("PRAGMA defer_foreign_keys = ON"), "{rest}");
     assert!(rest.contains("CREATE TABLE comments__rh_alter ("), "{rest}");
     assert!(rest.contains("body TEXT DEFAULT 'none'"), "{rest}");
@@ -202,7 +202,8 @@ end
         "{rest}"
     );
     assert!(
-        rest.contains("DROP TABLE comments\nALTER TABLE comments__rh_alter RENAME TO comments"),
+        rest.contains("DROP TABLE comments\nCREATE TABLE comments (")
+            && rest.contains("INSERT INTO comments (id, article_id, body) SELECT id, article_id, body FROM comments__rh_alter\nDROP TABLE comments__rh_alter"),
         "{rest}"
     );
     assert!(
@@ -657,4 +658,90 @@ end
     let stdout = String::from_utf8_lossy(&done.stdout);
     assert!(done.status.success(), "sqlite3 rejected the migrations: {}\n{script}", String::from_utf8_lossy(&done.stderr));
     assert_eq!(stdout.lines().collect::<Vec<_>>(), ["rows|1|7|first", "violations|0", "target|articles|article_key"], "{script}");
+}
+
+#[test]
+fn a_parent_rebuilt_under_its_children_commits_with_their_rows() {
+    let ms = record(&[
+        ("db/migrate/20260101000001_create_articles.rb", CREATE_ARTICLES),
+        ("db/migrate/20260101000002_create_comments.rb", CREATE_COMMENTS),
+        (
+            "db/migrate/20260101000003_title_default.rb",
+            r#"
+class TitleDefault < ActiveRecord::Migration[8.1]
+  def change
+    change_column_default :articles, :title, from: nil, to: "untitled"
+  end
+end
+"#,
+        ),
+    ]);
+    assert!(matches!(ms[2].steps.as_slice(), [MigrationStep::RebuildTable { .. }]), "{:?}", ms[2].steps);
+    let migration = |m: &Migration| format!("BEGIN;\n{}COMMIT;\n", sql(m).iter().map(|s| format!("{s};\n")).collect::<String>());
+    let script = format!(
+        "PRAGMA foreign_keys = ON;\n{}{}\
+         INSERT INTO articles (id, title, created_at, updated_at) VALUES (7, 'a', '2026-01-01', '2026-01-01');\n\
+         INSERT INTO comments (id, article_id, body) VALUES (1, 7, 'first');\n\
+         {}\
+         SELECT 'rows', id, article_id, body FROM comments;\n\
+         SELECT 'violations', count(*) FROM pragma_foreign_key_check;\n",
+        migration(&ms[0]),
+        migration(&ms[1]),
+        migration(&ms[2]),
+    );
+    let mut child = std::process::Command::new("sqlite3")
+        .args(["-bail", ":memory:"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("sqlite3, which this check runs the migrations with");
+    use std::io::Write;
+    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+    let done = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&done.stdout);
+    assert!(done.status.success(), "sqlite3 rejected the migrations: {}\n{script}", String::from_utf8_lossy(&done.stderr));
+    assert_eq!(stdout.lines().collect::<Vec<_>>(), ["rows|1|7|first", "violations|0"], "{script}");
+}
+
+fn one(body: &str) -> String {
+    format!("class Change < ActiveRecord::Migration[8.1]\n  def change\n    {body}\n  end\nend\n")
+}
+
+/// Each form renders as SQL that would not do what `db:migrate` does, so
+/// the migration is pending and not rendered.
+#[test]
+fn forms_the_sql_would_get_wrong_are_not_rendered() {
+    for body in [
+        r#"execute "UPDATE articles SET title = 'x'; DROP TABLE comments""#,
+        "create_table :articles, if_not_exists: true do |t|\n      t.string :title\n    end",
+        "def change(",
+    ] {
+        let ms = record(&[("db/migrate/20260101000001_create_articles.rb", CREATE_ARTICLES), ("db/migrate/20260101000002_change.rb", &one(body))]);
+        assert!(ms[1].not_renderable.is_some(), "{body}: {:?}", ms[1].steps);
+    }
+}
+
+#[test]
+fn a_helper_the_fold_does_not_read_leaves_every_table_unknown() {
+    let ms = record(&[
+        ("db/migrate/20260101000001_create_articles.rb", CREATE_ARTICLES),
+        ("db/migrate/20260101000002_install.rb", &one("install_slug")),
+        ("db/migrate/20260101000003_title.rb", &one(r#"change_column_default :articles, :title, from: nil, to: "untitled""#)),
+    ]);
+    assert!(ms[1].not_renderable.is_some());
+    let why = ms[2].not_renderable.as_deref().unwrap_or_default();
+    assert!(why.contains("not known"), "the rebuild could drop what install_slug added: {why:?}");
+}
+
+#[test]
+fn an_expression_default_is_added_by_a_rebuild_and_a_reference_keeps_its_default() {
+    let ms = record(&[
+        ("db/migrate/20260101000001_create_articles.rb", CREATE_ARTICLES),
+        ("db/migrate/20260101000002_stamp.rb", &one(r#"add_column :articles, :published_at, :datetime, default: -> { "CURRENT_TIMESTAMP" }"#)),
+        ("db/migrate/20260101000003_author.rb", &one("add_reference :articles, :author, null: false, default: 0, index: false")),
+    ]);
+    assert!(matches!(ms[1].steps.as_slice(), [MigrationStep::RebuildTable { .. }]), "{:?}", ms[1].steps);
+    let author = sql(&ms[2]).join("\n");
+    assert!(author.contains("author_id") && author.contains("DEFAULT 0"), "{author}");
 }
