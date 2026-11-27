@@ -986,6 +986,10 @@ impl SpecConfig {
                     }
                 }
                 (None, "puts" | "print" | "warn") => {}
+                // `:raise` turns a potential false positive into a failure RSpec reports, which the emitted test cannot.
+                (Some("RSpec::Expectations.configuration"), "on_potential_false_positives=") if t.contains(":raise") => {
+                    self.refuse_all(file, "`on_potential_false_positives = :raise`")?;
+                }
                 (Some(r), n) if INERT_STATEMENTS.contains(&(r, n)) => {}
                 // `Dir[Rails.root.join("spec", "support", ...)]`, and the
                 // `Rails.root.glob("spec/support/**/*.rb")` that current
@@ -2442,6 +2446,11 @@ end
             let _ = super::super::survey::surveying(|| config.read_helper(src, "/app/spec/rails_helper.rb", &mut |_, _| Ok(())));
             assert!(config.refused.iter().any(|f| f.0.is_none()), "{what} must leave every example out");
         }
+        let mut config = SpecConfig::default();
+        let _ = super::super::survey::surveying(|| {
+            config.read_helper(b"RSpec::Expectations.configuration.on_potential_false_positives = :raise\n", "/app/spec/spec_helper.rb", &mut |_, _| Ok(()))
+        });
+        assert!(config.refused.iter().any(|f| f.0.is_none()), "a false-positive policy of :raise must leave every example out");
         let mut config = SpecConfig::default();
         let _ = super::super::survey::surveying(|| config.read_support(b"require_relative \"../spec_helper\"\n", "/app/spec/support/setup.rb"));
         assert!(config.refused.iter().any(|f| f.0.is_none()), "a support file's own load must leave every example out");
