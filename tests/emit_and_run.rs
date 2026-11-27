@@ -7490,7 +7490,7 @@ async fn record_json_is_rails_serializable_hash() {
             _ => server.get(path).await,
         };
         assert_eq!(response.status_code(), 200, "{method} {path}");
-        assert_eq!(response.header("content-type"), "application/json", "{method} {path}");
+        assert_eq!(response.header("content-type"), "application/json; charset=utf-8", "{method} {path}");
         assert_eq!(response.text(), want, "{method} {path}");
     }
 }
