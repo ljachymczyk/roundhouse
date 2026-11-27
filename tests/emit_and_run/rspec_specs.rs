@@ -235,7 +235,7 @@ fn failing_response_matchers_fail_the_emitted_test() {
             .write("spec/requests/articles_spec.rb", &RESPONSE_SPEC.replacen(find, replace, 1))
             .run_test("test/models/requests_articles_spec_test.rb");
         assert!(run.errors.is_empty(), "{find}: {:?}", run.errors);
-        assert!(!run.success, "`{replace}` passed:\n{}\n{}", run.stdout, run.stderr);
+        assert!(!run.program_succeeded(), "`{replace}` passed:\n{}\n{}", run.stdout, run.stderr);
     }
 }
 
