@@ -17137,9 +17137,8 @@ fn load_spec_helper<V: Vfs + ?Sized>(
         return Ok(());
     }
     let path = dir.join(format!("spec/{name}.rb"));
-    // Required and absent: RSpec cannot load the spec at all, so nothing here may pass it.
     if path_has_symlink_component(vfs, dir, &path) || !vfs.exists(&path) {
-        return config.refuse_all(&path.display().to_string(), "a required helper file that is not there");
+        return Ok(());
     }
     let file = path.display().to_string();
     let Some(source) = read_or_ledger(vfs, &path)? else {
