@@ -52,7 +52,7 @@ Both former substrate gaps are now FFI-shaped and landed:
 The original substrate request was tracked in [matz/spinel#214](https://github.com/matz/spinel/issues/214);
 the `sp_net`/`sp_crypto` upstreaming that lets this link cleanly is
 discussed in [OriPekelman/tep#6](https://github.com/OriPekelman/tep/issues/6)
-+ [rubys/roundhouse#1](https://github.com/rubys/roundhouse/issues/1).
++ [roundhouse-rb/roundhouse#1](https://github.com/roundhouse-rb/roundhouse/issues/1).
 
 ## Quick start
 
@@ -61,7 +61,7 @@ discussed in [OriPekelman/tep#6](https://github.com/OriPekelman/tep/issues/6)
 System tools to install once. All available via standard package
 managers:
 
-- **Ruby 3.4 or later** with bundler (ships with Ruby).
+- **Ruby 4.0.9 or later** with bundler (ships with Ruby).
 - **Node.js + npm** — Tailwind CSS build for the asset pipeline.
 - **SQLite system library** — preinstalled on macOS;
   `apt install libsqlite3-dev` on Ubuntu / Debian. The `sqlite3`
@@ -69,7 +69,7 @@ managers:
 
 The end-to-end demo path additionally needs:
 
-- **Rails gem** — `gem install rails`. Used by `bin/rh fixture` to
+- **Rails gem** — `gem install rails -v 8.1.4`. Used by `bin/rh fixture` to
   generate the Rails fixture via `rails new`.
 - **Rust + cargo** — install via [rustup](https://rustup.rs). Used
   to build the Roundhouse transpiler.
@@ -83,7 +83,7 @@ and serves the running app on `:3000`:
 
 ```sh
 rm -rf roundhouse
-git clone https://github.com/rubys/roundhouse
+git clone https://github.com/roundhouse-rb/roundhouse
 cd roundhouse
 bin/rh fixture                    # generate the Rails fixture (~60s)
 bin/rh dev ruby                   # transpile + assets + Puma on :3000 (~3-5min cold; ~5s warm)
@@ -233,7 +233,7 @@ Turbo clients) is layered on top of that log by `cable.rb`'s
 | View helpers | `link_to`, `button_to`, `dom_id`, `content_for`, `turbo_stream_from`, `truncate`, `pluralize`, `stylesheet_link_tag`, `javascript_importmap_tags`, FormBuilder (label/text_field/text_area/submit) |
 | Layouts | `Views::Layouts.application(body)` consumes `content_for(:title)`, emits importmap referencing Turbo |
 | Broadcasts | Turbo Stream fragments via after-commit hooks; in-memory log for tests + file IPC for dev-server fan-out |
-| Flash | Cookie-based round-trip (signed `flash_notice`, `flash_alert` cookies); render-path clears, redirect-path emits |
+| Flash | Rides in the session cookie as Rails keeps it (`"flash" => {"discard" => [], "flashes" => {...}}`); shown once |
 | Forms | POST/PATCH/DELETE via hidden `_method` field; method override on the dev-server side; full create/update/destroy flow |
 | HTTP entry point | `main.rb` parses CGI, dispatches, writes response with status + headers + body |
 | HTTP server (CRuby) | Puma + Rack adapter (`config.ru`) — terminates HTTP/1.1, lifts requests into CGI shape, calls `Main.run`, parses the response back to a Rack tuple. `Rack::Static` serves `/assets/*` and root icons. |
@@ -340,7 +340,7 @@ from this fixture:
   `csrf_meta_tags` carry the session's token, and a controller under
   `protect_from_forgery with: :exception` refuses a non-GET request
   that does not present it (see the guide's
-  [security posture](https://github.com/rubys/roundhouse/blob/main/docs/guide/rails-coverage.md#security-posture)
+  [security posture](https://github.com/roundhouse-rb/roundhouse/blob/main/docs/guide/rails-coverage.md#security-posture)
   for how this differs from Rails).
 - **Signed stream names.** `turbo_stream_from` writes the name signed
   the way turbo-rails signs it, and a subscribe whose name does not
@@ -348,10 +348,11 @@ from this fixture:
   stream by editing the name in the page, and a `/cable` handshake from
   another site's `Origin`, or with none, is refused with Rails' 404
   (runtime/request_forgery_protection.rb).
-- **Signed, not encrypted, session and flash cookies.** A client can
-  read its session and its flash messages but cannot forge either: a
-  constructed `Cookie: flash_notice=Hello` is not signed and shows
-  nothing.
+- **The session cookie is Rails' encrypted one.** AES-256-GCM under
+  `SECRET_KEY_BASE`, the flash inside it: a client can neither read
+  nor forge its session or its flash messages, and a session cookie
+  Rails wrote with the same secret reads here (and the other way
+  round).
 - **No HTTPS.** No `Secure` flag on cookies; `HttpOnly` is set but
   `SameSite` is not.
 - **No authentication, no authorization.** No user model, no login,
