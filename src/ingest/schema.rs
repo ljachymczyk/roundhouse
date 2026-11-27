@@ -2873,20 +2873,6 @@ fn reference_definition(
     let polymorphic = polymorphic_option.as_ref().is_some_and(|n| truthy(n));
     let id_name = format!("{name}_id");
     id.name = Symbol::from(id_name.as_str());
-    // `type: :uuid` (or :string): the key's own storage, not the integer a reference otherwise is.
-    if let Some(declared) = foreign_key_option(options, "type") {
-        match name_value(&declared).as_deref() {
-            Some("integer" | "bigint") => {}
-            Some("uuid") => id.col_type = ColumnType::Uuid,
-            Some("string") => id.col_type = ColumnType::String { limit: None },
-            _ => {
-                return Err(IngestError::Unsupported {
-                    file: file.into(),
-                    message: format!("reference {table}.{id_name} names a `type:` the fold does not model"),
-                })
-            }
-        }
-    }
     let mut index_columns = vec![Symbol::from(id_name.as_str())];
     let mut columns = Vec::new();
     if polymorphic {
@@ -4339,7 +4325,6 @@ mod tests {
             class CreateEvents < ActiveRecord::Migration[8.0]
               def change
                 create_table :content_management_publication_events do |t|
-                  t.references :account, type: :uuid
                   t.references :subject, polymorphic: { null: false, default: "Post" }
                   t.references :primary_publication_author, index: { unique: true }
                   t.references :primary_publication_editor, index: { unique: true }
@@ -4348,7 +4333,6 @@ mod tests {
             end
             "#]);
         let table = &schema.tables[&Symbol::from("content_management_publication_events")];
-        assert_eq!(col(&schema, "content_management_publication_events", "account_id").col_type, ColumnType::Uuid);
         let subject_type = col(&schema, "content_management_publication_events", "subject_type");
         assert!(!subject_type.nullable);
         assert!(subject_type.default.is_some());
