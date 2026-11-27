@@ -2905,13 +2905,14 @@ fn reference_definition(
         Some(value) => {
             let mut index = build_index(table, index_columns, None, std::iter::once(&value), file)?;
             if polymorphic && foreign_key_option(std::slice::from_ref(&value), "name").is_none() {
-                index.name = Symbol::from(length_safe_index_name(format!("index_{table}_on_{name}"), &[&format!("{name}_type"), &id_name]));
+                // Rails' `polymorphic_index_name`, which is not shortened as a generated name is.
+                index.name = Symbol::from(format!("index_{table}_on_{name}"));
             }
             vec![index]
         }
         None => {
             let index_name = if polymorphic {
-                length_safe_index_name(format!("index_{table}_on_{name}"), &[&format!("{name}_type"), &id_name])
+                format!("index_{table}_on_{name}")
             } else {
                 default_index_name(table, &[id_name.as_str()])
             };
@@ -4326,6 +4327,56 @@ mod tests {
         assert_eq!(names, ["index_posts_on_author_id", "index_posts_on_editor_id"]);
         let fks: Vec<&str> = posts.foreign_keys.iter().map(|f| f.from_columns[0].as_str()).collect();
         assert_eq!(fks, ["author_id", "editor_id"]);
+    }
+
+    #[test]
+    fn reference_options_shape_the_columns_as_rails_does() {
+        let schema = fold(&[r#"
+            class CreateEvents < ActiveRecord::Migration[8.0]
+              def change
+                create_table :content_management_publication_events do |t|
+                  t.references :account, type: :uuid
+                  t.references :subject, polymorphic: { null: false, default: "Post" }
+                  t.references :primary_publication_author, index: { unique: true }
+                  t.references :primary_publication_editor, index: { unique: true }
+                end
+              end
+            end
+            "#]);
+        let table = &schema.tables[&Symbol::from("content_management_publication_events")];
+        assert_eq!(col(&schema, "content_management_publication_events", "account_id").col_type, ColumnType::Uuid);
+        let subject_type = col(&schema, "content_management_publication_events", "subject_type");
+        assert!(!subject_type.nullable);
+        assert!(subject_type.default.is_some());
+        // Rails 8.1's generated name over 62 bytes: the short `idx_on_` form and a SHA-256 suffix, distinct for both.
+        let names: Vec<&str> = table.indexes.iter().map(|i| i.name.as_str()).collect();
+        assert!(names.contains(&"idx_on_primary_publication_author_id_cb2bf9cf32"), "{names:?}");
+        assert!(names.contains(&"idx_on_primary_publication_editor_id_2e1dce0499"), "{names:?}");
+    }
+
+    #[test]
+    fn add_reference_if_not_exists_keeps_the_column_there() {
+        let schema = fold(&[
+            r#"
+            class CreatePosts < ActiveRecord::Migration[8.0]
+              def change
+                create_table :posts do |t|
+                  t.integer :author_id, null: false, default: 1
+                end
+              end
+            end
+            "#,
+            r#"
+            class AddAuthorToPosts < ActiveRecord::Migration[8.0]
+              def change
+                add_reference :posts, :author, if_not_exists: true, index: false
+              end
+            end
+            "#,
+        ]);
+        let author = col(&schema, "posts", "author_id");
+        assert!(!author.nullable);
+        assert!(author.default.is_some());
     }
 
     #[test]
