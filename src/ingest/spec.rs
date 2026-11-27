@@ -2102,6 +2102,10 @@ end
     }
 
     fn sends(e: &Expr) -> Vec<String> {
+        // One hook's body is a single call (each `after` hook has its own `ensure`).
+        if let ExprNode::Send { method, .. } = &*e.node {
+            return vec![method.as_str().to_string()];
+        }
         let ExprNode::Seq { exprs } = &*e.node else { return vec![format!("{e:?}")] };
         exprs
             .iter()
