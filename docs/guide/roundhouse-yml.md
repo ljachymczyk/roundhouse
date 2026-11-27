@@ -125,8 +125,9 @@ The supported subset:
 - `expect { }.to change { value }` and `change(receiver, :message)`, bare
   or with `by`, `by_at_least`, `by_at_most`, `from` and `to`. As in
   RSpec, the value is not copied: it and its `hash` are compared before
-  and after the block, so a value changed in place reads as a change, and
-  `from` is matched before the block runs.
+  and after the block, so a value changed in place reads as a change (the
+  `by` forms compare the delta instead), and `from` is matched before the
+  block runs. An Array or Hash `from`/`to` must hold plain literals.
 
 Roundhouse reads `spec/spec_helper.rb` and `spec/rails_helper.rb`, and
 the `spec/support/` files they load with the generated
