@@ -2927,7 +2927,13 @@ end
         let mut entries: Vec<&'static str> = Vec::new();
         if let Ok(options) = vfs.read(&dir.join(".rspec")) {
             let options = String::from_utf8_lossy(&options);
-            let mut words = options.split_whitespace();
+            // RSpec skips comment lines and reads the rest shell-style: `--require "spec_helper"` names spec_helper.
+            let tokens: Vec<String> = options
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .flat_map(|l| l.split_whitespace().map(|w| w.trim_matches(|c| c == '"' || c == '\'').to_string()).collect::<Vec<_>>())
+                .collect();
+            let mut words = tokens.iter().map(String::as_str);
             while let Some(word) = words.next() {
                 let required = match word.strip_prefix("--require=") {
                     Some(name) => Some(name),
@@ -2946,14 +2952,17 @@ end
             for line in String::from_utf8_lossy(&source).lines() {
                 let line = line.trim();
                 let Some(rest) = line.strip_prefix("require_relative").or_else(|| line.strip_prefix("require")) else { continue };
-                let required = rest.trim().trim_start_matches('(').trim_end_matches(')').trim().trim_matches(|c| c == '"' || c == '\'');
+                // The first quoted argument, whatever follows it (`require "rails_helper" # setup`).
+                let rest = rest.trim().trim_start_matches('(');
+                let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else { continue };
+                let Some(required) = rest[1..].split(quote).next() else { continue };
                 if let Some(name) = super::spec::helper_file_name(required) {
                     entries.push(name);
                 }
             }
         }
         let mut loaded: crate::det::HashSet<&'static str> = crate::det::HashSet::default();
-        let mut support_loaded = false;
+        let mut support_loaded: crate::det::HashSet<PathBuf> = crate::det::HashSet::default();
         for entry in entries {
             load_spec_helper(vfs, dir, entry, &mut spec_config, &mut loaded, &mut support_loaded)?;
         }
@@ -17122,14 +17131,15 @@ fn load_spec_helper<V: Vfs + ?Sized>(
     name: &'static str,
     config: &mut super::spec::SpecConfig,
     loaded: &mut crate::det::HashSet<&'static str>,
-    support_loaded: &mut bool,
+    support_loaded: &mut crate::det::HashSet<PathBuf>,
 ) -> IngestResult<()> {
     if !loaded.insert(name) {
         return Ok(());
     }
     let path = dir.join(format!("spec/{name}.rb"));
+    // Required and absent: RSpec cannot load the spec at all, so nothing here may pass it.
     if path_has_symlink_component(vfs, dir, &path) || !vfs.exists(&path) {
-        return Ok(());
+        return config.refuse_all(&path.display().to_string(), "a required helper file that is not there");
     }
     let file = path.display().to_string();
     let Some(source) = read_or_ledger(vfs, &path)? else {
@@ -17141,9 +17151,6 @@ fn load_spec_helper<V: Vfs + ?Sized>(
             load_spec_helper(vfs, dir, other, config, loaded, support_loaded)
         }
         super::spec::Load::Support(glob) => {
-            if std::mem::replace(support_loaded, true) {
-                return Ok(());
-            }
             let support = dir.join("spec/support");
             if path_has_symlink_component(vfs, dir, &support) || !vfs.is_dir(&support) {
                 return Ok(());
@@ -17153,6 +17160,8 @@ fn load_spec_helper<V: Vfs + ?Sized>(
                 files.retain(|f| f.parent() == Some(support.as_path()));
             }
             files.sort();
+            // Each glob reads what it matches that no earlier load read, as Ruby's `require` does.
+            files.retain(|f| support_loaded.insert(f.clone()));
             for f in files {
                 match read_or_ledger(vfs, &f)? {
                     Some(source) => config.read_support(&source, &f.display().to_string())?,
