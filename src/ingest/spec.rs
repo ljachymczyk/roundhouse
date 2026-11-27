@@ -743,6 +743,32 @@ impl Reader<'_> {
     }
 }
 
+/// RSpec's own metadata, which every example carries whatever it declares.
+const BUILTIN_METADATA: &[&str] = &[
+    "file_path", "absolute_file_path", "rerun_file_path", "line_number", "location", "description",
+    "full_description", "described_class", "example_group", "scoped_id", "execution_result",
+];
+
+/// Metadata whose match the reader cannot decide: a built-in key, or a `type:` that is not a literal.
+fn unreadable_metadata(metadata: &[&Node<'_>]) -> bool {
+    metadata.iter().any(|node| {
+        let elements: Vec<Node<'_>> = match (node.as_keyword_hash_node(), node.as_hash_node()) {
+            (Some(h), _) => h.elements().iter().collect(),
+            (None, Some(h)) => h.elements().iter().collect(),
+            _ => return false,
+        };
+        elements.iter().any(|element| {
+            let Some(assoc) = element.as_assoc_node() else { return true };
+            let key = assoc.key().as_symbol_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned());
+            match key.as_deref() {
+                Some("type") => symbol_or_string(&assoc.value()).is_none(),
+                Some(k) => BUILTIN_METADATA.contains(&k),
+                None => true,
+            }
+        })
+    })
+}
+
 /// A Symbol or String literal's text: RSpec compares metadata values like `type: "model"` and
 /// `type: :model` alike.
 fn symbol_or_string(node: &Node<'_>) -> Option<String> {
@@ -863,7 +889,8 @@ impl SpecConfig {
     /// One `spec/support/` file a helper loads: what it configures, and
     /// the modules it defines.
     pub fn read_support(&mut self, source: &[u8], file: &str) -> IngestResult<()> {
-        self.read_file(source, file, &mut |_, _| Ok(()))?;
+        // A support file's own helper require or support glob is not followed, so it is refused, not ignored.
+        self.read_file(source, file, &mut |config, _| config.refuse_all(file, "a load from a support file"))?;
         if let Some(classes) = super::survey::unwrap_or_record(super::library_class::ingest_library_classes(source, file))? {
             self.support_modules.extend(classes);
         }
@@ -967,9 +994,10 @@ impl SpecConfig {
                     // The glob's own reach: `support/**/*.rb` every file below, `support/*.rb` the folder alone.
                     let glob = if !(t.contains("support") && t.contains("require")) {
                         None
-                    } else if t.contains("\"**\"") || t.contains("/**/") {
+                    // The exact patterns only: a narrower one (`support/**/auth_*.rb`) would be read as the whole folder.
+                    } else if t.contains("support/**/*.rb") || t.contains("\"support\", \"**\", \"*.rb\"") {
                         Some(SupportGlob::Recursive)
-                    } else if t.contains("support/*.rb") || t.contains("\"*.rb\"") {
+                    } else if t.contains("support/*.rb") || t.contains("\"support\", \"*.rb\"") {
                         Some(SupportGlob::TopLevel)
                     } else {
                         None
@@ -987,10 +1015,11 @@ impl SpecConfig {
                 // `it_behaves_like` / `include_context`, refused at use.
                 (Some("RSpec") | None, "shared_examples" | "shared_examples_for" | "shared_context") => {}
                 (Some("RSpec::Matchers"), "define" | "define_negated_matcher" | "alias_matcher") => {
-                    if let Some(first) = call.arguments().and_then(|a| a.arguments().iter().next()) {
-                        if let Some(sym) = first.as_symbol_node() {
-                            self.custom_matchers.push(String::from_utf8_lossy(sym.unescaped()).into_owned());
-                        }
+                    let first = call.arguments().and_then(|a| a.arguments().iter().next());
+                    match first.as_ref().and_then(|f| f.as_symbol_node()) {
+                        Some(sym) => self.custom_matchers.push(String::from_utf8_lossy(sym.unescaped()).into_owned()),
+                        // A name it cannot read may shadow any built-in matcher.
+                        None => self.refuse_helper(file, &format!("{at}, a matcher whose name is not a literal Symbol,"), TypeFilter(None))?,
                     }
                 }
                 // A matcher library's configuration block: it reaches only
@@ -1087,6 +1116,10 @@ impl SpecConfig {
                 "include" => {
                     let (modules, metadata): (Vec<&Node<'_>>, Vec<&Node<'_>>) =
                         args.iter().partition(|a| constant_path_of(a).is_some());
+                    if unreadable_metadata(&metadata) {
+                        self.refuse_helper(file, &format!("`{}` with metadata the reader cannot evaluate", first_line(&t)), TypeFilter(None))?;
+                        continue;
+                    }
                     let Some(filter) = metadata_filter(&metadata) else { continue };
                     for m in modules {
                         let path: Vec<String> =
@@ -1117,7 +1150,12 @@ impl SpecConfig {
                 "each" | "example" => {
                     rest.remove(0);
                 }
-                "all" | "context" | "suite" => {
+                // RSpec ignores a suite hook's metadata: it runs once, before every example.
+                "suite" => {
+                    self.refuse_helper(file, &format!("`{}`, a hook that runs once per suite,", first_line(t)), TypeFilter(None))?;
+                    return Ok(None);
+                }
+                "all" | "context" => {
                     if let Some(filter) = metadata_filter(&rest[1..]) {
                         self.refuse_helper(file, &format!("`{}`, a hook that runs once per group or suite,", first_line(t)), filter)?;
                     }
@@ -1125,6 +1163,11 @@ impl SpecConfig {
                 }
                 _ => {}
             }
+        }
+        // Metadata it cannot read (a computed value, RSpec's own `file_path:`) may match any example.
+        if unreadable_metadata(&rest) {
+            self.refuse_helper(file, &format!("`{}` with metadata the reader cannot evaluate", first_line(t)), TypeFilter(None))?;
+            return Ok(None);
         }
         Ok(metadata_filter(&rest))
     }
@@ -2382,6 +2425,26 @@ end
             refused.read_helper(b"TestSettings.configure { |c| c.flag = true }\n", "/app/spec/rails_helper.rb", &mut |_, _| Ok(()))
         });
         assert!(refused.refused.iter().any(|f| f.0.is_none()), "an unread library configuration leaves every example out");
+    }
+
+    // Each form leaves every example out: what it registers or matches is not read.
+    #[test]
+    fn unread_helper_forms_leave_every_example_out() {
+        let cases: &[(&str, &[u8])] = &[
+            ("a suite hook", b"RSpec.configure do |config|\n  config.before(:suite, type: :model) { setup }\nend\n"),
+            ("built-in metadata", b"RSpec.configure do |config|\n  config.before(file_path: /article_spec/) { setup }\nend\n"),
+            ("a computed type", b"RSpec.configure do |config|\n  config.before(type: Config.spec_type) { setup }\nend\n"),
+            ("a computed include filter", b"RSpec.configure do |config|\n  config.include Helpers, type: Config.spec_type\nend\n"),
+            ("an interpolated matcher name", b"RSpec::Matchers.define(:\"be_#{:nil}\") { match { |_| false } }\n"),
+        ];
+        for (what, src) in cases {
+            let mut config = SpecConfig::default();
+            let _ = super::super::survey::surveying(|| config.read_helper(src, "/app/spec/rails_helper.rb", &mut |_, _| Ok(())));
+            assert!(config.refused.iter().any(|f| f.0.is_none()), "{what} must leave every example out");
+        }
+        let mut config = SpecConfig::default();
+        let _ = super::super::survey::surveying(|| config.read_support(b"require_relative \"../spec_helper\"\n", "/app/spec/support/setup.rb"));
+        assert!(config.refused.iter().any(|f| f.0.is_none()), "a support file's own load must leave every example out");
     }
 
     // A helper that does not say `infer_spec_type_from_file_location!` gives
