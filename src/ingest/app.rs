@@ -2922,25 +2922,40 @@ end
     }
     let mut spec_config = super::spec::SpecConfig::default();
     if !rspec_files.is_empty() {
-        for helper in ["spec/spec_helper.rb", "spec/rails_helper.rb"] {
-            let path = dir.join(helper);
-            if path_has_symlink_component(vfs, dir, &path) || !vfs.exists(&path) {
-                continue;
-            }
-            if let Some(source) = read_or_ledger(vfs, &path)? {
-                spec_config.read_helper(&source, &path.display().to_string())?;
-            }
-        }
-        // `Dir[Rails.root.join("spec/support/**/*.rb")].sort.each { |f| require f }`.
-        let support = dir.join("spec/support");
-        if spec_config.loads_support_dir && !path_has_symlink_component(vfs, dir, &support) && vfs.is_dir(&support) {
-            let mut files = read_test_rb_files(vfs, dir, &support)?;
-            files.sort();
-            for file in files {
-                if let Some(source) = read_or_ledger(vfs, &file)? {
-                    spec_config.read_support(&source, &file.display().to_string())?;
+        // The helpers the run loads: `.rspec`'s `--require`s, then each spec's own `require`s. RSpec's
+        // configuration is global, so a helper any selected spec loads configures every example.
+        let mut entries: Vec<&'static str> = Vec::new();
+        if let Ok(options) = vfs.read(&dir.join(".rspec")) {
+            let options = String::from_utf8_lossy(&options);
+            let mut words = options.split_whitespace();
+            while let Some(word) = words.next() {
+                let required = match word.strip_prefix("--require=") {
+                    Some(name) => Some(name),
+                    None if word == "--require" || word == "-r" => words.next(),
+                    None => None,
+                };
+                if let Some(name) = required.and_then(super::spec::helper_file_name) {
+                    entries.push(name);
                 }
             }
+        }
+        let mut specs: Vec<&PathBuf> = rspec_files.iter().collect();
+        specs.sort();
+        for f in specs {
+            let Ok(source) = vfs.read(f) else { continue };
+            for line in String::from_utf8_lossy(&source).lines() {
+                let line = line.trim();
+                let Some(rest) = line.strip_prefix("require_relative").or_else(|| line.strip_prefix("require")) else { continue };
+                let required = rest.trim().trim_start_matches('(').trim_end_matches(')').trim().trim_matches(|c| c == '"' || c == '\'');
+                if let Some(name) = super::spec::helper_file_name(required) {
+                    entries.push(name);
+                }
+            }
+        }
+        let mut loaded: crate::det::HashSet<&'static str> = crate::det::HashSet::default();
+        let mut support_loaded = false;
+        for entry in entries {
+            load_spec_helper(vfs, dir, entry, &mut spec_config, &mut loaded, &mut support_loaded)?;
         }
         spec_config.finish(&dir.join("spec/rails_helper.rb").display().to_string())?;
     }
@@ -17082,3 +17097,55 @@ fn mime_extension_lookups(app: &mut App) {
     crate::lower::for_each_emit_body(app, &mut rewrite);
 }
 
+
+
+/// One RSpec helper file (`spec/<name>.rb`), once, with what it loads where it loads it: another
+/// helper, and the support files its glob names. A file the configuration needs and cannot read
+/// leaves every example out (`SpecConfig::refuse_all`), since what it registers is unknown.
+fn load_spec_helper<V: Vfs + ?Sized>(
+    vfs: &V,
+    dir: &Path,
+    name: &'static str,
+    config: &mut super::spec::SpecConfig,
+    loaded: &mut crate::det::HashSet<&'static str>,
+    support_loaded: &mut bool,
+) -> IngestResult<()> {
+    if !loaded.insert(name) {
+        return Ok(());
+    }
+    let path = dir.join(format!("spec/{name}.rb"));
+    if path_has_symlink_component(vfs, dir, &path) || !vfs.exists(&path) {
+        return Ok(());
+    }
+    let file = path.display().to_string();
+    let Some(source) = read_or_ledger(vfs, &path)? else {
+        return config.refuse_all(&file, "a helper file that could not be read");
+    };
+    config.read_helper(&source, &file, &mut |config, load| match load {
+        super::spec::Load::Helper(other) => {
+            let other = super::spec::helper_file_name(&other).unwrap_or("spec_helper");
+            load_spec_helper(vfs, dir, other, config, loaded, support_loaded)
+        }
+        super::spec::Load::Support(glob) => {
+            if std::mem::replace(support_loaded, true) {
+                return Ok(());
+            }
+            let support = dir.join("spec/support");
+            if path_has_symlink_component(vfs, dir, &support) || !vfs.is_dir(&support) {
+                return Ok(());
+            }
+            let mut files = read_test_rb_files(vfs, dir, &support)?;
+            if glob == super::spec::SupportGlob::TopLevel {
+                files.retain(|f| f.parent() == Some(support.as_path()));
+            }
+            files.sort();
+            for f in files {
+                match read_or_ledger(vfs, &f)? {
+                    Some(source) => config.read_support(&source, &f.display().to_string())?,
+                    None => config.refuse_all(&f.display().to_string(), "a support file that could not be read")?,
+                }
+            }
+            Ok(())
+        }
+    })
+}

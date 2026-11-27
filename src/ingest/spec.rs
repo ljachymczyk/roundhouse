@@ -366,7 +366,7 @@ impl Reader<'_> {
                         return Ok(None);
                     };
                     let key = assoc.key().as_symbol_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned());
-                    let value = assoc.value().as_symbol_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned());
+                    let value = symbol_or_string(&assoc.value());
                     match (key.as_deref(), value.as_deref()) {
                         (Some("type"), Some(t)) if SUPPORTED_TYPES.contains(&t) => spec_type = Some(t.to_string()),
                         _ => {
@@ -463,6 +463,11 @@ impl Reader<'_> {
             return Ok(false);
         }
         let Some(body) = self.block_body(call, kind)? else { return Ok(false) };
+        // The body becomes a method's (setup/teardown): a bare `next`/`break` there does not parse, and a `return` skips the rest.
+        if jumps(&body) {
+            self.refuse(&node, &format!("`next`, `break` or `return` in a `{kind}` hook"))?;
+            return Ok(false);
+        }
         if kind == "after" {
             frame.afters.push(body);
         } else {
@@ -709,6 +714,8 @@ impl Reader<'_> {
             .includes
             .iter()
             .filter(|(f, _)| f.applies_to(spec_type.as_deref()))
+            // Ruby's lookup order: the module included last answers first.
+            .rev()
             .filter_map(|(_, name)| self.config.support_modules.iter().find(|lc| &lc.name == name).cloned())
             .collect();
         super::app::splice_test_helpers(&mut module, &included);
@@ -717,6 +724,44 @@ impl Reader<'_> {
         Ok(())
     }
 }
+
+/// A Symbol or String literal's text: RSpec compares metadata values like `type: "model"` and
+/// `type: :model` alike.
+fn symbol_or_string(node: &Node<'_>) -> Option<String> {
+    node.as_symbol_node()
+        .map(|s| String::from_utf8_lossy(s.unescaped()).into_owned())
+        .or_else(|| node.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned()))
+}
+
+/// What a helper file loads where it loads it (`SpecConfig::read_helper`).
+pub enum Load {
+    /// `require "spec_helper"` / `"rails_helper"`: that file, by its name.
+    Helper(String),
+    /// The `spec/support` files a glob names.
+    Support(SupportGlob),
+}
+
+/// How far a helper's `spec/support` glob reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SupportGlob {
+    /// `spec/support/**/*.rb`: every file below.
+    Recursive,
+    /// `spec/support/*.rb`: the folder's own files.
+    TopLevel,
+}
+
+/// The helper file a `require` names (`"rails_helper"`, `"../spec_helper"`), if it is one.
+pub fn helper_file_name(required: &str) -> Option<&'static str> {
+    let base = required.rsplit('/').next().unwrap_or(required).trim_end_matches(".rb");
+    match base {
+        "spec_helper" => Some("spec_helper"),
+        "rails_helper" => Some("rails_helper"),
+        _ => None,
+    }
+}
+
+/// Configuration blocks that set up only matchers, which a spec reaches by name (refused there).
+const MATCHER_LIBRARIES: &[&str] = &["Shoulda::Matchers"];
 
 /// Which examples a helper item applies to, by spec type: `None` for
 /// every example, `Some("request")` for `type: :request` only.
@@ -740,8 +785,8 @@ impl TypeFilter {
 pub struct SpecConfig {
     /// `config.infer_spec_type_from_file_location!`.
     pub infer_spec_types: bool,
-    /// `Dir[...support...].each { |f| require f }` in a helper file.
-    pub loads_support_dir: bool,
+    /// The `spec/support` glob a helper file loaded, if any.
+    pub support_glob: Option<SupportGlob>,
     /// `config.before` hooks, in run order.
     befores: Vec<(TypeFilter, Expr)>,
     /// `config.after` hooks, in run order.
@@ -784,15 +829,18 @@ const INERT_STATEMENTS: &[(&str, &str)] = &[
 ];
 
 impl SpecConfig {
-    /// `spec/spec_helper.rb` or `spec/rails_helper.rb`.
-    pub fn read_helper(&mut self, source: &[u8], file: &str) -> IngestResult<()> {
-        self.read_file(source, file)
+    /// `spec/spec_helper.rb` or `spec/rails_helper.rb`. `load` runs what
+    /// the file loads where it loads it: another helper file
+    /// (`require "spec_helper"`), and the support files its glob names,
+    /// so their hooks register before the ones written after the load.
+    pub fn read_helper(&mut self, source: &[u8], file: &str, load: &mut dyn FnMut(&mut SpecConfig, Load) -> IngestResult<()>) -> IngestResult<()> {
+        self.read_file(source, file, load)
     }
 
     /// One `spec/support/` file a helper loads: what it configures, and
     /// the modules it defines.
     pub fn read_support(&mut self, source: &[u8], file: &str) -> IngestResult<()> {
-        self.read_file(source, file)?;
+        self.read_file(source, file, &mut |_, _| Ok(()))?;
         if let Some(classes) = super::survey::unwrap_or_record(super::library_class::ingest_library_classes(source, file))? {
             self.support_modules.extend(classes);
         }
@@ -840,7 +888,13 @@ impl SpecConfig {
         Ok(())
     }
 
-    fn read_file(&mut self, source: &[u8], file: &str) -> IngestResult<()> {
+    /// Every example is left out: a file the configuration needs could not be read, so what it
+    /// registers is unknown.
+    pub fn refuse_all(&mut self, file: &str, what: &str) -> IngestResult<()> {
+        self.refuse_helper(file, what, TypeFilter(None))
+    }
+
+    fn read_file(&mut self, source: &[u8], file: &str, load: &mut dyn FnMut(&mut SpecConfig, Load) -> IngestResult<()>) -> IngestResult<()> {
         super::sources::register(file, &String::from_utf8_lossy(source));
         let result = super::prism::parse(source, file);
         let root = result.node();
@@ -860,7 +914,10 @@ impl SpecConfig {
             }
             if let Some(def) = stmt.as_def_node() {
                 let owner = ClassId(Symbol::from("Object"));
-                self.helper_defs.push(ingest_library_method(&def, &owner, file)?);
+                let def = ingest_library_method(&def, &owner, file)?;
+                // A redefinition replaces the earlier one, as Ruby's later `def` does.
+                self.helper_defs.retain(|d| d.name != def.name);
+                self.helper_defs.push(def);
                 continue;
             }
             // Boot boilerplate: the environment, the production guard,
@@ -878,16 +935,37 @@ impl SpecConfig {
             let name = constant_id_str(&call.name());
             let recv = call.receiver().map(|r| text(&r));
             match (recv.as_deref(), name) {
-                (None, "require" | "require_relative" | "puts" | "print" | "warn") => {}
+                // Another helper file, loaded at this point.
+                (None, "require" | "require_relative") => {
+                    if let Some(helper) = call.arguments().and_then(|a| a.arguments().iter().next()).and_then(|a| {
+                        a.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned())
+                    }) && let Some(name) = helper_file_name(&helper)
+                    {
+                        load(self, Load::Helper(name.to_string()))?;
+                    }
+                }
+                (None, "puts" | "print" | "warn") => {}
                 (Some(r), n) if INERT_STATEMENTS.contains(&(r, n)) => {}
                 // `Dir[Rails.root.join("spec", "support", ...)]`, and the
                 // `Rails.root.glob("spec/support/**/*.rb")` that current
                 // rspec-rails generators write.
                 (Some(r), "each") if r.starts_with("Dir[") || r.starts_with("Dir.glob") || r.starts_with("Rails.root.glob") => {
-                    if t.contains("support") && t.contains("require") {
-                        self.loads_support_dir = true;
+                    // The glob's own reach: `support/**/*.rb` every file below, `support/*.rb` the folder alone.
+                    let glob = if !(t.contains("support") && t.contains("require")) {
+                        None
+                    } else if t.contains("\"**\"") || t.contains("/**/") {
+                        Some(SupportGlob::Recursive)
+                    } else if t.contains("support/*.rb") || t.contains("\"*.rb\"") {
+                        Some(SupportGlob::TopLevel)
                     } else {
-                        self.refuse_helper(file, &at, TypeFilter(None))?;
+                        None
+                    };
+                    match glob {
+                        Some(glob) => {
+                            self.support_glob = Some(glob);
+                            load(self, Load::Support(glob))?;
+                        }
+                        None => self.refuse_helper(file, &at, TypeFilter(None))?,
                     }
                 }
                 (Some("RSpec"), "configure") => self.read_configure(&call, file, &text)?,
@@ -901,15 +979,17 @@ impl SpecConfig {
                         }
                     }
                 }
-                // Another library's configuration block: it reaches only
-                // that library's matchers and helpers, refused where a
-                // spec uses them. Still not read, so reported.
-                (Some(_), "configure") => {
+                // A matcher library's configuration block: it reaches only
+                // that library's matchers, refused where a spec uses them.
+                // Still not read, so reported.
+                (Some(r), "configure") if MATCHER_LIBRARIES.contains(&r) => {
                     super::survey::continue_or_fail(IngestError::Unsupported {
                         file: file.into(),
                         message: format!("RSpec helper: {at} is not read"),
                     })?;
                 }
+                // Any other library's (`TestSettings.configure`) may change what every example reads.
+                (Some(_), "configure") => self.refuse_helper(file, &at, TypeFilter(None))?,
                 _ => self.refuse_helper(file, &at, TypeFilter(None))?,
             }
         }
@@ -1043,7 +1123,7 @@ fn metadata_filter(metadata: &[&Node<'_>]) -> Option<TypeFilter> {
         for element in hash.elements().iter() {
             let assoc = element.as_assoc_node()?;
             let key = assoc.key().as_symbol_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned());
-            let value = assoc.value().as_symbol_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned());
+            let value = symbol_or_string(&assoc.value());
             match (key.as_deref(), value) {
                 (Some("type"), Some(t)) if SUPPORTED_TYPES.contains(&t.as_str()) => filter = TypeFilter(Some(t)),
                 _ => return None,
@@ -1185,10 +1265,13 @@ fn teardown_method(hooks: Vec<Expr>, owner: &ClassId) -> MethodDef {
     let syn = Span::synthetic();
     // Each hook in its own `ensure`, not one around them all: RSpec runs every `after` hook when an earlier one raises.
     let mut body = Expr::new(syn, ExprNode::Super { args: Some(Vec::new()) });
-    for hook in hooks.into_iter().rev() {
+    let count = hooks.len();
+    for (i, hook) in hooks.into_iter().rev().enumerate() {
+        // Only the outermost is the method body's own `ensure`: a nested one needs its `begin`/`end`.
+        let implicit = i + 1 == count;
         body = Expr::new(
             syn,
-            ExprNode::BeginRescue { body: hook, rescues: Vec::new(), else_branch: None, ensure: Some(Box::new(body)), implicit: true },
+            ExprNode::BeginRescue { body: hook, rescues: Vec::new(), else_branch: None, ensure: Some(Box::new(body)), implicit },
         );
     }
     MethodDef {
@@ -1504,6 +1587,8 @@ fn jumps_in(expr: &Expr, nested: bool) -> bool {
         ExprNode::Return { .. } => return true,
         ExprNode::Next { .. } | ExprNode::Break { .. } | ExprNode::Redo | ExprNode::Retry if !nested => return true,
         ExprNode::Lambda { .. } => return false,
+        // A loop owns its `next` and `break`; a `return` in it still leaves the example.
+        ExprNode::While { cond, body, .. } => return jumps_in(cond, nested) || jumps_in(body, true),
         _ => {}
     }
     let mut found = false;
@@ -1566,8 +1651,9 @@ fn block_expectation(
                 ([], Some(b)) => lambda_body(&desugar(b, ctx)?)?,
                 ([recv, name], None) => match &*name.node {
                     ExprNode::Lit { value: Literal::Sym { value } } => {
-                        receiver = Some(assign_var("__rspec_receiver", recv.clone(), span));
-                        send(Some(var("__rspec_receiver", span)), value.as_str(), Vec::new(), span)
+                        let bound = format!("__rspec_receiver_{}", span.start);
+                        receiver = Some(assign_var(&bound, recv.clone(), span));
+                        send(Some(var(&bound, span)), value.as_str(), Vec::new(), span)
                     }
                     _ => return Err("`change(receiver, message)` with a message that is not a symbol".into()),
                 },
@@ -1591,12 +1677,13 @@ fn block_expectation(
 /// assert(__rspec_error.message == "text")         # with a message
 /// ```
 ///
-/// `not_to raise_error` takes no argument in RSpec (with one it is an
-/// error), and means: run the block; an exception fails the example.
+/// `not_to raise_error` here takes no argument (RSpec runs one and warns
+/// of a false positive; this lowering refuses it), and means: run the
+/// block; an exception fails the example.
 fn raise_error_expectation(span: Span, body: Expr, positive: bool, args: Vec<Expr>) -> Result<Expr, String> {
     if !positive {
         if !args.is_empty() {
-            return Err("`not_to raise_error` with an argument (RSpec refuses it too)".into());
+            return Err("`not_to raise_error` with an argument (a Roundhouse limit: RSpec runs it and warns of a false positive)".into());
         }
         return Ok(Expr::new(
             span,
@@ -1636,7 +1723,15 @@ fn raise_error_expectation(span: Span, body: Expr, positive: bool, args: Vec<Exp
     );
     let Some(message) = message else { return Ok(raises) };
     let error = "__rspec_error";
-    let text = send(Some(var(error, span)), "message", Vec::new(), span);
+    // RSpec's own source for the text: `original_message` where the error has one (a NameError's undecorated text).
+    let text = Expr::new(
+        span,
+        ExprNode::If {
+            cond: send(Some(var(error, span)), "respond_to?", vec![Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from("original_message") } })], span),
+            then_branch: send(Some(send(Some(var(error, span)), "original_message", Vec::new(), span)), "to_s", Vec::new(), span),
+            else_branch: send(Some(send(Some(var(error, span)), "message", Vec::new(), span)), "to_s", Vec::new(), span),
+        },
+    );
     let check = match &*message.node {
         ExprNode::Lit { value: Literal::Regex { .. } } => send(Some(message.clone()), "match?", vec![text], span),
         _ => send(Some(text), "==", vec![message.clone()], span),
@@ -1648,20 +1743,25 @@ fn raise_error_expectation(span: Span, body: Expr, positive: bool, args: Vec<Exp
 }
 
 /// `change { value }` / `change(receiver, :message)`, as RSpec's
-/// `ChangeDetails` computes it: the value before the block and after it,
-/// a collection or String copied before the block runs so that changing
-/// it in place still reads as a change.
+/// `ChangeDetails` computes it: the value and its `hash` before the block
+/// and after it, the value itself not copied, so that a value changed in
+/// place reads as a change through its `hash`.
 ///
 /// ```ruby
-/// __rspec_before = value
-/// __rspec_before = __rspec_before.dup if __rspec_before.is_a?(Enumerable) || __rspec_before.is_a?(String)
+/// __rspec_by_N = 1                                  # .by(1), read first
+/// __rspec_before_N = value
+/// __rspec_before_hash_N = __rspec_before_N.hash
 /// body
-/// __rspec_after = value
-/// assert(1 === __rspec_after - __rspec_before || __rspec_after - __rspec_before == 1)   # .by(1)
+/// __rspec_after_N = value
+/// __rspec_after_hash_N = __rspec_after_N.hash
+/// __rspec_delta_N = __rspec_after_N - __rspec_before_N
+/// assert(__rspec_by_N === __rspec_delta_N || __rspec_delta_N == __rspec_by_N)
 /// ```
 ///
-/// `from` / `to` / a bare `change` also need the value to have changed
-/// (`before != after`). Expected values match the way RSpec's
+/// `N` is the expectation's offset, so a nested `change` keeps its own
+/// names. `from` / `to` / a bare `change` also need the value to have
+/// changed (`before != after || before_hash != after_hash`); `from` is
+/// matched before the block runs. Expected values match the way RSpec's
 /// `values_match?` does for plain values: `expected === actual ||
 /// actual == expected`.
 fn change_expectation(
@@ -1671,80 +1771,111 @@ fn change_expectation(
     value: Expr,
     qualifiers: Vec<(String, Vec<Expr>)>,
 ) -> Result<Expr, String> {
-    let (before, after) = ("__rspec_before", "__rspec_after");
+    // Names of this expectation's own: a nested `change` in the block must not overwrite them.
+    let at = span.start;
+    let name = |base: &str| format!("__rspec_{base}_{at}");
+    let (before, after, before_hash, after_hash) = (name("before"), name("after"), name("before_hash"), name("after_hash"));
     let mut by: Option<(String, Expr)> = None;
     let mut from: Option<Expr> = None;
     let mut to: Option<Expr> = None;
-    for (name, args) in qualifiers {
+    // Each argument as its call in the chain runs, in the chain's order (`.to(…).from(…)` reads `to`'s first).
+    let mut stmts = Vec::new();
+    for (qualifier, args) in qualifiers {
         let [arg] = args.as_slice() else {
-            return Err(format!("`change.{name}` without exactly one argument"));
+            return Err(format!("`change.{qualifier}` without exactly one argument"));
         };
-        match name.as_str() {
-            "by" | "by_at_least" | "by_at_most" if by.is_none() => by = Some((name.clone(), arg.clone())),
-            "from" if from.is_none() => from = Some(arg.clone()),
-            "to" if to.is_none() => to = Some(arg.clone()),
-            _ => return Err(format!("`change.{name}` here")),
+        // RSpec matches an Array or Hash expected element by element (`Integer` against an element);
+        // only a whole-value match is lowered, so a pattern inside one is refused.
+        if matches!(qualifier.as_str(), "from" | "to") && collection_with_patterns(arg) {
+            return Err(format!("`change.{qualifier}` with a pattern inside an Array or Hash"));
+        }
+        let slot = match qualifier.as_str() {
+            "by" | "by_at_least" | "by_at_most" if by.is_none() => "by",
+            "from" if from.is_none() => "from",
+            "to" if to.is_none() => "to",
+            _ => return Err(format!("`change.{qualifier}` here")),
+        };
+        let bound = name(slot);
+        stmts.push(assign_var(&bound, arg.clone(), span));
+        let read = var(&bound, span);
+        match slot {
+            "by" => by = Some((qualifier.clone(), read)),
+            "from" => from = Some(read),
+            _ => to = Some(read),
         }
     }
     if by.is_some() && (from.is_some() || to.is_some()) {
         return Err("`change` with both `by` and `from` / `to`".into());
     }
     if !positive && (by.is_some() || to.is_some()) {
-        return Err("`not_to change` with `by` or `to` (RSpec refuses it too)".into());
+        return Err("`not_to change` with `by` or `to`".into());
     }
 
-    // RSpec builds the matcher, so evaluates these arguments, before it runs the block; each is read once.
-    let mut stmts = Vec::new();
-    let mut bind = |name: &str, arg: Expr| {
-        stmts.push(assign_var(name, arg, span));
-        var(name, span)
-    };
-    let by = by.map(|(kind, n)| (kind, bind("__rspec_by", n)));
-    let from = from.map(|x| bind("__rspec_from", x));
-    let to = to.map(|y| bind("__rspec_to", y));
-    stmts.push(assign_var(before, value.clone(), span));
-    if by.is_none() {
-        let copyable = Expr::new(
-            span,
-            ExprNode::BoolOp {
-                op: crate::expr::BoolOpKind::Or,
-                surface: Default::default(),
-                left: send(Some(var(before, span)), "is_a?", vec![constant(&["Enumerable".to_string()], span)], span),
-                right: send(Some(var(before, span)), "is_a?", vec![constant(&["String".to_string()], span)], span),
-            },
-        );
-        stmts.push(Expr::new(
-            span,
-            ExprNode::If {
-                cond: copyable,
-                then_branch: assign_var(before, send(Some(var(before, span)), "dup", Vec::new(), span), span),
-                else_branch: nil(span),
-            },
-        ));
-    }
-    stmts.push(body);
-    stmts.push(assign_var(after, value, span));
-
-    let delta = || send(Some(var(after, span)), "-", vec![var(before, span)], span);
-    let changed = || send(Some(var(after, span)), "!=", vec![var(before, span)], span);
+    // RSpec's ChangeDetails: the value is not copied; its `hash` before and after tells an in-place change apart.
+    stmts.push(assign_var(&before, value.clone(), span));
+    stmts.push(assign_var(&before_hash, send(Some(var(&before, span)), "hash", Vec::new(), span), span));
     let assert = |cond: Expr| send(None, "assert", vec![cond], span);
+    // `from` matches before the event runs, as RSpec matches it on the value it yields then.
+    let from_matched = from.map(|x| {
+        let matched = name("from_matched");
+        stmts.push(assign_var(&matched, values_match(x, var(&before, span), span), span));
+        var(&matched, span)
+    });
+    stmts.push(body);
+    stmts.push(assign_var(&after, value, span));
+    stmts.push(assign_var(&after_hash, send(Some(var(&after, span)), "hash", Vec::new(), span), span));
+
+    let changed = Expr::new(
+        span,
+        ExprNode::BoolOp {
+            op: crate::expr::BoolOpKind::Or,
+            surface: Default::default(),
+            left: send(Some(var(&before, span)), "!=", vec![var(&after, span)], span),
+            right: send(Some(var(&before_hash, span)), "!=", vec![var(&after_hash, span)], span),
+        },
+    );
     match by {
-        Some((kind, n)) => stmts.push(assert(match kind.as_str() {
-            "by" => values_match(n, delta(), span),
-            "by_at_least" => send(Some(delta()), ">=", vec![n], span),
-            _ => send(Some(delta()), "<=", vec![n], span),
-        })),
+        Some((kind, n)) => {
+            // The delta once: a matcher compares it twice (`===`, then `==`).
+            let delta = name("delta");
+            stmts.push(assign_var(&delta, send(Some(var(&after, span)), "-", vec![var(&before, span)], span), span));
+            stmts.push(assert(match kind.as_str() {
+                "by" => values_match(n, var(&delta, span), span),
+                "by_at_least" => send(Some(var(&delta, span)), ">=", vec![n], span),
+                _ => send(Some(var(&delta, span)), "<=", vec![n], span),
+            }));
+        }
         None => {
-            if let Some(x) = from {
-                stmts.push(assert(values_match(x, var(before, span), span)));
+            if let Some(m) = from_matched {
+                stmts.push(assert(m));
             }
+            // The change first: RSpec never asks `to`'s matcher of a value the event left as it was.
+            stmts.push(send(None, if positive { "assert" } else { "refute" }, vec![changed], span));
             if let Some(y) = to {
-                stmts.push(assert(values_match(y, var(after, span), span)));
+                stmts.push(assert(values_match(y, var(&after, span), span)));
             }
-            stmts.push(send(None, if positive { "assert" } else { "refute" }, vec![changed()], span));
         }
     }
     Ok(Expr::new(span, ExprNode::Seq { exprs: stmts }))
+}
+
+/// An Array or Hash literal holding something other than plain literals (a class, a matcher, a
+/// lambda), which RSpec would match element by element.
+fn collection_with_patterns(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Array { elements, .. } => elements.iter().any(|el| !plain_literal(el)),
+        ExprNode::Hash { entries, .. } => entries.iter().any(|(k, v)| !plain_literal(k) || !plain_literal(v)),
+        _ => false,
+    }
+}
+
+fn plain_literal(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Lit { .. } => true,
+        ExprNode::Array { elements, .. } => elements.iter().all(plain_literal),
+        ExprNode::Hash { entries, .. } => entries.iter().all(|(k, v)| plain_literal(k) && plain_literal(v)),
+        _ => false,
+    }
 }
 
 /// RSpec's `values_match?(expected, actual)` for plain values.
@@ -1999,15 +2130,25 @@ end
         }
         let mut order = Vec::new();
         kinds(&tms[0].tests[0].body, &mut order);
-        // `by`'s argument is read first, as RSpec builds the matcher before the block; no copy of the value: it is a difference.
-        // The receiver first: `change(Article, :count)` evaluates it as `change` is called.
-        assert_eq!(order, ["__rspec_receiver =", "__rspec_by =", "__rspec_before =", "create!", "__rspec_after =", "assert"]);
+        // Without the expectation's own offset suffix.
+        let order: Vec<String> = order
+            .into_iter()
+            .map(|k| match k.strip_suffix(" =").and_then(|n| n.rsplit_once('_')) {
+                Some((base, n)) if n.chars().all(|c| c.is_ascii_digit()) => format!("{base} ="),
+                _ => k,
+            })
+            .collect();
+        // `by`'s argument is read first, as RSpec builds the matcher before the block; the delta once.
+        assert_eq!(
+            order,
+            ["__rspec_receiver =", "__rspec_by =", "__rspec_before =", "__rspec_before_hash =", "create!", "__rspec_after =", "__rspec_after_hash =", "__rspec_delta =", "assert"]
+        );
     }
 
     #[test]
-    fn change_from_to_copies_the_value_and_needs_a_change() {
+    fn change_from_to_compares_hashes_and_needs_a_change() {
         let body = body_of(&example("expect { list << 1 }.to change { list }.from([]).to([1])"));
-        assert!(body.contains("dup") && body.contains("\"!=\"") && body.contains("\"===\""), "{body}");
+        assert!(!body.contains("dup") && body.contains("\"hash\"") && body.contains("\"!=\"") && body.contains("\"===\""), "{body}");
         for refused in [
             "expect { x }.not_to change { y }.by(1)",
             "expect { x }.to change { y }.by(1).from(0)",
@@ -2091,9 +2232,11 @@ end
 
     fn config(helper: &str, support: &str) -> IngestResult<SpecConfig> {
         let mut config = SpecConfig::default();
-        config.read_helper(helper.as_bytes(), "/app/spec/rails_helper.rb")?;
-        assert!(config.loads_support_dir);
-        config.read_support(support.as_bytes(), "/app/spec/support/json_helpers.rb")?;
+        config.read_helper(helper.as_bytes(), "/app/spec/rails_helper.rb", &mut |config, load| match load {
+            Load::Support(_) => config.read_support(support.as_bytes(), "/app/spec/support/json_helpers.rb"),
+            Load::Helper(_) => Ok(()),
+        })?;
+        assert!(config.support_glob.is_some());
         config.finish("/app/spec/rails_helper.rb")?;
         Ok(config)
     }
@@ -2137,6 +2280,40 @@ end
         assert_eq!(sends(request[0].setup.as_ref().unwrap()), ["global_setup", "host!"]);
         // `config.include JsonHelpers, type: :request`.
         helper(&request[0], "json");
+    }
+
+    // RSpec's own reading of a helper: a String type filter is the Symbol's, a later `def` replaces an
+    // earlier one, the module included last answers first, a one-level glob keeps to its folder, and a
+    // library's configuration that is not a matcher library's leaves every example out.
+    #[test]
+    fn helper_configuration_reads_as_rspec_does() {
+        let helper_src = "Dir[Rails.root.join(\"spec/support/*.rb\")].sort.each { |f| require f }\nRSpec.configure do |config|\n  config.infer_spec_type_from_file_location!\n  config.before(type: \"model\") { configured }\n  config.include First\n  config.include Second\nend\n\ndef label\n  1\nend\n\ndef label\n  2\nend\n";
+        let support = "module First\n  def pick\n    :first\n  end\nend\nmodule Second\n  def pick\n    :second\n  end\nend\n";
+        let mut globs = Vec::new();
+        let mut config = SpecConfig::default();
+        config
+            .read_helper(helper_src.as_bytes(), "/app/spec/rails_helper.rb", &mut |config, load| match load {
+                Load::Support(glob) => {
+                    globs.push(glob);
+                    config.read_support(support.as_bytes(), "/app/spec/support/modules.rb")
+                }
+                Load::Helper(_) => Ok(()),
+            })
+            .expect("helper");
+        config.finish("/app/spec/rails_helper.rb").expect("finish");
+        assert_eq!(globs, [SupportGlob::TopLevel]);
+        let model = with_config(&config, "describe Article do\n  it \"x\" do\n    expect([label, pick]).to eq([2, :second])\n  end\nend\n", "/app/spec/models/article_spec.rb");
+        assert_eq!(sends(model[0].setup.as_ref().unwrap()), ["configured"]);
+        let label = helper(&model[0], "label");
+        assert!(format!("{:?}", label.body).contains("value: 2"), "{:?}", label.body);
+        let pick = helper(&model[0], "pick");
+        assert!(format!("{:?}", pick.body).contains("second"), "{:?}", pick.body);
+
+        let mut refused = SpecConfig::default();
+        let _ = super::super::survey::surveying(|| {
+            refused.read_helper(b"TestSettings.configure { |c| c.flag = true }\n", "/app/spec/rails_helper.rb", &mut |_, _| Ok(()))
+        });
+        assert!(refused.refused.iter().any(|f| f.0.is_none()), "an unread library configuration leaves every example out");
     }
 
     // Without `infer_spec_type_from_file_location!` a file's folder gives
