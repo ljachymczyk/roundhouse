@@ -32,7 +32,7 @@ mod associations;
 pub(crate) use associations::polymorphic_type_switch;
 pub(crate) mod broadcasts;
 pub(crate) mod markers;
-pub(crate) mod unclaimed;
+pub mod unclaimed;
 pub(crate) mod select_aliases;
 pub mod row;
 

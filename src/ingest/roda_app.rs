@@ -139,6 +139,7 @@ pub fn ingest_roda_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestR
         sti_subclass_names: Vec::new(),
         mixin_sends: Vec::new(),
         select_aliases: Vec::new(),
+        refused_class_macros: Vec::new(),
         i18n: Default::default(),
     });
     let models_dir = dir.join("models");

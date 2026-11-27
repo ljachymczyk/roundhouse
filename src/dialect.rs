@@ -134,6 +134,10 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub select_aliases: Vec<SelectAlias>,
 
+    /// Spans of the class-body calls `ingest::class_macros` refused and reported itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused_class_macros: Vec<crate::span::Span>,
+
     /// The catalog entries this model's messages can reach, its i18n
     /// scope and lookup keys; stamped by `i18n::stamp_models`. Default
     /// (no app locale) answers Rails' own English.

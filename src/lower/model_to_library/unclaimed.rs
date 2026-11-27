@@ -47,7 +47,7 @@ pub(crate) fn unclaimed_calls(model: &Model, schema: &Schema) -> Vec<Unclaimed> 
         let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
         // Replayed where the source has it (`ingest::app_extension_calls`),
         // or a class macro `ingest::class_macros` refused and reports itself.
-        if expr.decisions & (crate::expr::REPLAYED_CLASS_BODY | crate::expr::REFUSED_CLASS_MACRO) != 0 {
+        if expr.decisions & crate::expr::REPLAYED_CLASS_BODY != 0 || model.refused_class_macros.contains(&expr.span) {
             continue;
         }
         // An unresolved `include` and the like carry their own diagnostic.
@@ -362,10 +362,20 @@ pub(crate) fn unclaimed_calls(model: &Model, schema: &Schema) -> Vec<Unclaimed> 
 pub(crate) fn diagnostics(app: &App) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for model in &app.models {
-        for call in unclaimed_calls(model, &app.schema) {
-            if app.extensions.attribute_macro(&call.name).is_some() {
-                continue;
-            }
+        out.extend(
+            model_diagnostics(model, &app.schema)
+                .into_iter()
+                .filter(|d| !matches!(&d.kind, crate::diagnostic::DiagnosticKind::Unsupported { construct, .. } if app.extensions.attribute_macro(construct.as_str()).is_some())),
+        );
+    }
+    out
+}
+
+/// One error per unclaimed statement of `model`.
+pub fn model_diagnostics(model: &Model, schema: &Schema) -> Vec<Diagnostic> {
+    unclaimed_calls(model, schema)
+        .into_iter()
+        .map(|call| {
             let mut detail = format!(
                 "`{}` in the body of `{}` is not modelled, so its effect would be dropped from the output",
                 call.name,
@@ -375,10 +385,9 @@ pub(crate) fn diagnostics(app: &App) -> Vec<Diagnostic> {
                 detail.push_str(": ");
                 detail.push_str(reason);
             }
-            out.push(Diagnostic::unsupported(call.span, None, call.name.as_str(), detail));
-        }
-    }
-    out
+            Diagnostic::unsupported(call.span, None, call.name.as_str(), detail)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -420,6 +429,7 @@ mod tests {
             span: Span::synthetic(),
             mixin_sends: Default::default(),
             select_aliases: Default::default(),
+            refused_class_macros: Vec::new(),
         }
     }
 
@@ -471,7 +481,9 @@ mod tests {
     #[test]
     fn a_class_macro_the_evaluator_refused_is_reported_by_it_alone() {
         let mut call = send("setting", vec![sym("name")]);
-        call.decisions |= crate::expr::REFUSED_CLASS_MACRO;
-        assert!(names(&model(vec![call, send("shout", vec![sym("title")])])) == ["shout"]);
+        call.span = Span { file: crate::span::FileId(1), start: 4, end: 17 };
+        let mut refusing = model(vec![call, send("shout", vec![sym("title")])]);
+        refusing.refused_class_macros.push(Span { file: crate::span::FileId(1), start: 4, end: 17 });
+        assert!(names(&refusing) == ["shout"]);
     }
 }

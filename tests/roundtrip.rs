@@ -87,6 +87,7 @@ fn tiny_blog_round_trips() {
         sti_subclass_names: Vec::new(),
         mixin_sends: Vec::new(),
         select_aliases: Vec::new(),
+        refused_class_macros: Vec::new(),
         i18n: Default::default(),
         span: Span::synthetic(),
     };

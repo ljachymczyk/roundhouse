@@ -145,11 +145,6 @@ pub const RESOLVED_MIXIN: u64 = 1 << 22;
 /// can ask; `project::report_unsupported_bundled_constants` reports it elsewhere.
 pub const MODULE_QUERY: u64 = 1 << 23;
 
-/// A model class-body call to a class macro `ingest::class_macros` could
-/// not expand: that pass reports it, with the reason, so the
-/// unclaimed-statement report does not name it a second time.
-pub const REFUSED_CLASS_MACRO: u64 = 1 << 32;
-
 /// A runtime Class/Module factory or implicit singleton-class access.
 /// The Ruby and JRuby targets retain these runtime class objects.
 pub const RUNTIME_CLASS_OBJECT: u64 = 1 << 31;

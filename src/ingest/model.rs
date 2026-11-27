@@ -670,6 +670,7 @@ pub(super) fn ingest_model_with_enum_constants(
         sti_subclass_names: Vec::new(),
         mixin_sends: Vec::new(),
         select_aliases: Vec::new(),
+        refused_class_macros: Vec::new(),
         i18n: Default::default(),
         table: TableRef(Symbol::from(table_name)),
         primary_key,

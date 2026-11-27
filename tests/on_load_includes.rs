@@ -95,8 +95,8 @@ end
     assert_eq!(survey_files, strict_files, "no emitted behavior changed");
     assert_eq!(survey_emit, strict_emit);
     assert!(
-        survey_emit.iter().any(|d| d.message.contains("labeled")),
-        "declaration warning must remain: {survey_emit:?}"
+        survey_diags.iter().any(|d| d.message.contains("labeled") && d.severity == roundhouse::diagnostic::Severity::Error),
+        "the unread declaration must stay reported: {survey_diags:?}"
     );
     let article = survey_files
         .iter()

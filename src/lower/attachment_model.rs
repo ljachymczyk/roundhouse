@@ -115,6 +115,7 @@ pub fn synthesize_attachment_model(app: &mut App) {
         sti_subclass_names: Vec::new(),
         mixin_sends: Vec::new(),
         select_aliases: Vec::new(),
+        refused_class_macros: Vec::new(),
         i18n: Default::default(),
         name: class,
         parent: Some(ClassId(Symbol::from("ApplicationRecord"))),

@@ -412,7 +412,7 @@ fn reported_default(decl: &str) -> Vec<String> {
     let _ = std::fs::remove_dir_all(&root);
     String::from_utf8_lossy(&out.stderr)
         .lines()
-        .filter(|l| l.contains("attribute not supported") && l.contains("not lowered"))
+        .filter(|l| l.contains("attribute not supported") && l.contains("is not modelled"))
         .map(str::to_string)
         .collect()
 }

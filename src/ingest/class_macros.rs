@@ -250,8 +250,9 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile], mention
             }
         }
         for index in refused {
-            if let ModelBodyItem::Unknown { expr, .. } = &mut app.models[model_index].body[index] {
-                expr.decisions |= crate::expr::REFUSED_CLASS_MACRO;
+            if let ModelBodyItem::Unknown { expr, .. } = &app.models[model_index].body[index] {
+                let span = expr.span;
+                app.models[model_index].refused_class_macros.push(span);
             }
         }
         if expansions.is_empty() {
