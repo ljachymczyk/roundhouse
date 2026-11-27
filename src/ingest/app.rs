@@ -2957,6 +2957,23 @@ end
         for entry in entries {
             load_spec_helper(vfs, dir, entry, &mut spec_config, &mut loaded, &mut support_loaded)?;
         }
+        // Fixtures RSpec loads from a folder other than `test/fixtures`, which is all the emitted suite loads:
+        // the examples would read other data, so they are left out.
+        for path in std::mem::take(&mut spec_config.fixture_paths) {
+            let folder = path.trim_start_matches("./").trim_end_matches('/');
+            if folder == "test/fixtures" {
+                continue;
+            }
+            let full = dir.join(folder);
+            let holds_fixtures = vfs.is_dir(&full)
+                && vfs.read_dir(&full).is_ok_and(|entries| entries.iter().any(|e| e.to_string_lossy().ends_with(".yml")));
+            if holds_fixtures {
+                spec_config.refuse_all(
+                    &dir.join("spec/rails_helper.rb").display().to_string(),
+                    &format!("`config.fixture_paths` naming `{folder}` (the emitted suite loads `test/fixtures`)"),
+                )?;
+            }
+        }
         spec_config.finish(&dir.join("spec/rails_helper.rb").display().to_string())?;
     }
 
@@ -2964,8 +2981,11 @@ end
         // In an app with RSpec files, RSpec runs only `*_spec.rb` files;
         // the rest of its spec folder (support files, helpers) is read
         // above or not at all, never as a Minitest file.
-        let in_spec_dir = entry.strip_prefix(dir).is_ok_and(|rel| rel.iter().next().is_some_and(|c| c == "spec"));
-        if !rspec_files.is_empty() && in_spec_dir && !is_spec(&entry) {
+        // Only the files RSpec's loader owns: its helpers and `spec/support`; a Minitest file there is still one.
+        let rspec_owned = entry.strip_prefix(dir).is_ok_and(|rel| {
+            rel == Path::new("spec/spec_helper.rb") || rel == Path::new("spec/rails_helper.rb") || rel.starts_with("spec/support")
+        });
+        if !rspec_files.is_empty() && rspec_owned {
             continue;
         }
         let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
