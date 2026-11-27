@@ -2057,6 +2057,10 @@ end
     }
 
     fn sends(e: &Expr) -> Vec<String> {
+        // One hook's body is a single call (each `after` hook has its own `ensure`).
+        if let ExprNode::Send { method, .. } = &*e.node {
+            return vec![method.as_str().to_string()];
+        }
         let ExprNode::Seq { exprs } = &*e.node else { return vec![format!("{e:?}")] };
         exprs
             .iter()
@@ -2087,6 +2091,40 @@ end
         assert_eq!(sends(request[0].setup.as_ref().unwrap()), ["global_setup", "host!"]);
         // `config.include JsonHelpers, type: :request`.
         helper(&request[0], "json");
+    }
+
+    // RSpec's own reading of a helper: a String type filter is the Symbol's, a later `def` replaces an
+    // earlier one, the module included last answers first, a one-level glob keeps to its folder, and a
+    // library's configuration that is not a matcher library's leaves every example out.
+    #[test]
+    fn helper_configuration_reads_as_rspec_does() {
+        let helper = "Dir[Rails.root.join(\"spec/support/*.rb\")].sort.each { |f| require f }\nRSpec.configure do |config|\n  config.infer_spec_type_from_file_location!\n  config.before(type: \"model\") { configured }\n  config.include First\n  config.include Second\nend\n\ndef label\n  1\nend\n\ndef label\n  2\nend\n";
+        let support = "module First\n  def pick\n    :first\n  end\nend\nmodule Second\n  def pick\n    :second\n  end\nend\n";
+        let mut globs = Vec::new();
+        let mut config = SpecConfig::default();
+        config
+            .read_helper(helper.as_bytes(), "/app/spec/rails_helper.rb", &mut |config, load| match load {
+                Load::Support(glob) => {
+                    globs.push(glob);
+                    config.read_support(support.as_bytes(), "/app/spec/support/modules.rb")
+                }
+                Load::Helper(_) => Ok(()),
+            })
+            .expect("helper");
+        config.finish("/app/spec/rails_helper.rb").expect("finish");
+        assert_eq!(globs, [SupportGlob::TopLevel]);
+        let model = with_config(&config, "describe Article do\n  it \"x\" do\n    expect([label, pick]).to eq([2, :second])\n  end\nend\n", "/app/spec/models/article_spec.rb");
+        assert_eq!(sends(model[0].setup.as_ref().unwrap()), ["configured"]);
+        let label = helper(&model[0], "label");
+        assert!(format!("{:?}", label.body).contains("value: 2"), "{:?}", label.body);
+        let pick = helper(&model[0], "pick");
+        assert!(format!("{:?}", pick.body).contains("second"), "{:?}", pick.body);
+
+        let mut refused = SpecConfig::default();
+        let _ = super::super::survey::surveying(|| {
+            refused.read_helper(b"TestSettings.configure { |c| c.flag = true }\n", "/app/spec/rails_helper.rb", &mut |_, _| Ok(()))
+        });
+        assert!(refused.refused.iter().any(|f| f.0.is_none()), "an unread library configuration leaves every example out");
     }
 
     // Without `infer_spec_type_from_file_location!` a file's folder gives
