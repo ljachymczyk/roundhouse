@@ -1183,16 +1183,14 @@ fn let_method(name: &str, body: Expr, span: Span, owner: &ClassId) -> MethodDef 
 /// class's `teardown do ... end` blocks.
 fn teardown_method(hooks: Vec<Expr>, owner: &ClassId) -> MethodDef {
     let syn = Span::synthetic();
-    let body = Expr::new(
-        syn,
-        ExprNode::BeginRescue {
-            body: Expr::new(syn, ExprNode::Seq { exprs: hooks }),
-            rescues: Vec::new(),
-            else_branch: None,
-            ensure: Some(Box::new(Expr::new(syn, ExprNode::Super { args: Some(Vec::new()) }))),
-            implicit: true,
-        },
-    );
+    // Each hook in its own `ensure`, not one around them all: RSpec runs every `after` hook when an earlier one raises.
+    let mut body = Expr::new(syn, ExprNode::Super { args: Some(Vec::new()) });
+    for hook in hooks.into_iter().rev() {
+        body = Expr::new(
+            syn,
+            ExprNode::BeginRescue { body: hook, rescues: Vec::new(), else_branch: None, ensure: Some(Box::new(body)), implicit: true },
+        );
+    }
     MethodDef {
         name_span: syn,
         name: Symbol::from("teardown"),
@@ -2039,16 +2037,17 @@ end
         let src = "describe Article do\n  after { outer_one }\n  after { outer_two }\n  context \"c\" do\n    after { inner }\n    it \"x\" do\n      expect(1).to eq(1)\n    end\n  end\nend\n";
         let tms = ingest(src);
         let teardown = helper(&tms[0], "teardown");
-        let ExprNode::BeginRescue { body, ensure: Some(ensure), .. } = &*teardown.body.node else { panic!() };
-        assert!(matches!(&*ensure.node, ExprNode::Super { .. }));
-        let ExprNode::Seq { exprs } = &*body.node else { panic!() };
-        let order: Vec<&str> = exprs
-            .iter()
-            .map(|e| match &*e.node {
+        // Each hook in its own `ensure`, `super` innermost: a raising hook still runs the ones after it.
+        let mut order: Vec<&str> = Vec::new();
+        let mut at = &teardown.body;
+        while let ExprNode::BeginRescue { body, ensure: Some(ensure), .. } = &*at.node {
+            order.push(match &*body.node {
                 ExprNode::Send { method, .. } => method.as_str(),
                 _ => "?",
-            })
-            .collect();
+            });
+            at = ensure;
+        }
+        assert!(matches!(&*at.node, ExprNode::Super { .. }));
         assert_eq!(order, ["inner", "outer_two", "outer_one"]);
     }
 
