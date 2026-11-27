@@ -11,8 +11,8 @@
 //! analysis refuses it (`String extension`) instead of typing it as a
 //! String.
 //!
-//! `parameterize` stays on model `def` bodies and unknown model-body
-//! expressions. The fused view walk does not apply that row, which is
+//! `parameterize` stays on model and library class `def` bodies and
+//! unknown model-body expressions. The fused view walk does not apply that row, which is
 //! what the old pass did.
 
 use crate::app::App;
@@ -231,6 +231,13 @@ const STRING_CORE_EXT: &[StringCoreExt] = &[
 /// callback spliced from a concern is still `Unknown` here (lobsters'
 /// `after_initialize` / `TypeID.new(self.class.to_s.parameterize)`).
 pub fn apply_parameterize_grounding(app: &mut App) {
+    // Not the models alone: a library class's method is a body too (mission_control's
+    // `IdentifiedByName#id`, `name.parameterize`, which raised NoMethodError as lobsters' Spinel build booted).
+    for class in &mut app.library_classes {
+        for method in &mut class.methods {
+            walk(&mut method.body, Site::ModelBodies);
+        }
+    }
     for model in &mut app.models {
         for item in &mut model.body {
             match item {

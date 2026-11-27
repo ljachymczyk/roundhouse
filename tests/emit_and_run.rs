@@ -22323,6 +22323,10 @@ mod lowered_sends;
 mod own_try;
 #[path = "emit_and_run/attr_reader_splat_constant.rs"]
 mod attr_reader_splat_constant;
+#[path = "emit_and_run/load_time_callee_requires.rs"]
+mod load_time_callee_requires;
+#[path = "emit_and_run/library_parameterize.rs"]
+mod library_parameterize;
 #[path = "emit_and_run/included_alias.rs"]
 mod included_alias;
 #[path = "emit_and_run/simple_format_sanitize.rs"]
