@@ -14,6 +14,8 @@ mod data_record_siblings;
 mod scratch;
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
+#[path = "emit_and_run/session_read_untyped.rs"]
+mod session_read_untyped;
 #[path = "support/native_http.rs"]
 #[allow(dead_code)]
 mod native_http;
@@ -351,8 +353,12 @@ mod assert_recognizes;
 mod assert_routing;
 #[path = "emit_and_run/class_new_constants.rs"]
 mod class_new_constants;
+#[path = "emit_and_run/missing_class_method.rs"]
+mod missing_class_method;
 #[path = "emit_and_run/i18n_subtree.rs"]
 mod i18n_subtree;
+#[path = "emit_and_run/i18n_subtree_json.rs"]
+mod i18n_subtree_json;
 #[path = "emit_and_run/i18n_values.rs"]
 mod i18n_values;
 #[path = "emit_and_run/i18n_locale_tag.rs"]
@@ -462,6 +468,10 @@ mod cable_stop_all_streams;
 mod cable_stop_all_streams_replacement;
 #[path = "emit_and_run/cable_broadcast_json.rs"]
 mod cable_broadcast_json;
+#[path = "support/encrypted_session_cookie.rs"]
+mod encrypted_session_cookie_contract;
+#[path = "emit_and_run/encrypted_session_cookie.rs"]
+mod encrypted_session_cookie;
 #[path = "support/index_with.rs"]
 mod index_with_contract;
 #[path = "emit_and_run/index_with.rs"]

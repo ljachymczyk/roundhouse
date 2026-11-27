@@ -3268,6 +3268,7 @@ end
     catalog.load_locales(available, fallbacks, &gem_files, &mut files);
     catalog.available_unknown = available_unknown;
     catalog.field_error_proc = field_error_proc_file(vfs, dir);
+    catalog.escape_js_separators = read_escape_js_separators(vfs, dir);
     catalog.plurals = plural_rules(vfs, dir, app.gem_lock.as_ref(), &catalog);
     catalog.freeze();
     // Shared, not copied, by the analyzer and the lowerings that read it:
@@ -5976,12 +5977,25 @@ fn spanned_include_statements(lc: &LibraryClass) -> Vec<(crate::span::Span, Vec<
     if lc.include_spans.len() != lc.includes.len() {
         return lc.includes.iter().map(|m| (crate::span::Span::synthetic(), vec![m.clone()])).collect();
     }
+    // A record of the statements, where spans alone don't tell them apart (a `class_eval` loop's, #2278); out of step,
+    // it's not read. In step with the spans but not with it, a mutation kept the one and not the other.
+    let ids = (lc.include_statements.len() == lc.includes.len()).then_some(&lc.include_statements);
+    debug_assert!(
+        lc.include_statements.is_empty() || ids.is_some(),
+        "{}: include_statements ({}) out of step with includes ({}) and include_spans",
+        lc.name.0,
+        lc.include_statements.len(),
+        lc.includes.len()
+    );
     let mut out: Vec<(crate::span::Span, Vec<crate::ident::ClassId>)> = Vec::new();
-    for (module, span) in lc.includes.iter().zip(&lc.include_spans) {
+    let mut last_id = None;
+    for (i, (module, span)) in lc.includes.iter().zip(&lc.include_spans).enumerate() {
+        let id = ids.map(|ids| ids[i]);
         match out.last_mut() {
-            Some((last, group)) if last == span && !span.is_synthetic() => group.push(module.clone()),
+            Some((last, group)) if last == span && !span.is_synthetic() && id == last_id => group.push(module.clone()),
             _ => out.push((*span, vec![module.clone()])),
         }
+        last_id = id;
     }
     out
 }
@@ -17168,4 +17182,58 @@ fn load_spec_helper<V: Vfs + ?Sized>(
             Ok(())
         }
     })
+}
+
+/// What a trimmed, non-comment config line sets
+/// `config.active_support.escape_js_separators_in_json` to, or `None`
+/// when the line says nothing about it. One definition for the lift and
+/// the initializer ledger.
+pub(super) fn escape_js_separators_line(line: &str) -> Option<bool> {
+    let rest = line
+        .strip_prefix("Rails.application.config.active_support.escape_js_separators_in_json")
+        .or_else(|| line.strip_prefix("config.active_support.escape_js_separators_in_json"))?;
+    // The value is `true` or `false`, so a `#` can only start a comment.
+    let rest = rest.split('#').next().unwrap_or("");
+    let value = rest.trim().strip_prefix('=')?.trim();
+    match value {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// `ActiveSupport::JSON::Encoding.escape_js_separators_in_json`: whether
+/// `to_json` writes U+2028 and U+2029 as ` ` / ` `. On, as
+/// ActiveSupport ships it, unless `config.load_defaults` is 8.1 or later;
+/// an explicit `config.active_support.escape_js_separators_in_json = …`
+/// (application or an initializer) wins over that.
+fn read_escape_js_separators<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> bool {
+    let code_lines = |bytes: &[u8]| -> Vec<String> {
+        String::from_utf8_lossy(bytes).lines().map(|l| l.trim().to_string()).filter(|l| !l.starts_with('#')).collect()
+    };
+    let mut files: Vec<Vec<String>> = Vec::new();
+    let mut escape = true;
+    if let Ok(source) = vfs.read(&dir.join("config/application.rb")) {
+        let lines = code_lines(&source);
+        for line in &lines {
+            if let Some(v) = load_defaults_version(line) {
+                escape = v < 8.1;
+            }
+        }
+        files.push(lines);
+    }
+    let init_dir = dir.join("config/initializers");
+    if vfs.is_dir(&init_dir) {
+        for path in read_rb_files(vfs, &init_dir).unwrap_or_default() {
+            if let Ok(source) = vfs.read(&path) {
+                files.push(code_lines(&source));
+            }
+        }
+    }
+    for line in files.iter().flatten() {
+        if let Some(v) = escape_js_separators_line(line) {
+            escape = v;
+        }
+    }
+    escape
 }
