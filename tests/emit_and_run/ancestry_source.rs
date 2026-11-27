@@ -88,5 +88,5 @@ puts "ok"
         .filter_map(|e| ["`after_touch` in the body of `Article`", "`attribute` in the body of `Article`"].into_iter().find(|g| e.contains(g)))
         .collect();
     assert_eq!((gaps.len(), run.errors.len()), (2, 2), "{:#?}", run.errors);
-    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    assert!(run.program_succeeded(), "{}\n{}", run.stdout, run.stderr);
 }
