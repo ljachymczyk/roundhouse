@@ -4695,8 +4695,12 @@ fn walk_decl_body_with_visibility<'pr>(
                                 } else if let Some(splat) = arg.as_splat_node() {
                                     // `attr_reader *PROPERTIES` (mission_control's JobsRelation): the names a constant of the
                                     // body above holds as a literal list. Not dropped where it holds no such list.
+                                    // Nor read off its value where the body changes it (`PROPERTIES.replace(…)`).
                                     let held = splat.expression().and_then(|e| e.as_constant_read_node()).and_then(|c| {
                                         let name = constant_id_str(&c.name()).to_string();
+                                        if out.unknown_calls.iter().any(|e| calls_on_constant(e, &name)) {
+                                            return None;
+                                        }
                                         out.constants.iter().rev().find(|(n, _)| n.as_str() == name).and_then(|(_, v)| literal_symbols(v))
                                     });
                                     match held {
@@ -9100,4 +9104,17 @@ fn literal_symbols(e: &Expr) -> Option<Vec<Symbol>> {
         ExprNode::Send { recv: Some(r), method, args, .. } if method.as_str() == "freeze" && args.is_empty() => literal_symbols(r),
         _ => None,
     }
+}
+
+/// Does `e` call a method on the constant `name` (a class body's `PROPERTIES.replace(…)`)?
+fn calls_on_constant(e: &Expr, name: &str) -> bool {
+    if let ExprNode::Send { recv: Some(r), .. } = &*e.node
+        && let ExprNode::Const { path } = &*r.node
+        && path.last().is_some_and(|p| p.as_str() == name)
+    {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |child| found = found || calls_on_constant(child, name));
+    found
 }

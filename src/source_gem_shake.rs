@@ -553,6 +553,29 @@ impl<'a> Gems<'a> {
         self.names.contains(c.name.0.as_str())
     }
 
+    /// Does a gem's code call a method that changes it on a constant of this name (`NAMES << :secret`)? Its
+    /// written value is then not all it holds.
+    fn const_mutated(&self, leaf: &str) -> bool {
+        fn walk(e: &Expr, leaf: &str) -> bool {
+            if let ExprNode::Send { recv: Some(r), method, .. } = &*e.node
+                && let ExprNode::Const { path } = &*r.node
+                && path.last().is_some_and(|p| p.as_str() == leaf)
+                && (method.as_str().ends_with('!') || matches!(method.as_str(), "<<" | "push" | "append" | "concat" | "replace" | "unshift" | "prepend" | "insert" | "clear" | "delete" | "delete_at" | "delete_if" | "keep_if" | "pop" | "shift" | "fill" | "[]="))
+            {
+                return true;
+            }
+            let mut found = false;
+            e.node.for_each_child(&mut |child| found = found || walk(child, leaf));
+            found
+        }
+        self.entries.values().flatten().any(|c| {
+            c.methods.iter().any(|m| walk(&m.body, leaf))
+                || c.unknown_calls.iter().any(|e| walk(e, leaf))
+                || c.class_ivar_initializers.iter().any(|e| walk(e, leaf))
+                || c.constants.iter().any(|(_, v)| walk(v, leaf))
+        })
+    }
+
     fn known(&self, name: &str) -> bool {
         self.entries.contains_key(name)
     }
@@ -1527,7 +1550,7 @@ fn elems_names(e: &Expr, gems: Option<&Gems<'_>>, context: Option<(&str, bool, &
                 Some(owner) => std::iter::once(owner.clone()).chain(gems.ancestors(&owner)).map(|o| held(&o)).find(|v| !v.is_empty())?,
                 None => gems.entries.keys().flat_map(|o| held(o)).collect(),
             };
-            if values.is_empty() {
+            if values.is_empty() || gems.const_mutated(&leaf) {
                 return None;
             }
             values.into_iter().try_fold(Vec::new(), |mut all, v| {
@@ -1554,19 +1577,31 @@ fn elems_names(e: &Expr, gems: Option<&Gems<'_>>, context: Option<(&str, bool, &
                     return None;
                 }
                 return bodies.into_iter().try_fold(Vec::new(), |mut all, (o, side, body)| {
-                    all.extend(elems_names(body, Some(gems), Some((o, side, "")), depth - 1)?);
+                    all.extend(elems_names_returned(body, Some(gems), Some((o, side, "")), depth - 1)?);
                     Some(all)
                 });
             };
-            let body = gems.ancestors(c).into_iter().find_map(|a| {
+            let (owner, body) = gems.ancestors(c).into_iter().find_map(|a| {
                 gems.entries.get(a.as_str()).into_iter().flatten().flat_map(|entry| entry.methods.iter())
                     .find(|m| m.name == *method && (m.receiver == MethodReceiver::Class) == side)
-                    .map(|m| &m.body)
+                    .map(|m| (a.clone(), &m.body))
             })?;
-            elems_names(body, Some(gems), context, depth - 1)
+            // In the defining class's context (a constant it names is its own), and every value it may return.
+            elems_names_returned(body, Some(gems), Some((owner.as_str(), side, "")), depth - 1)
         }
         _ => None,
     }
+}
+
+/// The names the elements of what method body `body` returns may be: its tail's and every `return`'s.
+fn elems_names_returned(body: &Expr, gems: Option<&Gems<'_>>, context: Option<(&str, bool, &str)>, depth: u8) -> Option<Vec<Name>> {
+    let mut returned = Vec::new();
+    collect_returns(body, &mut returned);
+    let mut names = elems_names(body, gems, context, depth)?;
+    for value in returned {
+        names.extend(elems_names(value, gems, context, depth)?);
+    }
+    Some(names)
 }
 
 /// The builtin classes a union of builtin values is of; `None` when a member may be any other object.
@@ -1735,25 +1770,28 @@ fn scan(e: &Expr, s: &mut Scan<'_>) {
                 s.calls.push((t.clone(), method.as_str().to_string()));
             }
             if block.is_some() {
-                let on = match &target {
-                    Target::Virtual(c, _) if !c.starts_with('\u{0}') => Some(c.clone()),
-                    _ => None,
-                };
                 let named: Vec<String> = match args.first().map(|a| &*a.node) {
                     _ if !matches!(method.as_str(), "send" | "public_send" | "__send__") => vec![method.as_str().to_string()],
                     Some(ExprNode::Lit { value: Literal::Sym { value } }) => vec![value.as_str().to_string()],
                     // Not every method's when the receiver's class is known: one of its lineage's (`Class\u{1}*`).
                     _ => vec!["*".to_string()],
                 };
-                let named: Vec<String> = match &on {
-                    Some(c) => named.into_iter().map(|n| format!("{c}\u{1}{n}")).collect(),
-                    None => named,
-                };
                 let forwarder = block.as_ref().and_then(|b| s.forwarder(b));
-                s.calls.extend(named.into_iter().map(|n| match &forwarder {
-                    Some(from) => (Target::Any, format!("{FORWARD}{from}\u{2}{n}")),
-                    None => (Target::Any, format!("{BLOCK}{n}")),
-                }));
+                // For each class a union receiver may be of, as its call is.
+                for t in std::iter::once(&target).chain(also.iter()) {
+                    let on = match t {
+                        Target::Virtual(c, _) if !c.starts_with('\u{0}') => Some(c.clone()),
+                        _ => None,
+                    };
+                    let named: Vec<String> = match &on {
+                        Some(c) => named.iter().map(|n| format!("{c}\u{1}{n}")).collect(),
+                        None => named.clone(),
+                    };
+                    s.calls.extend(named.into_iter().map(|n| match &forwarder {
+                        Some(from) => (Target::Any, format!("{FORWARD}{from}\u{2}{n}")),
+                        None => (Target::Any, format!("{BLOCK}{n}")),
+                    }));
+                }
             }
             s.pass(method.as_str(), Some(args));
             // `after_update :send_email_changed_notification, if: :send_email_changed_notification?` in a class body
@@ -1799,11 +1837,13 @@ fn scan(e: &Expr, s: &mut Scan<'_>) {
                     }
                     // The Method is called later, maybe with a block (`method(name).call { … }`), as a `method(:name)` is.
                     if matches!(method.as_str(), "method" | "public_method") {
-                        let every = match &target {
-                            Target::Virtual(c, _) if !c.starts_with('\u{0}') => format!("{c}\u{1}*"),
-                            _ => "*".to_string(),
-                        };
-                        s.calls.push((Target::Any, format!("{BLOCK}{every}")));
+                        for t in std::iter::once(&target).chain(also.iter()) {
+                            let every = match t {
+                                Target::Virtual(c, _) if !c.starts_with('\u{0}') => format!("{c}\u{1}*"),
+                                _ => "*".to_string(),
+                            };
+                            s.calls.push((Target::Any, format!("{BLOCK}{every}")));
+                        }
                     }
                 }
                 _ => {}

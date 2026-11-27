@@ -9924,13 +9924,16 @@ fn emit_library_class_decl_inner(
         if load_time {
             let mut reached: BTreeSet<Vec<String>> = BTreeSet::new();
             walk_load_time_callee_paths(e, None, classes, &mut BTreeSet::new(), &mut reached, 6);
-            // Not only what the walk reads: a call it reaches into a gem compiled from source runs that gem's code
-            // through receivers the walk cannot type, and Ruby has loaded the whole gem by then (et-orbi's
-            // `require 'tzinfo'`), so its every class is loaded first.
+            // Not only what the walk reads: a call it reaches into another gem compiled from source runs that gem's
+            // code through receivers the walk cannot type, and Ruby has loaded that whole gem by then (et-orbi's
+            // `require 'tzinfo'`), so its every class is loaded first. Not the class's own gem: its files load in
+            // the order its own requires give (Devise's strategies register with Warden as they load).
+            let own = source_gem_dir(app, lc);
             let gems: BTreeSet<String> = reached.iter()
                 .filter_map(|path| classes.iter().find(|c| c.name.0.as_str() == path.join("::")))
                 .chain(callee_receivers(e, classes))
                 .filter_map(|c| source_gem_dir(app, c))
+                .filter(|g| own.as_ref() != Some(g))
                 .collect();
             for c in classes.iter().filter(|c| source_gem_dir(app, c).is_some_and(|g| gems.contains(&g))) {
                 reached.insert(c.name.0.as_str().split("::").map(str::to_string).collect());
@@ -12529,6 +12532,10 @@ fn walk_load_time_callee_paths(
         }
     }
 
+    // Not into a closure: stored, it runs later (one called now is the callee's own walk's).
+    if matches!(&*e.node, ExprNode::Lambda { .. }) {
+        return;
+    }
     e.node.for_each_child(&mut |child| walk_load_time_callee_paths(child, current, classes, visited, out, depth));
 }
 
@@ -12577,15 +12584,20 @@ fn walk_load_time_method(
     while let Some(c) = owner {
         let defs: Vec<&MethodDef> = c.methods.iter().filter(|m| m.name.as_str() == called && m.receiver == on).collect();
         if !defs.is_empty() {
-            let key = format!("{}{}{called}", c.name.0.as_str(), if on == MethodReceiver::Class { "." } else { "#" });
+            // The receiver's class too: an inherited method's receiverless calls reach each receiver's overrides.
+            let key = format!("{}>{}{}{called}", class.name.0.as_str(), c.name.0.as_str(), if on == MethodReceiver::Class { "." } else { "#" });
             if !visited.insert(key) {
                 return;
             }
             let mut supers = false;
             for m in defs {
-                walk_const_paths(&m.body, out);
-                // Not the defining class as self: the receiver's, whose methods a receiverless call reaches first.
-                walk_load_time_callee_paths(&m.body, Some((class, on)), classes, visited, out, depth - 1);
+                // Its parameters' defaults run when a call leaves them out; a closure it only stores runs later.
+                let defaults: Vec<&Expr> = m.params.iter().filter_map(|p| p.default.as_ref()).collect();
+                for e in std::iter::once(&m.body).chain(defaults) {
+                    walk_load_time_const_paths(e, out);
+                    // Not the defining class as self: the receiver's, whose methods a receiverless call reaches first.
+                    walk_load_time_callee_paths(e, Some((class, on)), classes, visited, out, depth - 1);
+                }
                 supers |= contains_super(&m.body);
             }
             if !supers {

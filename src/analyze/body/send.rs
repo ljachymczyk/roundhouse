@@ -1375,9 +1375,10 @@ impl<'a> BodyTyper<'a> {
         for (id, cls) in classes.iter().filter(|(id, _)| below(id)) {
             if let Some(ty) = cls.instance_methods.get(method) {
                 let ty = unwrap_fn_ret(&ty.subst_self(&Ty::Class { id: id.clone(), args: Vec::new().into() }));
-                // Not a definition not typed yet (an earlier round's): it would make the whole answer untyped.
+                // Not an answer bounded by the typed ones where one is untyped: it may be declared so, or not typed
+                // yet (an earlier round's, which a later round answers).
                 if matches!(ty, Ty::Untyped | Ty::Var { .. }) {
-                    continue;
+                    return Vec::new();
                 }
                 if !out.contains(&ty) {
                     out.push(ty);
@@ -2520,7 +2521,8 @@ impl<'a> BodyTyper<'a> {
                 // instance of one of them where the call runs (parslet's `Parser#try` calls `root`, which each parser
                 // defines), and a plain instance raises there. Only for self: a value typed as the class is an
                 // instance of it (`URI::Generic` has no `request_uri`).
-                if instance_receiver && IMPLICIT_SELF.with(|f| f.get()) && !kernel_class_side && !class_dynamic_finder && !unknown_named_ancestor {
+                // Not over a `method_missing` the class has: a plain instance's call answers that.
+                if instance_receiver && IMPLICIT_SELF.with(|f| f.get()) && method_missing_ty.is_none() && !kernel_class_side && !class_dynamic_finder && !unknown_named_ancestor {
                     let below = self.descendant_instance_answers(id, method);
                     if !below.is_empty() {
                         return below.into_iter().fold(Ty::Bottom, crate::analyze::body::union_of);
