@@ -696,6 +696,7 @@ impl Reader<'_> {
             tests,
             setup,
             inner_classes: Vec::new(),
+            body_classes: Vec::new(),
             helpers,
             constants: Vec::new(),
             includes: Vec::new(),
@@ -1188,7 +1189,7 @@ fn teardown_method(hooks: Vec<Expr>, owner: &ClassId) -> MethodDef {
             body: Expr::new(syn, ExprNode::Seq { exprs: hooks }),
             rescues: Vec::new(),
             else_branch: None,
-            ensure: Some(Expr::new(syn, ExprNode::Super { args: Some(Vec::new()) })),
+            ensure: Some(Box::new(Expr::new(syn, ExprNode::Super { args: Some(Vec::new()) }))),
             implicit: true,
         },
     );
@@ -1560,17 +1561,24 @@ fn block_expectation(
             raise_error_expectation(span, body, positive, args)
         }
         "change" => {
+            // `change(receiver, :message)` evaluates the receiver once, as `change` is called; the message goes to that object twice.
+            let mut receiver: Option<Expr> = None;
             let value = match (args.as_slice(), block) {
                 ([], Some(b)) => lambda_body(&desugar(b, ctx)?)?,
                 ([recv, name], None) => match &*name.node {
                     ExprNode::Lit { value: Literal::Sym { value } } => {
-                        send(Some(recv.clone()), value.as_str(), Vec::new(), span)
+                        receiver = Some(assign_var("__rspec_receiver", recv.clone(), span));
+                        send(Some(var("__rspec_receiver", span)), value.as_str(), Vec::new(), span)
                     }
                     _ => return Err("`change(receiver, message)` with a message that is not a symbol".into()),
                 },
                 _ => return Err("this form of `change`".into()),
             };
-            change_expectation(span, body, positive, value, qualifiers)
+            let expectation = change_expectation(span, body, positive, value, qualifiers)?;
+            Ok(match receiver {
+                Some(bind) => Expr::new(span, ExprNode::Seq { exprs: vec![bind, expectation] }),
+                None => expectation,
+            })
         }
         other => Err(format!("the `{other}` matcher on a block expectation")),
     }
@@ -1686,7 +1694,16 @@ fn change_expectation(
         return Err("`not_to change` with `by` or `to` (RSpec refuses it too)".into());
     }
 
-    let mut stmts = vec![assign_var(before, value.clone(), span)];
+    // RSpec builds the matcher, so evaluates these arguments, before it runs the block; each is read once.
+    let mut stmts = Vec::new();
+    let mut bind = |name: &str, arg: Expr| {
+        stmts.push(assign_var(name, arg, span));
+        var(name, span)
+    };
+    let by = by.map(|(kind, n)| (kind, bind("__rspec_by", n)));
+    let from = from.map(|x| bind("__rspec_from", x));
+    let to = to.map(|y| bind("__rspec_to", y));
+    stmts.push(assign_var(before, value.clone(), span));
     if by.is_none() {
         let copyable = Expr::new(
             span,
