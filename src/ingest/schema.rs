@@ -729,8 +729,14 @@ fn apply_table_verb(
                 if let Some(table) = schema.tables.get_mut(&Symbol::from(t.as_str())) {
                     // A column under the logical name goes only when it is a reference an
                     // earlier fold stored that way; an ordinary `author` stays, as in Rails.
+                    // `if_not_exists: true` keeps a column already there, as Rails skips it.
+                    let if_not_exists = kwarg_value(options.iter(), "if_not_exists").is_some_and(|v| bool_value(&v) == Some(true));
+                    let cols: Vec<Column> = cols
+                        .into_iter()
+                        .filter(|c| !(if_not_exists && table.columns.iter().any(|x| x.name == c.name)))
+                        .collect();
                     table.columns.retain(|x| {
-                        !(x.name.as_str() == name && matches!(x.col_type, ColumnType::Reference { .. }))
+                        !(x.name.as_str() == name && !name.ends_with("_id") && matches!(x.col_type, ColumnType::Reference { .. }))
                             && !cols.iter().any(|c| c.name == x.name)
                     });
                     table.columns.extend(cols);
@@ -751,7 +757,7 @@ fn apply_table_verb(
                     .is_some_and(|v| v.as_nil_node().is_none() && bool_value(&v) != Some(false));
                 let type_column = format!("{name}_type");
                 let removed = |column: &Column| column.name.as_str() == physical
-                    || (column.name.as_str() == name && matches!(column.col_type, ColumnType::Reference { .. }))
+                    || (column.name.as_str() == name && !name.ends_with("_id") && matches!(column.col_type, ColumnType::Reference { .. }))
                     || (polymorphic && column.name.as_str() == type_column);
                 if let Some(table) = schema.tables.get(&Symbol::from(t.as_str())) {
                     let no_id = !table.columns.iter().any(|column| column.name.as_str() == physical);
@@ -2458,6 +2464,14 @@ fn table_from_create_table(
                             // is in place. `t.references :author, :editor`
                             // makes each, with every option.
                             let rargs = call_arguments(&call);
+                            // Every positional name must be literal: a dropped one would be a reference silently missing.
+                            if rargs.iter().any(|a| a.as_keyword_hash_node().is_none() && a.as_hash_node().is_none() && name_value(a).is_none()) {
+                                gaps.push(IngestError::Unsupported {
+                                    file: file.into(),
+                                    message: format!("`t.references` on {table_name} names a reference by a non-literal"),
+                                });
+                                continue;
+                            }
                             let names: Vec<String> = rargs.iter().filter_map(name_value).collect();
                             match column_from_call(&call, &table_name, file, dialect) {
                                 Ok(Some(col)) => {
@@ -2851,17 +2865,36 @@ fn reference_definition(
 ) -> IngestResult<(Vec<Column>, Vec<Index>)> {
     let truthy = |n: &Node<'_>| n.as_nil_node().is_none() && bool_value(n) != Some(false);
     let name = id.name.as_str().to_string();
-    let polymorphic = foreign_key_option(options, "polymorphic").is_some_and(|n| truthy(&n));
+    let polymorphic_option = foreign_key_option(options, "polymorphic");
+    let polymorphic = polymorphic_option.as_ref().is_some_and(|n| truthy(n));
     let id_name = format!("{name}_id");
     id.name = Symbol::from(id_name.as_str());
+    // `type: :uuid` (or :string): the key's own storage, not the integer a reference otherwise is.
+    if let Some(declared) = foreign_key_option(options, "type") {
+        match name_value(&declared).as_deref() {
+            Some("integer" | "bigint") => {}
+            Some("uuid") => id.col_type = ColumnType::Uuid,
+            Some("string") => id.col_type = ColumnType::String { limit: None },
+            _ => {
+                return Err(IngestError::Unsupported {
+                    file: file.into(),
+                    message: format!("reference {table}.{id_name} names a `type:` the fold does not model"),
+                })
+            }
+        }
+    }
     let mut index_columns = vec![Symbol::from(id_name.as_str())];
     let mut columns = Vec::new();
     if polymorphic {
         let type_name = format!("{name}_type");
+        // `polymorphic: { null:, default: }` shapes the type column; the outer `null:` still wins.
+        let shape = polymorphic_option.as_ref().filter(|n| n.as_hash_node().is_some()).map(|n| parse_column_opts(std::slice::from_ref(n).iter()));
+        let outer_null = parse_column_opts(options.iter()).nullable;
         columns.push(Column {
             name: Symbol::from(type_name.as_str()),
             col_type: ColumnType::String { limit: None },
-            nullable: id.nullable,
+            nullable: outer_null.or(shape.as_ref().and_then(|o| o.nullable)).unwrap_or(id.nullable),
+            default: shape.as_ref().and_then(|o| o.default.clone()),
             ..reference_column(&type_name)
         });
         index_columns.insert(0, Symbol::from(type_name.as_str()));
@@ -2872,13 +2905,13 @@ fn reference_definition(
         Some(value) => {
             let mut index = build_index(table, index_columns, None, std::iter::once(&value), file)?;
             if polymorphic && foreign_key_option(std::slice::from_ref(&value), "name").is_none() {
-                index.name = Symbol::from(format!("index_{table}_on_{name}"));
+                index.name = Symbol::from(length_safe_index_name(format!("index_{table}_on_{name}"), &[&format!("{name}_type"), &id_name]));
             }
             vec![index]
         }
         None => {
             let index_name = if polymorphic {
-                format!("index_{table}_on_{name}")
+                length_safe_index_name(format!("index_{table}_on_{name}"), &[&format!("{name}_type"), &id_name])
             } else {
                 default_index_name(table, &[id_name.as_str()])
             };
@@ -2890,8 +2923,30 @@ fn reference_definition(
 
 /// The name Rails gives an index it names itself:
 /// `index_<table>_on_<column>_and_<column>`.
+///
+/// A name over Rails' 62 bytes is the short form Rails 7.1+ gives instead:
+/// `idx_on_<columns joined by _>`, cut to fit, then `_` and the first ten
+/// hex digits of the full name's SHA-256. PostgreSQL would otherwise cut two
+/// long names to the same 63 bytes.
 fn default_index_name(table: &str, columns: &[&str]) -> String {
-    format!("index_{table}_on_{}", columns.join("_and_"))
+    length_safe_index_name(format!("index_{table}_on_{}", columns.join("_and_")), columns)
+}
+
+fn length_safe_index_name(full: String, columns: &[&str]) -> String {
+    const MAX: usize = 62;
+    if full.len() <= MAX {
+        return full;
+    }
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(full.as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let suffix = format!("_{}", &hex[..10]);
+    let mut short = format!("idx_on_{}", columns.join("_"));
+    let limit = MAX - suffix.len();
+    while short.len() > limit {
+        short.pop();
+    }
+    format!("{short}{suffix}")
 }
 
 /// A `references`/`belongs_to` column under the reference's own name (the
@@ -3077,8 +3132,13 @@ fn array_default_matches(json: &str, col_type: &ColumnType) -> bool {
 fn parse_column_opts<'pr>(nodes: impl Iterator<Item = &'pr Node<'pr>>) -> ColumnOpts {
     let mut opts = ColumnOpts::default();
     for node in nodes {
-        let Some(kh) = node.as_keyword_hash_node() else { continue };
-        for el in kh.elements().iter() {
+        // A braced Hash too: `polymorphic: { null: false }` shapes the type column.
+        let elements = match (node.as_keyword_hash_node(), node.as_hash_node()) {
+            (Some(kh), _) => kh.elements(),
+            (None, Some(h)) => h.elements(),
+            _ => continue,
+        };
+        for el in elements.iter() {
             let Some(assoc) = el.as_assoc_node() else { continue };
             let Some(key) = symbol_value(&assoc.key()) else { continue };
             let value = &assoc.value();
