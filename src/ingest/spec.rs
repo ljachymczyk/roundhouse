@@ -361,7 +361,7 @@ impl Reader<'_> {
                         return Ok(None);
                     };
                     let key = assoc.key().as_symbol_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned());
-                    let value = assoc.value().as_symbol_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned());
+                    let value = symbol_or_string(&assoc.value());
                     match (key.as_deref(), value.as_deref()) {
                         (Some("type"), Some(t)) if SUPPORTED_TYPES.contains(&t) => spec_type = Some(t.to_string()),
                         _ => {
@@ -701,6 +701,8 @@ impl Reader<'_> {
             .includes
             .iter()
             .filter(|(f, _)| f.applies_to(spec_type.as_deref()))
+            // Ruby's lookup order: the module included last answers first.
+            .rev()
             .filter_map(|(_, name)| self.config.support_modules.iter().find(|lc| &lc.name == name).cloned())
             .collect();
         super::app::splice_test_helpers(&mut module, &included);
@@ -709,6 +711,44 @@ impl Reader<'_> {
         Ok(())
     }
 }
+
+/// A Symbol or String literal's text: RSpec compares metadata values like `type: "model"` and
+/// `type: :model` alike.
+fn symbol_or_string(node: &Node<'_>) -> Option<String> {
+    node.as_symbol_node()
+        .map(|s| String::from_utf8_lossy(s.unescaped()).into_owned())
+        .or_else(|| node.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned()))
+}
+
+/// What a helper file loads where it loads it (`SpecConfig::read_helper`).
+pub enum Load {
+    /// `require "spec_helper"` / `"rails_helper"`: that file, by its name.
+    Helper(String),
+    /// The `spec/support` files a glob names.
+    Support(SupportGlob),
+}
+
+/// How far a helper's `spec/support` glob reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SupportGlob {
+    /// `spec/support/**/*.rb`: every file below.
+    Recursive,
+    /// `spec/support/*.rb`: the folder's own files.
+    TopLevel,
+}
+
+/// The helper file a `require` names (`"rails_helper"`, `"../spec_helper"`), if it is one.
+pub fn helper_file_name(required: &str) -> Option<&'static str> {
+    let base = required.rsplit('/').next().unwrap_or(required).trim_end_matches(".rb");
+    match base {
+        "spec_helper" => Some("spec_helper"),
+        "rails_helper" => Some("rails_helper"),
+        _ => None,
+    }
+}
+
+/// Configuration blocks that set up only matchers, which a spec reaches by name (refused there).
+const MATCHER_LIBRARIES: &[&str] = &["Shoulda::Matchers"];
 
 /// Which examples a helper item applies to, by spec type: `None` for
 /// every example, `Some("request")` for `type: :request` only.
@@ -732,8 +772,8 @@ impl TypeFilter {
 pub struct SpecConfig {
     /// `config.infer_spec_type_from_file_location!`.
     pub infer_spec_types: bool,
-    /// `Dir[...support...].each { |f| require f }` in a helper file.
-    pub loads_support_dir: bool,
+    /// The `spec/support` glob a helper file loaded, if any.
+    pub support_glob: Option<SupportGlob>,
     /// `config.before` hooks, in run order.
     befores: Vec<(TypeFilter, Expr)>,
     /// `config.after` hooks, in run order.
@@ -776,15 +816,18 @@ const INERT_STATEMENTS: &[(&str, &str)] = &[
 ];
 
 impl SpecConfig {
-    /// `spec/spec_helper.rb` or `spec/rails_helper.rb`.
-    pub fn read_helper(&mut self, source: &[u8], file: &str) -> IngestResult<()> {
-        self.read_file(source, file)
+    /// `spec/spec_helper.rb` or `spec/rails_helper.rb`. `load` runs what
+    /// the file loads where it loads it: another helper file
+    /// (`require "spec_helper"`), and the support files its glob names,
+    /// so their hooks register before the ones written after the load.
+    pub fn read_helper(&mut self, source: &[u8], file: &str, load: &mut dyn FnMut(&mut SpecConfig, Load) -> IngestResult<()>) -> IngestResult<()> {
+        self.read_file(source, file, load)
     }
 
     /// One `spec/support/` file a helper loads: what it configures, and
     /// the modules it defines.
     pub fn read_support(&mut self, source: &[u8], file: &str) -> IngestResult<()> {
-        self.read_file(source, file)?;
+        self.read_file(source, file, &mut |_, _| Ok(()))?;
         if let Some(classes) = super::survey::unwrap_or_record(super::library_class::ingest_library_classes(source, file))? {
             self.support_modules.extend(classes);
         }
@@ -830,7 +873,13 @@ impl SpecConfig {
         Ok(())
     }
 
-    fn read_file(&mut self, source: &[u8], file: &str) -> IngestResult<()> {
+    /// Every example is left out: a file the configuration needs could not be read, so what it
+    /// registers is unknown.
+    pub fn refuse_all(&mut self, file: &str, what: &str) -> IngestResult<()> {
+        self.refuse_helper(file, what, TypeFilter(None))
+    }
+
+    fn read_file(&mut self, source: &[u8], file: &str, load: &mut dyn FnMut(&mut SpecConfig, Load) -> IngestResult<()>) -> IngestResult<()> {
         super::sources::register(file, &String::from_utf8_lossy(source));
         let result = super::prism::parse(source, file);
         let root = result.node();
@@ -850,7 +899,10 @@ impl SpecConfig {
             }
             if let Some(def) = stmt.as_def_node() {
                 let owner = ClassId(Symbol::from("Object"));
-                self.helper_defs.push(ingest_library_method(&def, &owner, file)?);
+                let def = ingest_library_method(&def, &owner, file)?;
+                // A redefinition replaces the earlier one, as Ruby's later `def` does.
+                self.helper_defs.retain(|d| d.name != def.name);
+                self.helper_defs.push(def);
                 continue;
             }
             // Boot boilerplate: the environment, the production guard,
@@ -868,16 +920,37 @@ impl SpecConfig {
             let name = constant_id_str(&call.name());
             let recv = call.receiver().map(|r| text(&r));
             match (recv.as_deref(), name) {
-                (None, "require" | "require_relative" | "puts" | "print" | "warn") => {}
+                // Another helper file, loaded at this point.
+                (None, "require" | "require_relative") => {
+                    if let Some(helper) = call.arguments().and_then(|a| a.arguments().iter().next()).and_then(|a| {
+                        a.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned())
+                    }) && let Some(name) = helper_file_name(&helper)
+                    {
+                        load(self, Load::Helper(name.to_string()))?;
+                    }
+                }
+                (None, "puts" | "print" | "warn") => {}
                 (Some(r), n) if INERT_STATEMENTS.contains(&(r, n)) => {}
                 // `Dir[Rails.root.join("spec", "support", ...)]`, and the
                 // `Rails.root.glob("spec/support/**/*.rb")` that current
                 // rspec-rails generators write.
                 (Some(r), "each") if r.starts_with("Dir[") || r.starts_with("Dir.glob") || r.starts_with("Rails.root.glob") => {
-                    if t.contains("support") && t.contains("require") {
-                        self.loads_support_dir = true;
+                    // The glob's own reach: `support/**/*.rb` every file below, `support/*.rb` the folder alone.
+                    let glob = if !(t.contains("support") && t.contains("require")) {
+                        None
+                    } else if t.contains("\"**\"") || t.contains("/**/") {
+                        Some(SupportGlob::Recursive)
+                    } else if t.contains("support/*.rb") || t.contains("\"*.rb\"") {
+                        Some(SupportGlob::TopLevel)
                     } else {
-                        self.refuse_helper(file, &at, TypeFilter(None))?;
+                        None
+                    };
+                    match glob {
+                        Some(glob) => {
+                            self.support_glob = Some(glob);
+                            load(self, Load::Support(glob))?;
+                        }
+                        None => self.refuse_helper(file, &at, TypeFilter(None))?,
                     }
                 }
                 (Some("RSpec"), "configure") => self.read_configure(&call, file, &text)?,
@@ -891,15 +964,17 @@ impl SpecConfig {
                         }
                     }
                 }
-                // Another library's configuration block: it reaches only
-                // that library's matchers and helpers, refused where a
-                // spec uses them. Still not read, so reported.
-                (Some(_), "configure") => {
+                // A matcher library's configuration block: it reaches only
+                // that library's matchers, refused where a spec uses them.
+                // Still not read, so reported.
+                (Some(r), "configure") if MATCHER_LIBRARIES.contains(&r) => {
                     super::survey::continue_or_fail(IngestError::Unsupported {
                         file: file.into(),
                         message: format!("RSpec helper: {at} is not read"),
                     })?;
                 }
+                // Any other library's (`TestSettings.configure`) may change what every example reads.
+                (Some(_), "configure") => self.refuse_helper(file, &at, TypeFilter(None))?,
                 _ => self.refuse_helper(file, &at, TypeFilter(None))?,
             }
         }
@@ -1033,7 +1108,7 @@ fn metadata_filter(metadata: &[&Node<'_>]) -> Option<TypeFilter> {
         for element in hash.elements().iter() {
             let assoc = element.as_assoc_node()?;
             let key = assoc.key().as_symbol_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned());
-            let value = assoc.value().as_symbol_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned());
+            let value = symbol_or_string(&assoc.value());
             match (key.as_deref(), value) {
                 (Some("type"), Some(t)) if SUPPORTED_TYPES.contains(&t.as_str()) => filter = TypeFilter(Some(t)),
                 _ => return None,
@@ -1933,9 +2008,11 @@ end
 
     fn config(helper: &str, support: &str) -> IngestResult<SpecConfig> {
         let mut config = SpecConfig::default();
-        config.read_helper(helper.as_bytes(), "/app/spec/rails_helper.rb")?;
-        assert!(config.loads_support_dir);
-        config.read_support(support.as_bytes(), "/app/spec/support/json_helpers.rb")?;
+        config.read_helper(helper.as_bytes(), "/app/spec/rails_helper.rb", &mut |config, load| match load {
+            Load::Support(_) => config.read_support(support.as_bytes(), "/app/spec/support/json_helpers.rb"),
+            Load::Helper(_) => Ok(()),
+        })?;
+        assert!(config.support_glob.is_some());
         config.finish("/app/spec/rails_helper.rb")?;
         Ok(config)
     }
