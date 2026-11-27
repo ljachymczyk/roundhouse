@@ -2350,11 +2350,17 @@ end
         assert!(refused.refused.iter().any(|f| f.0.is_none()), "an unread library configuration leaves every example out");
     }
 
-    // Without `infer_spec_type_from_file_location!` a file's folder gives
-    // it no type, as in rspec-rails.
+    // A helper that does not say `infer_spec_type_from_file_location!` gives
+    // a file's folder no type, as in rspec-rails; with no helper read at all,
+    // the folder's type stands, as these specs were read before.
     #[test]
     fn spec_types_are_inferred_only_when_the_helper_says_so() {
-        let tms = with_config(&SpecConfig::default(), "describe \"Articles\" do\n  it \"x\" do\n    expect(1).to eq(1)\n  end\nend\n", "/app/spec/requests/articles_spec.rb");
+        let src = "describe \"Articles\" do\n  it \"x\" do\n    expect(1).to eq(1)\n  end\nend\n";
+        let tms = with_config(&SpecConfig::default(), src, "/app/spec/requests/articles_spec.rb");
+        assert_eq!(tms[0].parent.as_ref().unwrap().0.as_str(), "ActionDispatch::IntegrationTest");
+        let mut plain = SpecConfig::default();
+        plain.read_helper(b"RSpec.configure do |config|\nend\n", "/app/spec/spec_helper.rb", &mut |_, _| Ok(())).expect("helper");
+        let tms = with_config(&plain, src, "/app/spec/requests/articles_spec.rb");
         assert_eq!(tms[0].parent.as_ref().unwrap().0.as_str(), "ActiveSupport::TestCase");
         let config = config(RAILS_HELPER, SUPPORT).expect("config");
         let src = "describe ArticlesController do\n  it \"x\" do\n    expect(1).to eq(1)\n  end\nend\n";
