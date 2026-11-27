@@ -155,6 +155,7 @@ end
     ]);
     let why = ms[1].not_renderable.as_deref().expect("change_table is not rendered");
     assert!(why.contains("`change_table`"), "{why}");
+    assert_eq!(ms[2].not_renderable, None);
     let out = sql(&ms[2]).join("\n");
     assert!(out.contains("subtitle TEXT"), "{out}");
 }
@@ -716,6 +717,8 @@ fn forms_the_sql_would_get_wrong_are_not_rendered() {
         r#"execute "UPDATE articles SET title = 'x'; DROP TABLE comments""#,
         "create_table :articles, if_not_exists: true do |t|\n      t.string :title\n    end",
         "def change(",
+        "drop_table :articles, :comments",
+        "add_reference :articles, :author, index: false, default: default_author_id",
     ] {
         let ms = record(&[("db/migrate/20260101000001_create_articles.rb", CREATE_ARTICLES), ("db/migrate/20260101000002_change.rb", &one(body))]);
         assert!(ms[1].not_renderable.is_some(), "{body}: {:?}", ms[1].steps);
@@ -744,4 +747,59 @@ fn an_expression_default_is_added_by_a_rebuild_and_a_reference_keeps_its_default
     assert!(matches!(ms[1].steps.as_slice(), [MigrationStep::RebuildTable { .. }]), "{:?}", ms[1].steps);
     let author = sql(&ms[2]).join("\n");
     assert!(author.contains("author_id") && author.contains("DEFAULT 0"), "{author}");
+}
+
+#[test]
+fn what_the_fold_cannot_see_leaves_the_tables_unknown() {
+    for body in [
+        "self.add_reference :articles, :author, index: false",
+        "change_table :articles do |t|\n      execute \"ALTER TABLE articles ADD COLUMN slug TEXT\"\n    end",
+        "connection.add_column :articles, :slug, :string",
+    ] {
+        let ms = record(&[
+            ("db/migrate/20260101000001_create_articles.rb", CREATE_ARTICLES),
+            ("db/migrate/20260101000002_change.rb", &one(body)),
+            ("db/migrate/20260101000003_title.rb", &one(r#"change_column_default :articles, :title, from: nil, to: "untitled""#)),
+        ]);
+        if body.starts_with("self.") {
+            assert_eq!(ms[1].not_renderable, None, "{body}");
+            assert!(sql(&ms[2]).join("\n").contains("author_id"), "{body}: the rebuild keeps the column");
+            continue;
+        }
+        assert!(ms[2].not_renderable.as_deref().is_some_and(|w| w.contains("not known")), "{body}: {:?}", ms[2].not_renderable);
+    }
+}
+
+#[test]
+fn data_sql_and_a_nil_replacement_are_rendered() {
+    let ms = record(&[
+        ("db/migrate/20260101000001_create_articles.rb", CREATE_ARTICLES),
+        ("db/migrate/20260101000002_data.rb", &one(r#"execute "UPDATE articles SET title = 'a;b' WHERE title IS NULL""#)),
+        ("db/migrate/20260101000003_null.rb", &one("change_column_null :articles, :title, false, nil")),
+    ]);
+    assert_eq!(ms[1].not_renderable, None);
+    assert_eq!(ms[2].not_renderable, None);
+    assert!(!sql(&ms[2]).iter().any(|s| s.starts_with("UPDATE")), "{:?}", sql(&ms[2]));
+}
+
+#[test]
+fn a_rebuild_that_would_run_a_childs_delete_action_is_not_rendered() {
+    let ms = record(&[
+        ("db/migrate/20260101000001_create_articles.rb", CREATE_ARTICLES),
+        ("db/migrate/20260101000002_comments.rb", &one("create_table :comments do |t|\n      t.references :article, foreign_key: { on_delete: :cascade }\n    end")),
+        ("db/migrate/20260101000003_title.rb", &one(r#"change_column_default :articles, :title, from: nil, to: "untitled""#)),
+    ]);
+    let why = ms[2].not_renderable.as_deref().unwrap_or_default();
+    assert!(why.contains("ON DELETE") && why.contains("comments"), "{why:?}");
+}
+
+#[test]
+fn create_table_if_not_exists_keeps_the_layout_already_there() {
+    let ms = record(&[
+        ("db/migrate/20260101000001_create_articles.rb", CREATE_ARTICLES),
+        ("db/migrate/20260101000002_again.rb", &one("create_table :articles, if_not_exists: true do |t|\n      t.string :headline\n    end")),
+        ("db/migrate/20260101000003_index.rb", &one("add_index :articles, :title")),
+    ]);
+    assert!(ms[1].not_renderable.is_some());
+    assert!(sql(&ms[2]).join("\n").contains("title"), "{:?}", ms[2].steps);
 }
