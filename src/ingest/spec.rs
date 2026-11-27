@@ -709,7 +709,7 @@ impl Reader<'_> {
         let mut module = TestModule {
             name: class,
             parent: Some(parent_for(spec_type.as_deref())),
-            target: described.map(|p| ClassId(Symbol::from(p.join("::")))),
+            target: described.as_ref().map(|p| ClassId(Symbol::from(p.join("::")))),
             tests,
             setup,
             inner_classes: Vec::new(),
