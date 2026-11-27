@@ -2128,12 +2128,12 @@ end
     // library's configuration that is not a matcher library's leaves every example out.
     #[test]
     fn helper_configuration_reads_as_rspec_does() {
-        let helper = "Dir[Rails.root.join(\"spec/support/*.rb\")].sort.each { |f| require f }\nRSpec.configure do |config|\n  config.infer_spec_type_from_file_location!\n  config.before(type: \"model\") { configured }\n  config.include First\n  config.include Second\nend\n\ndef label\n  1\nend\n\ndef label\n  2\nend\n";
+        let helper_src = "Dir[Rails.root.join(\"spec/support/*.rb\")].sort.each { |f| require f }\nRSpec.configure do |config|\n  config.infer_spec_type_from_file_location!\n  config.before(type: \"model\") { configured }\n  config.include First\n  config.include Second\nend\n\ndef label\n  1\nend\n\ndef label\n  2\nend\n";
         let support = "module First\n  def pick\n    :first\n  end\nend\nmodule Second\n  def pick\n    :second\n  end\nend\n";
         let mut globs = Vec::new();
         let mut config = SpecConfig::default();
         config
-            .read_helper(helper.as_bytes(), "/app/spec/rails_helper.rb", &mut |config, load| match load {
+            .read_helper(helper_src.as_bytes(), "/app/spec/rails_helper.rb", &mut |config, load| match load {
                 Load::Support(glob) => {
                     globs.push(glob);
                     config.read_support(support.as_bytes(), "/app/spec/support/modules.rb")
