@@ -2052,7 +2052,11 @@ fn build_index<'pr>(
         let cols: Vec<&str> = expression.as_deref().map(|e| {
             e.split(|c: char| !c.is_alphanumeric() && c != '_').filter(|s| !s.is_empty()).collect()
         }).unwrap_or_else(|| columns.iter().map(|c| c.as_str()).collect());
-        format!("index_{}_on_{}", table_name, cols.join(if expression.is_some() { "_" } else { "_and_" }))
+        if expression.is_some() {
+            format!("index_{}_on_{}", table_name, cols.join("_"))
+        } else {
+            default_index_name(table_name, &cols)
+        }
     });
     Ok(Index { name: Symbol::from(name), columns, expression, unique, using, predicate })
 }
