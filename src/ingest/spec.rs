@@ -1843,7 +1843,8 @@ end
         let mut order = Vec::new();
         kinds(&tms[0].tests[0].body, &mut order);
         // `by`'s argument is read first, as RSpec builds the matcher before the block; no copy of the value: it is a difference.
-        assert_eq!(order, ["__rspec_by =", "__rspec_before =", "create!", "__rspec_after =", "assert"]);
+        // The receiver first: `change(Article, :count)` evaluates it as `change` is called.
+        assert_eq!(order, ["__rspec_receiver =", "__rspec_by =", "__rspec_before =", "create!", "__rspec_after =", "assert"]);
     }
 
     #[test]
