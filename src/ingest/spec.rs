@@ -40,7 +40,9 @@
 //! - `expect { }.to raise_error` (any `Exception`, a class, a literal
 //!   message, or both), `not_to raise_error`, and `change { value }` /
 //!   `change(receiver, :message)` bare or with `by`, `by_at_least`,
-//!   `by_at_most`, `from`, `to`.
+//!   `by_at_most`, `from`, `to`;
+//! - on a request spec's `response`: `have_http_status`, `redirect_to`,
+//!   and the `Rack::Response::Helpers` status predicates (`be_successful`).
 
 use crate::det::HashMap;
 
@@ -196,6 +198,9 @@ struct Ctx<'a> {
     described: Option<&'a [String]>,
     /// Matchers the suite defines itself (`RSpec::Matchers.define`).
     custom_matchers: &'a [String],
+    /// A bare `response` is the integration session's last response (a
+    /// request spec that defines no `response` of its own).
+    session_response: bool,
 }
 
 /// One example group on the way down: what it adds to the groups around it.
@@ -541,7 +546,8 @@ impl Reader<'_> {
         let described = chain.iter().rev().find_map(|f| f.described.clone());
         let spec_type: Option<String> = match chain.iter().rev().find_map(|f| f.spec_type.clone()) {
             Some(t) => Some(t),
-            None if self.config.infer_spec_types => match inferred_type(self.file) {
+            // No helper read: the folder's type, as these specs were read before helper configuration was.
+            None if self.config.infer_spec_types || !self.config.helpers_loaded => match inferred_type(self.file) {
                 Some(t) if SUPPORTED_TYPES.contains(&t) => Some(t.to_string()),
                 Some(t) => {
                     super::survey::continue_or_fail(IngestError::Unsupported {
@@ -591,7 +597,21 @@ impl Reader<'_> {
             }
         }
 
-        let ctx = Ctx { described: described.as_deref(), custom_matchers: &self.config.custom_matchers };
+        let included: Vec<LibraryClass> = self
+            .config
+            .includes
+            .iter()
+            .filter(|(f, _)| f.applies_to(spec_type.as_deref()))
+            // Ruby's lookup order: the module included last answers first.
+            .rev()
+            .filter_map(|(_, name)| self.config.support_modules.iter().find(|lc| &lc.name == name).cloned())
+            .collect();
+        // Not the session's `response` when the group, or a module it includes, defines its own.
+        let session_response = spec_type.as_deref() == Some("request")
+            && !lets.iter().any(|(n, _, _)| n == "response")
+            && !defs.iter().any(|d| d.name.as_str() == "response")
+            && !included.iter().any(|lc| lc.methods.iter().any(|m| m.name.as_str() == "response"));
+        let ctx = Ctx { described: described.as_deref(), custom_matchers: &self.config.custom_matchers, session_response };
         let rewrite = |e: &Expr| -> Result<Expr, String> { desugar(e, &ctx) };
         let mut helpers = Vec::new();
         for (let_name, body, span) in &lets {
@@ -689,7 +709,7 @@ impl Reader<'_> {
         let mut module = TestModule {
             name: class,
             parent: Some(parent_for(spec_type.as_deref())),
-            target: described.map(|p| ClassId(Symbol::from(p.join("::")))),
+            target: described.as_ref().map(|p| ClassId(Symbol::from(p.join("::")))),
             tests,
             setup,
             inner_classes: Vec::new(),
@@ -701,17 +721,23 @@ impl Reader<'_> {
         // `config.include` modules, then the helper files' own `def`s
         // (methods on Object): Ruby finds the group's methods first,
         // then included modules, then Object's.
-        let included: Vec<LibraryClass> = self
-            .config
-            .includes
-            .iter()
-            .filter(|(f, _)| f.applies_to(spec_type.as_deref()))
-            // Ruby's lookup order: the module included last answers first.
-            .rev()
-            .filter_map(|(_, name)| self.config.support_modules.iter().find(|lc| &lc.name == name).cloned())
-            .collect();
-        super::app::splice_test_helpers(&mut module, &included);
-        splice_helper_defs(&mut module, &self.config.helper_defs);
+        // To a fixed point: a top-level helper may call an included module's method, and the other way round.
+        let own = module.helpers.len();
+        loop {
+            let before = module.helpers.len();
+            super::app::splice_test_helpers(&mut module, &included);
+            splice_helper_defs(&mut module, &self.config.helper_defs);
+            if module.helpers.len() == before {
+                break;
+            }
+        }
+        // The helpers' expectations read in this group's context: `response` is its own where it defines one.
+        let helper_ctx = Ctx { described: described.as_deref(), custom_matchers: &self.config.custom_matchers, session_response };
+        for h in module.helpers.iter_mut().skip(own) {
+            if let Ok(body) = desugar(&h.body, &helper_ctx) {
+                h.body = body;
+            }
+        }
         self.modules.push(module);
         Ok(())
     }
@@ -803,6 +829,10 @@ impl TypeFilter {
 pub struct SpecConfig {
     /// `config.infer_spec_type_from_file_location!`.
     pub infer_spec_types: bool,
+    /// A helper file was read: its configuration, not the folder, says each spec's type.
+    pub helpers_loaded: bool,
+    /// `config.fixture_paths = [...]`: the folders RSpec loads fixtures from, as written.
+    pub fixture_paths: Vec<String>,
     /// The `spec/support` glob a helper file loaded, if any.
     pub support_glob: Option<SupportGlob>,
     /// `config.before` hooks, in run order.
@@ -827,7 +857,7 @@ pub struct SpecConfig {
 /// here starts from a truncated database plus `test/fixtures`) the
 /// transaction mode.
 const INERT_SETTINGS: &[&str] = &[
-    "fixture_paths=", "fixture_path=", "file_fixture_path=", "filter_rails_from_backtrace!",
+    "file_fixture_path=", "filter_rails_from_backtrace!",
     "filter_gems_from_backtrace", "order=", "example_status_persistence_file_path=",
     "disable_monkey_patching!", "expect_with", "mock_with", "shared_context_metadata_behavior=",
     "filter_run_when_matching", "warnings=", "profile_examples=", "default_formatter=",
@@ -852,6 +882,7 @@ impl SpecConfig {
     /// (`require "spec_helper"`), and the support files its glob names,
     /// so their hooks register before the ones written after the load.
     pub fn read_helper(&mut self, source: &[u8], file: &str, load: &mut dyn FnMut(&mut SpecConfig, Load) -> IngestResult<()>) -> IngestResult<()> {
+        self.helpers_loaded = true;
         self.read_file(source, file, load)
     }
 
@@ -894,14 +925,7 @@ impl SpecConfig {
         // A helper body this subset cannot read is left as written: the
         // call it makes (`expect`, `described_class`) is then an analysis
         // error in every module that reaches it.
-        let matchers = self.custom_matchers.clone();
-        let ctx = Ctx { described: None, custom_matchers: &matchers };
-        let methods = self.helper_defs.iter_mut().chain(self.support_modules.iter_mut().flat_map(|lc| lc.methods.iter_mut()));
-        for m in methods {
-            if let Ok(body) = desugar(&m.body, &ctx) {
-                m.body = body;
-            }
-        }
+        // (Their bodies are rewritten where a group takes them, in that group's context.)
         Ok(())
     }
 
@@ -962,6 +986,10 @@ impl SpecConfig {
                     }
                 }
                 (None, "puts" | "print" | "warn") => {}
+                // `:raise` turns a potential false positive into a failure RSpec reports, which the emitted test cannot.
+                (Some("RSpec::Expectations.configuration"), "on_potential_false_positives=") if t.contains(":raise") => {
+                    self.refuse_all(file, "`on_potential_false_positives = :raise`")?;
+                }
                 (Some(r), n) if INERT_STATEMENTS.contains(&(r, n)) => {}
                 // `Dir[Rails.root.join("spec", "support", ...)]`, and the
                 // `Rails.root.glob("spec/support/**/*.rb")` that current
@@ -1053,6 +1081,19 @@ impl SpecConfig {
             }
             match name {
                 "infer_spec_type_from_file_location!" => self.infer_spec_types = true,
+                // Not verdict-neutral: the examples read the data these folders hold (`ingest::app` checks them).
+                "fixture_paths=" | "fixture_path=" => {
+                    let paths: Vec<String> = t
+                        .split('"')
+                        .enumerate()
+                        .filter(|(i, _)| i % 2 == 1)
+                        .map(|(_, p)| p.to_string())
+                        .collect();
+                    if paths.is_empty() {
+                        self.refuse_helper(file, &format!("`{}` (a fixture path that is not a literal)", first_line(&t)), TypeFilter(None))?;
+                    }
+                    self.fixture_paths.extend(paths);
+                }
                 "before" | "prepend_before" | "append_before" | "after" | "prepend_after" | "append_after" => {
                     let Some(filter) = self.hook_filter(&args, file, &t)? else { continue };
                     let Some(body) = item.block().and_then(|b| b.as_block_node()) else {
@@ -1091,7 +1132,7 @@ impl SpecConfig {
                     }
                 }
                 _ => {
-                    let metadata: Vec<&Node<'_>> = args.iter().filter(|a| a.as_keyword_hash_node().is_some()).collect();
+                    let metadata: Vec<&Node<'_>> = args.iter().filter(|a| a.as_keyword_hash_node().is_some() || a.as_hash_node().is_some()).collect();
                     // Filtered by metadata no supported example carries:
                     // it can reach none of them.
                     let Some(filter) = metadata_filter(&metadata) else { continue };
@@ -1152,8 +1193,13 @@ impl SpecConfig {
 fn metadata_filter(metadata: &[&Node<'_>]) -> Option<TypeFilter> {
     let mut filter = TypeFilter(None);
     for node in metadata {
-        let hash = node.as_keyword_hash_node()?;
-        for element in hash.elements().iter() {
+        // `{ type: :request }` passes RSpec the same filter as `type: :request`.
+        let elements: Vec<Node<'_>> = match (node.as_keyword_hash_node(), node.as_hash_node()) {
+            (Some(h), _) => h.elements().iter().collect(),
+            (None, Some(h)) => h.elements().iter().collect(),
+            _ => return None,
+        };
+        for element in elements.iter() {
             let assoc = element.as_assoc_node()?;
             let key = assoc.key().as_symbol_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned());
             let value = symbol_or_string(&assoc.value());
@@ -1449,6 +1495,13 @@ fn expectation(expr: &Expr, ctx: &Ctx<'_>) -> Result<Option<Expr>, String> {
         }
         _ => return Err("this form of `expect`".into()),
     };
+    // A custom matcher of the name (`RSpec::Matchers.define :be_successful`) is the suite's, not rspec-rails'.
+    let custom = matches!(&*matcher.node, ExprNode::Send { recv: None, method, .. } if ctx.custom_matchers.iter().any(|m| m == method.as_str()));
+    if ctx.session_response && !custom && is_bare_call(&actual, "response") {
+        if let Some(assertion) = response_matcher(span, matcher, positive, ctx)? {
+            return Ok(Some(assertion));
+        }
+    }
     let conditions = matcher_conditions(matcher, actual, ctx)?;
     // `include(a, b)` holds when every value is included; its negation
     // when none is, so each value is its own assertion either way.
@@ -1460,6 +1513,150 @@ fn expectation(expr: &Expr, ctx: &Ctx<'_>) -> Result<Option<Expr>, String> {
         asserts.pop().unwrap()
     } else {
         Expr::new(span, ExprNode::Seq { exprs: asserts })
+    }))
+}
+
+fn is_bare_call(expr: &Expr, name: &str) -> bool {
+    matches!(&*expr.node, ExprNode::Send { recv: None, method, args, block: None, .. } if method.as_str() == name && args.is_empty())
+}
+
+/// rspec-rails' response matchers, on a request spec's `response`:
+///
+/// - `have_http_status(x)` is the harness's `assert_response(x)` where
+///   Rails' rules are rspec-rails' (all but `:redirect`); otherwise, and
+///   for `not_to`, it compares `response.status` by rspec-rails'
+///   rules: an Integer exactly, a generic type by the Rack predicate it
+///   names (`:success` / `:successful`, `:redirect`, `:missing` /
+///   `:not_found`, `:error` / `:server_error`), any other Symbol through
+///   the status code table. A status held in a variable goes to
+///   `assert_response` too (if it holds `:redirect`, Rails' 3xx range
+///   answers); in `not_to` it is refused;
+/// - `redirect_to(x)` is `assert_redirected_to(x)`, which rspec-rails
+///   delegates to;
+/// - `be_<predicate>` for the status predicates of
+///   `Rack::Response::Helpers` (`be_successful`, `be_not_found`, ...) is
+///   that predicate's status test.
+///
+/// `Ok(None)` for any other matcher, read as on any value.
+fn response_matcher(span: Span, matcher: &Expr, positive: bool, ctx: &Ctx<'_>) -> Result<Option<Expr>, String> {
+    let ExprNode::Send { recv: None, method, args, block: None, .. } = &*matcher.node else {
+        return Ok(None);
+    };
+    let args = args.iter().map(|a| desugar(a, ctx)).collect::<Result<Vec<_>, _>>()?;
+    let status = || send(Some(send(None, "response", Vec::new(), span)), "status", Vec::new(), span);
+    let int = |n: i64| Expr::new(span, ExprNode::Lit { value: Literal::Int { value: n } });
+    let between = |lo: i64, hi: i64| {
+        Expr::new(
+            span,
+            ExprNode::BoolOp {
+                op: crate::expr::BoolOpKind::And,
+                surface: Default::default(),
+                left: send(Some(status()), ">=", vec![int(lo)], span),
+                right: send(Some(status()), "<=", vec![int(hi)], span),
+            },
+        )
+    };
+    let one_of = |codes: &[i64]| {
+        let list = Expr::new(
+            span,
+            ExprNode::Array { elements: codes.iter().map(|c| int(*c)).collect(), style: Default::default() },
+        );
+        send(Some(list), "include?", vec![status()], span)
+    };
+    let check = |cond: Expr| send(None, if positive { "assert" } else { "refute" }, vec![cond], span);
+    let name = method.as_str();
+    Ok(Some(match name {
+        "have_http_status" => {
+            let [expected] = args.as_slice() else {
+                return Err("`have_http_status` without exactly one argument".into());
+            };
+            // rspec-rails sends the generic types to the response's Rack
+            // predicates (`successful?`, `redirect?`, `not_found?`,
+            // `server_error?`); `redirect?` is the five redirect codes, not
+            // the 3xx range Rails' own `assert_response :redirect` checks.
+            let generic = |sym: &str| match sym {
+                "success" | "successful" => Some(between(200, 299)),
+                "redirect" => Some(one_of(&[301, 302, 303, 307, 308])),
+                "missing" | "not_found" => Some(one_of(&[404])),
+                "error" | "server_error" => Some(between(500, 599)),
+                _ => None,
+            };
+            // Where Rails' rules are rspec-rails' own, the harness's
+            // `assert_response` (every lane already runs it) answers.
+            let assert_response = |arg: Expr| send(None, "assert_response", vec![arg], span);
+            let sym = |name: &str| Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(name) } });
+            if positive {
+                match &*expected.node {
+                    ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "redirect" => {}
+                    ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "successful" => {
+                        return Ok(Some(assert_response(sym("success"))));
+                    }
+                    ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "server_error" => {
+                        return Ok(Some(assert_response(sym("error"))));
+                    }
+                    _ => return Ok(Some(assert_response(expected.clone()))),
+                }
+            }
+            match &*expected.node {
+                ExprNode::Lit { value: Literal::Int { value } } => check(send(Some(status()), "==", vec![int(*value)], span)),
+                ExprNode::Lit { value: Literal::Sym { value } } => match generic(value.as_str()) {
+                    Some(cond) => check(cond),
+                    None => {
+                        let codes = Expr::new(
+                            span,
+                            ExprNode::Const { path: vec![Symbol::from("ActionController"), Symbol::from("STATUS_CODES")] },
+                        );
+                        // Not `[]`: an unknown symbol would answer nil, and `refute(status == nil)` passes for every response.
+                        let code = send(Some(codes), "fetch", vec![expected.clone()], span);
+                        check(send(Some(status()), "==", vec![code], span))
+                    }
+                },
+                _ => return Err("`not_to have_http_status` with a status that is not a literal".into()),
+            }
+        }
+        "redirect_to" => {
+            if !positive {
+                return Err("`not_to redirect_to`".into());
+            }
+            let [expected] = args.as_slice() else {
+                return Err("`redirect_to` without exactly one argument".into());
+            };
+            send(None, "assert_redirected_to", vec![expected.clone()], span)
+        }
+        _ if args.is_empty() => {
+            // Rack::Response::Helpers.
+            let cond = match name.strip_prefix("be_").unwrap_or_default() {
+                "informational" => between(100, 199),
+                "successful" => between(200, 299),
+                "redirection" => between(300, 399),
+                "client_error" => between(400, 499),
+                "server_error" => between(500, 599),
+                "invalid" => {
+                    let below = send(Some(status()), "<", vec![int(100)], span);
+                    let above = send(Some(status()), ">=", vec![int(600)], span);
+                    Expr::new(span, ExprNode::BoolOp { op: crate::expr::BoolOpKind::Or, surface: Default::default(), left: below, right: above })
+                }
+                "ok" => one_of(&[200]),
+                "created" => one_of(&[201]),
+                "accepted" => one_of(&[202]),
+                "no_content" => one_of(&[204]),
+                "moved_permanently" => one_of(&[301]),
+                "redirect" => one_of(&[301, 302, 303, 307, 308]),
+                "bad_request" => one_of(&[400]),
+                "unauthorized" => one_of(&[401]),
+                "forbidden" => one_of(&[403]),
+                "not_found" => one_of(&[404]),
+                "method_not_allowed" => one_of(&[405]),
+                "not_acceptable" => one_of(&[406]),
+                "request_timeout" => one_of(&[408]),
+                "precondition_failed" => one_of(&[412]),
+                "unprocessable" => one_of(&[422]),
+                "empty" => one_of(&[201, 204, 304]),
+                _ => return Ok(None),
+            };
+            check(cond)
+        }
+        _ => return Ok(None),
     }))
 }
 
@@ -2250,15 +2447,26 @@ end
             assert!(config.refused.iter().any(|f| f.0.is_none()), "{what} must leave every example out");
         }
         let mut config = SpecConfig::default();
+        let _ = super::super::survey::surveying(|| {
+            config.read_helper(b"RSpec::Expectations.configuration.on_potential_false_positives = :raise\n", "/app/spec/spec_helper.rb", &mut |_, _| Ok(()))
+        });
+        assert!(config.refused.iter().any(|f| f.0.is_none()), "a false-positive policy of :raise must leave every example out");
+        let mut config = SpecConfig::default();
         let _ = super::super::survey::surveying(|| config.read_support(b"require_relative \"../spec_helper\"\n", "/app/spec/support/setup.rb"));
         assert!(config.refused.iter().any(|f| f.0.is_none()), "a support file's own load must leave every example out");
     }
 
-    // Without `infer_spec_type_from_file_location!` a file's folder gives
-    // it no type, as in rspec-rails.
+    // A helper that does not say `infer_spec_type_from_file_location!` gives
+    // a file's folder no type, as in rspec-rails; with no helper read at all,
+    // the folder's type stands, as these specs were read before.
     #[test]
     fn spec_types_are_inferred_only_when_the_helper_says_so() {
-        let tms = with_config(&SpecConfig::default(), "describe \"Articles\" do\n  it \"x\" do\n    expect(1).to eq(1)\n  end\nend\n", "/app/spec/requests/articles_spec.rb");
+        let src = "describe \"Articles\" do\n  it \"x\" do\n    expect(1).to eq(1)\n  end\nend\n";
+        let tms = with_config(&SpecConfig::default(), src, "/app/spec/requests/articles_spec.rb");
+        assert_eq!(tms[0].parent.as_ref().unwrap().0.as_str(), "ActionDispatch::IntegrationTest");
+        let mut plain = SpecConfig::default();
+        plain.read_helper(b"RSpec.configure do |config|\nend\n", "/app/spec/spec_helper.rb", &mut |_, _| Ok(())).expect("helper");
+        let tms = with_config(&plain, src, "/app/spec/requests/articles_spec.rb");
         assert_eq!(tms[0].parent.as_ref().unwrap().0.as_str(), "ActiveSupport::TestCase");
         let config = config(RAILS_HELPER, SUPPORT).expect("config");
         let src = "describe ArticlesController do\n  it \"x\" do\n    expect(1).to eq(1)\n  end\nend\n";
@@ -2304,6 +2512,42 @@ end
         let src = "describe Article do\n  it \"x\" do\n    expect(Article.new).to be_tidy\n  end\nend\n";
         let err = ingest_spec_files_with(src.as_bytes(), "/app/spec/models/article_spec.rb", &config).unwrap_err();
         assert!(err.to_string().contains("custom matcher `be_tidy`"), "{err}");
+    }
+
+    fn request_body(body: &str) -> Result<String, String> {
+        let src = format!("RSpec.describe \"Articles\", type: :request do\n  it \"x\" do\n    {body}\n  end\nend\n");
+        ingest_spec_files(src.as_bytes(), "/app/spec/requests/articles_spec.rb")
+            .map(|tms| format!("{:?}", tms[0].tests[0].body))
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn response_matchers_in_request_specs() {
+        // Rails' rules are rspec-rails' here: the harness's assertion.
+        let body = request_body("expect(response).to have_http_status(:ok)").unwrap();
+        assert!(body.contains("assert_response") && body.contains("\"ok\""), "{body}");
+        let body = request_body("expect(response).to have_http_status(:successful)").unwrap();
+        assert!(body.contains("assert_response") && body.contains("\"success\""), "{body}");
+        // `:redirect` is Rack's `redirect?`: five codes, not 3xx.
+        let body = request_body("expect(response).to have_http_status(:redirect)").unwrap();
+        assert!(!body.contains("assert_response") && body.contains("307") && body.contains("308") && !body.contains("304"), "{body}");
+        let body = request_body("expect(response).not_to have_http_status(404)").unwrap();
+        assert!(body.contains("refute") && body.contains("status") && body.contains("404"), "{body}");
+        let body = request_body("expect(response).to be_successful").unwrap();
+        assert!(body.contains("status") && body.contains("200") && body.contains("299"), "{body}");
+        let body = request_body("expect(response).to redirect_to(articles_path)").unwrap();
+        assert!(body.contains("assert_redirected_to") && body.contains("articles_path"), "{body}");
+        let err = request_body("expect(response).not_to redirect_to(articles_path)").unwrap_err();
+        assert!(err.contains("not_to redirect_to"), "{err}");
+    }
+
+    // Only a request spec's own `response` is the session's.
+    #[test]
+    fn response_matchers_elsewhere_are_refused() {
+        let src = example("expect(response).to have_http_status(:ok)");
+        assert!(ingest_spec_files(src.as_bytes(), "/app/spec/models/article_spec.rb").is_err());
+        let src = "RSpec.describe \"Articles\", type: :request do\n  let(:response) { fetch }\n  it \"x\" do\n    expect(response).to have_http_status(:ok)\n  end\nend\n";
+        assert!(ingest_spec_files(src.as_bytes(), "/app/spec/requests/articles_spec.rb").is_err());
     }
 
     #[test]
