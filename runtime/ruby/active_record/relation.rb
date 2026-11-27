@@ -193,6 +193,7 @@ module ActiveRecord
       @limit = nil
       @offset = nil
       @includes = []
+      @references = []
       @skip_preloading = false
       # Rails' NullRelation flag: `Model.none` and `where(id: [])` must not
       # hit the database. Chain methods call `unload_records`, which keeps
@@ -276,6 +277,7 @@ module ActiveRecord
         @havings,
         @ctes,
         @includes,
+        @references,
         @scope_attributes
       )
       target.take_query_scalars(
@@ -437,6 +439,7 @@ module ActiveRecord
           @havings,
           @ctes,
           @includes,
+          @references,
           @scope_attributes
         )
       end
@@ -445,7 +448,7 @@ module ActiveRecord
 
     # List accumulators go through copy_* so inference types the
     # parameters. Scalars come from `clone` (shallow ivar copy).
-    def take_query_lists(wheres, where_cols, where_null, joins, orders, groups, havings, ctes, includes, attrs)
+    def take_query_lists(wheres, where_cols, where_null, joins, orders, groups, havings, ctes, includes, references, attrs)
       @wheres = copy_string_list(wheres)
       @where_cols = copy_cols_list(where_cols)
       @where_null = copy_bool_list(where_null)
@@ -455,6 +458,7 @@ module ActiveRecord
       @havings = copy_string_list(havings)
       @ctes = copy_string_list(ctes)
       @includes = copy_symbol_list(includes)
+      @references = copy_string_list(references)
       @scope_attributes = copy_scope_attributes(attrs)
       self
     end
@@ -638,8 +642,10 @@ module ActiveRecord
     end
 
     def or!(other)
-      return self if other.null_relation?
+      own_lists
       unload_records
+      merge_reference_names!(other)
+      return self if other.null_relation?
       mine = @wheres.length > 0 ? @wheres.join(" AND ") : "1=1"
       other_wheres = other.where_clauses
       theirs = other_wheres.length > 0 ? other_wheres.join(" AND ") : "1=1"
@@ -673,6 +679,7 @@ module ActiveRecord
         end
       end
       other.having_clauses.each { |h| @havings << h unless @havings.include?(h) }
+      merge_reference_names!(other)
       mark_null! if other.null_relation?
       @none = true if other.explicit_none?
       self
@@ -1563,6 +1570,20 @@ module ActiveRecord
     # model's synthesized `preload_associations` (batched `IN` loads
     # into the `_preload_<assoc>` caches). Models without a synthesized
     # override inherit Base's no-op and stay lazy (correct, just N+1).
+    # The JOINs written, and each one an `includes` implies because a condition names its association (Rails'
+    # `references_eager_loaded_tables?`), which preloading alone leaves out of the query.
+    def rendered_joins
+      return @joins if @includes.length == 0
+      out = copy_string_list(@joins)
+      # Not every name the SQL qualifies by: only a hash condition (`"name".`) or `references(:name)` joins in Rails.
+      named = @wheres.join(" ")
+      @references.each { |name| named = named + " \"" + name + "\"." }
+      copy_string_list(@model._eager_load_joins(@includes, named, @joins.join(" "))).each do |join|
+        out << join unless out.include?(join)
+      end
+      out
+    end
+
     def includes(*names)
       spawn.include_names!(names)
     end
@@ -1601,14 +1622,26 @@ module ActiveRecord
       spawn.include_names!(names)
     end
 
-    # `references(:assoc)` — Rails' marker that a string condition
-    # mentions an eager-loaded table. The preload machinery here decides
-    # what to load from `eager_load`/`includes` alone, so the marker
-    # carries no state; accept and ignore it so marker-bearing chains
-    # stay chainable (lobsters' filters page).
+    # Not ignored: a string condition on an included table joins it only once `references` names it, as in Rails.
     def references(*names)
-      names
-      unloaded_spawn
+      spawn.reference_names!(names)
+    end
+
+    def reference_names!(names)
+      own_lists
+      unload_records
+      names.each { |n| @references << n.to_s }
+      self
+    end
+
+    def reference_names
+      @references
+    end
+
+    # Rails' `references_values |= other.references_values`, for `or`, `and` and `merge`.
+    def merge_reference_names!(other)
+      other.reference_names.each { |n| @references << n unless @references.include?(n) }
+      nil
     end
 
     # `merge(other)` — fold another relation's WHEREs and ORDER BY in.
@@ -1624,6 +1657,7 @@ module ActiveRecord
         push_where(w)
         @opaque_wheres = true
       end
+      merge_reference_names!(other)
       merge_orders!(other)
       mark_null! if other.null_relation?
       @none = true if other.explicit_none?
@@ -2717,7 +2751,8 @@ module ActiveRecord
       return 0.0 if @null
       term = expr.is_a?(Symbol) ? aggregate_column(expr.to_s) : expr.to_s
       sql = "#{cte_prefix}SELECT COALESCE(SUM(#{term}), 0) AS n FROM #{from_source}"
-      sql = "#{sql} #{@joins.join(" ")}" if @joins.length > 0
+      joins = rendered_joins
+      sql = "#{sql} #{joins.join(" ")}" if joins.length > 0
       sql = "#{sql} WHERE #{@wheres.join(" AND ")}" if @wheres.length > 0
       rows = ActiveRecord.adapter.select_rows(sql)
       rows.length == 0 ? 0.0 : rows[0]["n"].to_f
@@ -3051,7 +3086,8 @@ module ActiveRecord
       return false if @null
       return true if n < 0
       sql = "#{cte_prefix}SELECT 1 AS one FROM #{from_source}"
-      sql = "#{sql} #{@joins.join(" ")}" if @joins.length > 0
+      joins = rendered_joins
+      sql = "#{sql} #{joins.join(" ")}" if joins.length > 0
       sql = "#{sql} WHERE #{@wheres.join(" AND ")}" if @wheres.length > 0
       sql = "#{sql} LIMIT 1 OFFSET #{n}"
       ActiveRecord.adapter.select_rows(sql).length > 0
@@ -3209,12 +3245,14 @@ module ActiveRecord
     # statement, not a subquery over every row.
     def scoped_write_where
       windowed = @orders.length > 0 || !@limit.nil? || !@offset.nil?
-      return "" if @wheres.length == 0 && @joins.length == 0 && !windowed
-      if @joins.length == 0 && !windowed
+      # Not `@joins` alone: an `includes` a condition or `references` names joins too, as a read renders it.
+      joined = rendered_joins.length > 0
+      return "" if @wheres.length == 0 && !joined && !windowed
+      if !joined && !windowed
         return " WHERE #{@wheres.join(" AND ")}"
       end
       primary_key = @model.primary_key
-      if windowed && @joins.length > 0
+      if windowed && joined
         inner = append_window(append_join_where("SELECT #{@model._columns_sql} FROM #{@table}"))
         return " WHERE #{primary_key} IN (SELECT #{primary_key} FROM (#{inner}) AS __rh_window)"
       end
@@ -3532,16 +3570,24 @@ module ActiveRecord
       raise RecordNotFound.new("Couldn't find #{@model.name} without an ID", @model.name, @model.primary_key) if id.nil?
       return find_ids(id) if id.is_a?(Array)
       key = @model._cast_primary_key(id)
-      prior_limit = @limit
-      own_lists
-      push_where("#{@table}.#{@model.primary_key} = #{bind_literal(key)}")
-      begin
-        @limit = 1
-        rows = load_records
-        record = rows.length == 0 ? nil : rows[0]
-      ensure
-        @limit = prior_limit
-        pop_where
+      # A PostgreSQL uuid key casts as `find_by` and `exists?` cast it
+      # (Rails' OID::Uuid, ActiveRecord::UuidCast): canonical, or "" for
+      # a value that is no uuid, which finds no row without a query.
+      uuid_key = uuid_query_column?(@model.primary_key.to_s)
+      key = ActiveRecord::UuidCast.cast_text(id) if uuid_key
+      record = nil
+      unless uuid_key && key == ""
+        prior_limit = @limit
+        own_lists
+        push_where("#{@table}.#{@model.primary_key} = #{bind_literal(key)}")
+        begin
+          @limit = 1
+          rows = load_records
+          record = rows.length == 0 ? nil : rows[0]
+        ensure
+          @limit = prior_limit
+          pop_where
+        end
       end
       if record.nil?
         raise RecordNotFound.new("Couldn't find #{@model.name} with '#{@model.primary_key}'=#{id.inspect}", @model.name, @model.primary_key, id)
@@ -3803,7 +3849,8 @@ module ActiveRecord
       distinct = @distinct ? "DISTINCT " : ""
       hints = @optimizer_hints.empty? ? "" : "/*+ #{@optimizer_hints} */ "
       sql = "#{cte_prefix}SELECT #{hints}#{distinct}#{cols} FROM #{from_source}"
-      sql = "#{sql} #{@joins.join(" ")}" if @joins.length > 0
+      joins = rendered_joins
+      sql = "#{sql} #{joins.join(" ")}" if joins.length > 0
       sql = "#{sql} WHERE #{@wheres.join(" AND ")}" if @wheres.length > 0
       sql = "#{sql} GROUP BY #{@groups.join(", ")}" if @groups.length > 0
       sql = "#{sql} HAVING #{@havings.join(" AND ")}" if @havings.length > 0
@@ -3840,7 +3887,8 @@ module ActiveRecord
     # JOIN + WHERE only — shared by count_sql / exists_sql so DISTINCT
     # and GROUP arms do not re-paste the ladder.
     def append_join_where(sql)
-      sql = "#{sql} #{@joins.join(" ")}" if @joins.length > 0
+      joins = rendered_joins
+      sql = "#{sql} #{joins.join(" ")}" if joins.length > 0
       sql = "#{sql} WHERE #{@wheres.join(" AND ")}" if @wheres.length > 0
       sql
     end
@@ -4042,6 +4090,12 @@ module ActiveRecord
         # static `v && v.id` narrowing was dropped in favor of this
         # runtime dispatch: hash values from untyped scope params can
         # be a record OR a collection, and only the runtime knows.
+        # On a uuid column the id casts as any other value there does; an
+        # unsaved record's is nil (`uuid_record_key`), which is `IS NULL`.
+        if uuid_query_column?(col)
+          key = uuid_record_key(val)
+          return key.nil? ? "#{qcol} IS NULL" : uuid_value_predicate(qcol, key)
+        end
         "#{qcol} = #{bind_literal(val._primary_key_value)}"
       elsif enum_column?(col)
         # An enum label held in a variable (the literal ones were cast
@@ -4050,10 +4104,75 @@ module ActiveRecord
         stored = @model._enum_where_value(col, val)
         stored.nil? ? "#{qcol} IS NULL" : "#{qcol} = #{bind_literal(stored)}"
       else
+        return uuid_value_predicate(qcol, val) if uuid_query_column?(col)
         limit = integer_query_limit(col)
         return integer_value_predicate(qcol, val, limit) if limit > 0
         "#{qcol} = #{bind_literal(column_bound_value(col, val))}"
       end
+    end
+
+    # ---- uuid query values --------------------------------------------
+    #
+    # A PostgreSQL uuid column casts its value as Rails' OID::Uuid does
+    # (ActiveRecord::UuidCast): a uuid in any form Rails accepts is
+    # bound canonical, and anything else is nil, `= NULL`, which matches
+    # no row and whose negation matches none either. As written, a blank
+    # or malformed String is a literal PostgreSQL rejects. The columns
+    # are the model's emitted `schema_uuid_query_columns`, PostgreSQL
+    # only: SQLite stores the column as text and Rails does not cast it.
+    def uuid_query_column?(col)
+      table_name = @model.table_name.to_s
+      prefix = "#{table_name}."
+      name = col.start_with?(prefix) ? col[prefix.length, col.length].to_s : col
+      return false if name.include?(".")
+      @model.schema_uuid_query_columns.include?(name.to_sym)
+    end
+
+    def uuid_value_predicate(qcol, val)
+      cast = ActiveRecord::UuidCast.cast_text(val)
+      cast.empty? ? "#{qcol} = NULL" : "#{qcol} = #{bind_literal(cast)}"
+    end
+
+    # Rails' ArrayHandler on a uuid column: nil is `IS NULL` and each
+    # Range its own arm; one other value is an Equality (`= NULL` when it
+    # is no uuid), and several a HomogeneousIn, which drops the values
+    # that are no uuid and writes `IN (NULL)` when none is left.
+    # A record's id under a uuid column. An unsaved record has none, which
+    # Rails writes `IS NULL` (alone or as an IN list's nil arm); its
+    # emitted id is "", which the cast would drop, so it reads as nil.
+    def uuid_record_key(record)
+      key = record._primary_key_value
+      record.new_record? && key.to_s.empty? ? nil : key
+    end
+
+    def uuid_list_predicate(qcol, vals)
+      scalars = []
+      ranges = []
+      has_nil = false
+      vals.each do |x|
+        if x.nil?
+          has_nil = true
+        elsif x.is_a?(Range)
+          ranges << range_predicate(qcol, x)
+        else
+          scalars << x
+        end
+      end
+      arms = []
+      if scalars.length == 1
+        arms << uuid_value_predicate(qcol, scalars[0])
+      elsif scalars.length > 1
+        kept = []
+        scalars.each do |x|
+          cast = ActiveRecord::UuidCast.cast_text(x)
+          kept << cast unless cast.empty?
+        end
+        arms << "#{qcol} IN (#{kept.empty? ? "NULL" : escape_list(kept)})"
+      end
+      arms << "#{qcol} IS NULL" if has_nil
+      ranges.each { |r| arms << r }
+      return arms[0] if arms.length == 1
+      "(#{arms.join(" OR ")})"
     end
 
     # ---- integer query values -----------------------------------------
@@ -4165,10 +4284,13 @@ module ActiveRecord
     # predicate (`1=0`): never `IN ()`. Pure — NullRelation is set by
     # `mark_null!` from `none` / lasting positive `where` only.
     def list_predicate(col, qcol, val)
-      ids = val.map { |x| x.is_a?(Base) ? x._primary_key_value : column_bound_value(col, x) }
+      uuid = uuid_query_column?(col)
+      ids = val.map { |x| x.is_a?(Base) ? (uuid ? uuid_record_key(x) : x._primary_key_value) : column_bound_value(col, x) }
       limit = integer_query_limit(col)
       if ids.empty?
         "1=0"
+      elsif uuid
+        uuid_list_predicate(qcol, ids)
       elsif limit > 0
         integer_list_predicate(qcol, ids, limit)
       elsif ids.any? { |x| x.nil? || x.is_a?(Range) }

@@ -203,8 +203,13 @@ pub(super) fn try_binary_operator(
             matches!(&*e.node, ExprNode::Lit { value: crate::expr::Literal::Str { .. } })
         };
         let is_nilable_str = |e: &Expr| {
+            // A local bound to a field or an array element holds the bare String the binding was declared with.
+            let declared = match &*e.node {
+                ExprNode::Var { name, .. } => super::super::local_var_ty(name.as_str()),
+                _ => None,
+            };
             matches!(
-                e.ty.as_ref(),
+                declared.as_ref().or(e.ty.as_ref()),
                 Some(crate::ty::Ty::Union { variants })
                     if variants.iter().any(|v| matches!(v, crate::ty::Ty::Nil))
                         && variants.iter().any(|v| matches!(v, crate::ty::Ty::Str))

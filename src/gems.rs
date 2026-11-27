@@ -130,7 +130,7 @@ pub(crate) fn compiler_runtime_gems() -> &'static [(Marker, &'static str)] {
     // (constant an emitted body names, gem that defines it). Only gems
     // whose absence is a RUNTIME error belong here — the list is the
     // façade's, not a survey of what an app might like.
-    const RUNTIME_GEMS: [(Marker, &str); 27] = [
+    const RUNTIME_GEMS: [(Marker, &str); 28] = [
         (Marker::Constant("Faye"), "faye-websocket"),
         (Marker::Constant("EventMachine"), "eventmachine"),
         (Marker::Constant("BCrypt"), "bcrypt"),
@@ -219,6 +219,8 @@ pub(crate) fn compiler_runtime_gems() -> &'static [(Marker, &'static str)] {
         // installed, which the app's own Gemfile (image_processing →
         // ruby-vips) already asked of the machine.
         (Marker::AnyText(&[VARIATION_MARKER]), "ruby-vips"),
+        // Not only the variant marker: an app's own `Vips::Image` (lobsters' StoryImage) needs the gem too.
+        (Marker::Constant("Vips"), "ruby-vips"),
         // The HTTP client an app calls. The real gem runs on this lane;
         // the strict targets refuse it (`lower::ruby_family_gems`). `Constant`
         // matches `Faraday.new` / `Faraday::…` / `rescue Faraday`; the
@@ -791,6 +793,7 @@ const FATES: &[(&str, GemFate)] = &[
     ("kaminari", GemFate::Modeled),    // Relation#page / per / paginate
     ("mail", GemFate::Modeled),        // catalog/gems: Mail::Address; ActionMailer
     ("mocha", GemFate::Modeled),       // lower/mocha bridge
+    ("multi_json", GemFate::Modeled), // ingest/multi_json + lower/oj: on the oj adapter, dump on ruby, jruby and spinel; load, other adapters and every other target refused
     ("nokogiri", GemFate::Modeled),    // catalog/gems: Nokogiri
     ("oj", GemFate::Modeled),          // ingest/oj + lower/oj: under Oj.mimic_JSON, load/generate on ruby, jruby and spinel; dump and every other target refused
     ("pagy", GemFate::Modeled),        // registry/controllers + analyze/body/pagy + runtime action_controller/pagy.rb: pagy(scope[, limit: n]) offset paginator, Pagy#series_nav/info_tag/readers (English); before 43, pagy9.rb: pagy/pagy_array(limit:, page:, items:), readers, series, vars[k], pagy_url_for, the overflow/array extras; other paginators/options/helpers refused
@@ -825,7 +828,6 @@ const FATES: &[(&str, GemFate)] = &[
     ("bundler-audit", GemFate::Infrastructure),
     ("capybara", GemFate::Infrastructure),
     ("climate_control", GemFate::Infrastructure),
-    ("connection_pool", GemFate::Infrastructure),
     ("database_consistency", GemFate::Infrastructure),
     ("debug", GemFate::Infrastructure),
     ("dockerfile-rails", GemFate::Infrastructure),
@@ -1019,6 +1021,10 @@ pub(crate) fn is_core_constant(written: &[&str]) -> bool {
 /// no such file is on its load path.
 pub(crate) fn is_framework_feature(feature: &str) -> bool {
     let root = feature.split('/').next().unwrap_or(feature);
+    // Not required as written: the runtime ports a Framework-fate `-rails` gem's engine (MC's importmap-rails); i18n is the real gem.
+    if feature == root && root.ends_with("-rails") && !compiler_tree_loads_gem(root) && FATES.iter().any(|(name, fate)| *name == root && *fate == GemFate::Framework) {
+        return true;
+    }
     matches!(
         root,
         "rails" | "railties" | "active_support" | "activesupport" | "active_record" | "activerecord" | "arel"
@@ -1160,18 +1166,19 @@ pub fn namespace_of(gem: &str) -> String {
 /// once the emitted program names that gem's namespace.
 ///
 /// A normal gem's entry file is `lib/<gem>.rb`, and the constant lowercases
-/// to that name (`duckdb` → `DuckDB`). The same file exists for three
-/// irregular constants: `caxlsx` (`lib/caxlsx.rb`), `polars-df`
-/// (`lib/polars-df.rb`), and `ruby_llm` (`lib/ruby_llm.rb`). Requiring the
-/// lowercased constant (`axlsx`, `polars`, `rubyllm`) is not that entry.
+/// to that name, its underscores aside (`duckdb` → `DuckDB`, `message_bus`
+/// → `MessageBus`, `ruby_llm` → `RubyLLM`): Bundler requires the gem by
+/// that name. The same file exists for two irregular constants: `caxlsx`
+/// (`lib/caxlsx.rb`) and `polars-df` (`lib/polars-df.rb`). Requiring the
+/// lowercased constant (`axlsx`, `polars`) is not that entry.
 ///
 /// `rubyzip` is not in this set. `require "rubyzip"` is not a file; the gem
 /// loads as `zip`.
 pub fn loads_by_gem_name(gem: &str) -> bool {
-    if namespace_of(gem).eq_ignore_ascii_case(gem) {
+    if namespace_of(gem).eq_ignore_ascii_case(&gem.replace('_', "")) {
         return true;
     }
-    matches!(gem, "caxlsx" | "polars-df" | "ruby_llm")
+    matches!(gem, "caxlsx" | "polars-df")
 }
 
 /// The top-level constants a gem might define, best guess first: the
@@ -1577,6 +1584,8 @@ enum Owner<'a> {
 struct Refuser<'a> {
     app: &'a crate::App,
     target: Option<&'a str>,
+    /// Whether a `rails_dependent` row inferred from the lockfile owns a path.
+    inferred: bool,
     app_owned: AppConstants,
     owners: std::cell::RefCell<crate::det::HashMap<String, Owner<'a>>>,
 }
@@ -1588,6 +1597,7 @@ impl<'a> Refuser<'a> {
         }
         let app = self.app;
         let owner = if let Some(row) = app.extensions.rails_dependent.iter()
+            .filter(|row| self.inferred || !row.inferred)
             .find(|row| extension_owns_constant(app, &self.app_owned, &row.gem, path))
         {
             Owner::RailsDependent(row)
@@ -1607,6 +1617,19 @@ impl<'a> Refuser<'a> {
 /// Extension-owned constants need both their declared type and a runtime.
 /// `None` checks source analysis; a target also checks native availability.
 pub(crate) fn extension_gem_refusals(app: &crate::App, target: Option<&str>) -> Vec<crate::diagnostic::Diagnostic> {
+    gem_refusals(app, target, true)
+}
+
+/// The [`extension_gem_refusals`] that refuse a whole target: not a
+/// `rails_dependent` row inferred from the lockfile (a gem that depends on
+/// railties), whose references analysis reports as errors that
+/// `--allow-unsupported` downgrades, but a row a project extension writes
+/// and a target's native-gem refusals (#2280).
+pub(crate) fn extension_gem_boundary_refusals(app: &crate::App, target: &str) -> Vec<crate::diagnostic::Diagnostic> {
+    gem_refusals(app, Some(target), false)
+}
+
+fn gem_refusals(app: &crate::App, target: Option<&str>, inferred: bool) -> Vec<crate::diagnostic::Diagnostic> {
     use crate::diagnostic::Diagnostic;
     use crate::expr::{Expr, ExprNode};
     use crate::span::Span;
@@ -1658,7 +1681,7 @@ pub(crate) fn extension_gem_refusals(app: &crate::App, target: Option<&str>) -> 
         }
         expr.node.for_each_child(&mut |child| visit(child, refuser, defined, out));
     }
-    let refuser = Refuser { app, target, app_owned: AppConstants::of(app), owners: Default::default() };
+    let refuser = Refuser { app, target, inferred, app_owned: AppConstants::of(app), owners: Default::default() };
     let mut out = Vec::new();
     let resolver = app.const_resolver.for_sources(&app.sources);
     let defined = |span, path: &[crate::ident::Symbol]| resolver.has_definition(span, path);
@@ -1935,6 +1958,24 @@ mod tests {
         let stubs = stub_facade_namespaces();
         assert!(stubs.contains("ROTP"), "{stubs:?}");
         assert!(!stubs.contains("WebPush"), "{stubs:?}");
+    }
+
+    /// mission_control-jobs' engine requires importmap-rails, turbo-rails and stimulus-rails, which the runtime ports;
+    /// a gem the app ships stays a require.
+    #[test]
+    fn a_framework_fate_gem_is_a_framework_feature() {
+        for feature in ["importmap-rails", "turbo-rails", "stimulus-rails", "rails/engine"] {
+            assert!(is_framework_feature(feature), "{feature}");
+        }
+        assert!(!is_framework_feature("rotp"));
+        assert!(!is_framework_feature("i18n/backend/simple"));
+        assert!(!is_framework_feature("i18n"));
+    }
+
+    /// lobsters' own `Vips::Image` needs ruby-vips loaded, not only an Active Storage variant.
+    #[test]
+    fn an_app_s_vips_constant_needs_ruby_vips() {
+        assert!(compiler_runtime_gems().iter().any(|(marker, gem)| *gem == "ruby-vips" && matches!(marker, Marker::Constant("Vips"))));
     }
 
     #[test]
@@ -2260,6 +2301,7 @@ end
             "rubyzip has no rubyzip.rb entry; boot must not require that name:\n{boot}"
         );
         assert!(loads_by_gem_name("duckdb") && loads_by_gem_name("mcp"));
+        assert!(loads_by_gem_name("message_bus") && loads_by_gem_name("ruby_llm"));
         assert!(!loads_by_gem_name("rubyzip"));
     }
 

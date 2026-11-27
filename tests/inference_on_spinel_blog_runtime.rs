@@ -693,7 +693,39 @@ fn untyped_subexpressions_baseline() {
     // `Db` results read as untyped on this RBS-less probe, as `Db.exec` did.
     // MEASURED 1464 on merging main 7d9513597 (1451) with the row locking's
     // +13 (1446 less main 1a54a7397's 1433), which add up.
-    const CEILING: usize = 1464;
+    // MEASURED 1465 on a fixpoint entry answering what it did not know (1464):
+    // `version_recorded?`'s `version` parameter in
+    // active_record/migration_runner.rb moves between two spellings of untyped (`Var`
+    // and `Untyped`) as its callers' rows settle, a move the fixpoint no
+    // longer counts toward a pin, so it stays unresolved on this RBS-less
+    // probe (+1); migration_runner.rbs types it for the RBS-paired gate.
+    // MEASURED 1452 on PostgreSQL uuid casts (1451): a record's id under a
+    // uuid column is read on its own arm, `uuid_value_predicate(qcol,
+    // val._primary_key_value)`, as the bound arm already reads it. That is
+    // one more `_primary_key_value` send this RBS-less probe leaves
+    // unresolved (+1 in active_record/relation.rb). base.rbs types it
+    // `Integer` for the RBS-paired gate.
+    // MEASURED 1465 on merging main 81b6491fc (1464) with the uuid casts'
+    // +1 (1452 less 1451), which add up.
+    // MEASURED 1467 on an unsaved record under a uuid column (1465): the
+    // record arm reads `new_record?` and the key's `to_s` before casting
+    // (+2 in active_record/relation.rb), so an unsaved record is
+    // `IS NULL` as in Rails.
+    // MEASURED 1470 on an unsaved record in a uuid IN list (1467): the
+    // list's untyped elements reach `uuid_record_key` (+3 in
+    // active_record/relation.rb), so the record is the list's nil arm.
+    // MEASURED 1471 on merging main 2d9d16d0c (1465) with the uuid casts'
+    // +6 (1470 less 1464), which add up.
+    // MEASURED 1474 on the connection handler (1471):
+    // `ConnectionHandler#clear_active_connections!` asks
+    // `Db.connection_slot(true) == -2` and `Db.query_cache_enabled?`
+    // (+3 in active_record/connection.rb), which read as untyped on this
+    // RBS-less probe, as the other `Db` results do.
+    // MEASURED 1482 on carrying `references` through `or!`, `and!` and
+    // `merge!` (1473): each hands its untyped `other` to
+    // `merge_reference_names!`, whose body reads that `other`, as the rest
+    // of those methods already do (+9 in active_record/relation.rb).
+    const CEILING: usize = 1482;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \

@@ -1616,6 +1616,22 @@ impl<'a> BodyTyper<'a> {
                 return self.dispatch(Some(&as_hash), method, block_ret, args);
             }
         }
+        // An app class under a core collection (discourse's `class Enum < Hash`): what its own chain does not define is
+        // the core class's, over values the analysis does not follow.
+        // Not the class object's own calls (`Ordinal.name`), nor a method answering the receiver itself, which keeps its
+        // class (`freeze`, `tap`).
+        if let Some(Ty::Class { id, .. }) = recv_ty
+            && instance_receiver
+            && !matches!(method.as_str(), "freeze" | "itself" | "tap" | "dup" | "clone")
+            && let Some(core) = self.core_ancestor(id, method)
+        {
+            let as_core = match core {
+                "Hash" => Ty::Hash { key: std::sync::Arc::new(Ty::Untyped), value: std::sync::Arc::new(Ty::Untyped) },
+                "Array" => Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) },
+                _ => Ty::Str,
+            };
+            return self.dispatch(Some(&as_core), method, block_ret, args);
+        }
         // What `errors` does not answer itself it delegates to its Array of `ActiveModel::Error`, as Rails' Enumerable does.
         if let Some(Ty::Class { id, .. }) = recv_ty {
             if id.0.as_str() == "ActiveModel::Errors"
@@ -2237,6 +2253,17 @@ impl<'a> BodyTyper<'a> {
                 if id.0.as_str() == "BigDecimal" {
                     return bigdecimal_method(method, call_args).unwrap_or_else(unknown);
                 }
+                // OpenStruct answers any name it does not define through
+                // `method_missing`: a member read (nil when unset) or write.
+                // An instance's member may be named like a class method (`OpenStruct.new(new: "x").new`).
+                if id.0.as_str() == "OpenStruct"
+                    && !self.classes().get(id).is_some_and(|c| {
+                        c.instance_methods.contains_key(method)
+                            || (!instance_receiver && c.class_methods.contains_key(method))
+                    })
+                {
+                    return Ty::Untyped;
+                }
                 if id.0.as_str() == crate::analyze::indifferent::CLASS {
                     // Not `instance_receiver`: the bare `HashWithIndifferentAccess` alias is not marked a resolved class reference.
                     let answer = if let Some(value) = args.first().cloned() {
@@ -2491,6 +2518,13 @@ impl<'a> BodyTyper<'a> {
                 // through hash_method / array_method instead of falling
                 // back to the (no-op) class-method table. Element types
                 // start as Var; usage narrows them via flow-typing.
+                // A module has no `new`: `Module#new` is Class's alone. Only one the source defines nothing on: an app's module
+                // can answer the call itself (a `self.public_send` its literal-name dispatch reaches).
+                if method.as_str() == "new"
+                    && self.classes().get(id).is_some_and(|c| c.is_module && c.source_class_methods.is_empty() && c.source_instance_methods.is_empty())
+                {
+                    return unknown();
+                }
                 if method.as_str() == "new" {
                     match id.0.as_str() {
                         "Hash" => {
@@ -4033,7 +4067,7 @@ pub(super) fn array_method(method: &Symbol, elem: &Ty, block_ret: Option<&Ty>) -
                 value: std::sync::Arc::new(unknown()),
             },
         },
-        "to_a" => Ty::Array { elem: std::sync::Arc::new(elem.clone()) },
+        "to_a" | "to_ary" => Ty::Array { elem: std::sync::Arc::new(elem.clone()) },
         "join" => Ty::Str,
         // `[0, 0, 0].pack("CCC")` — binary packing (lobsters'
         // confidence_order byte strings).
@@ -4182,9 +4216,18 @@ pub(super) fn hash_method(
             },
             _ => Ty::Hash { key: std::sync::Arc::new(key.clone()), value: std::sync::Arc::new(value.clone()) },
         },
-        // The supported Rails subset is the non-mutating, one-argument,
-        // no-block form. Keep block conflicts and `deep_merge!` unresolved
-        // rather than claiming semantics the shared runtime does not provide.
+        // The supported Rails subset is the one-argument, no-block form. The
+        // mutating one answers the receiver, whose type it cannot widen: an
+        // argument whose keys or values the receiver's type does not already
+        // hold stays unresolved (refused in `analyze::body`).
+        "deep_merge!" if args.len() == 1 && block_ret.is_none() => match args[0].ty.as_ref() {
+            Some(Ty::Hash { key: other_key, value: other_value })
+                if union_of(key.clone(), (**other_key).clone()) == *key && union_of(value.clone(), (**other_value).clone()) == *value =>
+            {
+                Ty::Hash { key: std::sync::Arc::new(key.clone()), value: std::sync::Arc::new(value.clone()) }
+            }
+            _ => unknown(),
+        },
         "deep_merge" if args.len() == 1 && block_ret.is_none() => {
             match args[0].ty.as_ref() {
                 Some(Ty::Hash {
@@ -4469,7 +4512,7 @@ pub(super) fn str_method(method: &Symbol) -> Ty {
         // Operators. `+` concats; `<<` mutates in place but still returns self.
         // `*` is repetition ("a" * 3); `%` is sprintf (returns Str). Comparisons
         // uniformly return Bool.
-        "+" | "<<" | "*" | "%" | "concat" => Ty::Str,
+        "+" | "<<" | "*" | "%" | "concat" | "prepend" => Ty::Str,
         "==" | "!=" | "<" | ">" | "<=" | ">=" | "<=>" | "eql?" | "equal?" => Ty::Bool,
         // ActiveSupport String extensions. Pluralization/inflection
         // methods all return Str; comparison-style return Bool. Match

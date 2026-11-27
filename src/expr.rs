@@ -21,6 +21,15 @@ use crate::ty::Ty;
 /// The source reference names a modeled class or module. The Ruby emitter
 /// uses its resolved `Ty::Class` when it changes lexical nesting.
 pub const RESOLVED_CLASS_REF: u64 = 1 << 2;
+/// An empty `{}` / `[]` seed whose type a later write in its body refined and stamped back: the next analysis of
+/// the body starts it from that stamp less its unknown arms, which an earlier round's untyped ivars left there.
+pub const REFINED_EMPTY_SEED: u64 = 1 << 45;
+/// A receiverless call the source wrote with empty parentheses (`h()`): the Ruby emit keeps them, as bare the name
+/// reads a local of the same name. A synthesized call's `parenthesized` is a default and says nothing.
+pub const WRITTEN_EMPTY_PARENS: u64 = 1 << 46;
+/// An `include M` written in a Concern's `class_methods do … end`: Ruby's ClassMethods includes M, so M's methods are
+/// the includer's class methods (`ingest::app::class_methods_includes` copies them onto the Concern's class side).
+pub const CLASS_METHODS_INCLUDE: u64 = 1 << 47;
 /// The value is a proven class/module object, rather than a nominal instance.
 pub const CLASS_OBJECT_VALUE: u64 = 1 << 5;
 /// The receiver of `base.extend(M)` in a module's `extended(base)` hook: the class Ruby hands the hook, so the
@@ -237,6 +246,12 @@ pub const NILABLE_OPERATOR_RECEIVER: u64 = 1 << 43;
 pub const COERCED_OPERAND: u64 = 1 << 44;
 /// On `x ||= v` where analyze typed the local `x` as never nil nor false: Ruby never assigns, so `v` is dead.
 pub const DEAD_OR_ASSIGN: u64 = 1 << 58;
+/// A class-body `include M` / `prepend M` standing for a file's top-level `X.include(M)` / `X.prepend(M)`: the
+/// opening of `X` it sits in waits for `X`'s declaration to give it its kind (`ingest::top_level_mixins`).
+pub const TOP_LEVEL_MIXIN: u64 = 1 << 62;
+/// A read of a platform's own constant (`Socket::SOL_TCP`) in a load-time branch its `Socket.const_defined?` guards:
+/// it runs only where the platform defines it (`ingest::platform_guards`).
+pub const PLATFORM_GUARDED_CONST: u64 = 1 << 63;
 
 /// On a route-helper call `lower::route_format_suffix` renamed for its
 /// literal `format:` (`widget_url(w, format: :json)` to

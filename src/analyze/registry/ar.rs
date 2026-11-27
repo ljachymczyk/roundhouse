@@ -32,7 +32,14 @@ pub(in crate::analyze) fn transaction_ty() -> Ty {
 fn register_connection_surface(classes: &mut HashMap<ClassId, ClassInfo>) {
     const RBS: &str = include_str!("../../../runtime/ruby/active_record/connection.rbs");
     let Ok(parsed) = crate::rbs::parse_app_signatures(RBS) else { return };
-    for name in ["ActiveRecord::Connection", "ActiveRecord::Result", "ActiveRecord::Transaction", "ActiveRecord::SchemaCache", "ActiveRecord::Column"] {
+    for name in [
+        "ActiveRecord::Connection",
+        "ActiveRecord::Result",
+        "ActiveRecord::Transaction",
+        "ActiveRecord::SchemaCache",
+        "ActiveRecord::Column",
+        "ActiveRecord::ConnectionAdapters::ConnectionHandler",
+    ] {
         let id = ClassId(Symbol::from(name));
         let Some(methods) = parsed.get(&id) else { continue };
         let cls = classes.entry(id).or_default();
@@ -166,6 +173,14 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         base.class_methods
             .entry(Symbol::from("connection"))
             .or_insert_with(connection_ty);
+        // runtime/ruby/active_record/connection.rb's: the handle, and the block's value with one held for it.
+        base.class_methods.entry(Symbol::from("lease_connection")).or_insert_with(connection_ty);
+        // The handler, for the one call a request's end makes of it (`clear_active_connections!`).
+        base.class_methods.entry(Symbol::from("connection_handler")).or_insert(Ty::Class {
+            id: ClassId(Symbol::from("ActiveRecord::ConnectionAdapters::ConnectionHandler")),
+            args: vec![].into(),
+        });
+        base.class_methods.entry(Symbol::from("with_connection")).or_insert(Ty::Untyped);
         base.class_methods.entry(Symbol::from("configurations")).or_insert(Ty::Untyped);
         base.class_methods.entry(Symbol::from("configurations=")).or_insert(Ty::Untyped);
         for m in ["sanitize_sql", "sanitize_sql_array", "sanitize_sql_for_order", "sanitize_sql_like"] {
@@ -607,6 +622,27 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         storage.class_methods.insert(Symbol::from("content_type_for_filename"), Ty::Str);
         storage.class_methods.insert(Symbol::from("url_filename"), Ty::Str);
         classes.insert(ClassId(Symbol::from("ActiveStorage")), storage);
+
+        // `ActiveStorage::Current` — `runtime/ruby/active_storage.rbs`
+        // verbatim (url_options / setter / set / base_url).
+        let url_options_hash = Ty::Hash {
+            key: std::sync::Arc::new(Ty::Sym),
+            value: std::sync::Arc::new(Ty::Untyped),
+        };
+        let nilable_url_options = nilable(url_options_hash);
+        let mut current = ClassInfo::default();
+        current
+            .class_methods
+            .insert(Symbol::from("url_options"), nilable_url_options.clone());
+        current
+            .class_methods
+            .insert(Symbol::from("url_options="), nilable_url_options);
+        current.class_methods.insert(
+            Symbol::from("set"),
+            super::block_fn(&Ty::Untyped, Ty::Untyped),
+        );
+        current.class_methods.insert(Symbol::from("base_url"), Ty::Str);
+        classes.insert(ClassId(Symbol::from("ActiveStorage::Current")), current);
     }
 
     // Arel — the low-level SQL AST that advanced scopes reach for

@@ -120,6 +120,18 @@ pub(super) fn conditional_definition<'pr>(node: &Node<'pr>) -> Option<(bool, Vec
     (defines && only_defs).then_some((negated, arms))
 }
 
+/// A [`conditional_definition`] whose branches only load: each statement an
+/// `include` of a constant, a `require` of a string, or a nested conditional
+/// of the same kind (#2282). It defines nothing itself.
+pub(super) fn load_only_conditional<'pr>(node: &Node<'pr>) -> Option<(bool, Vec<(Option<Node<'pr>>, Vec<Node<'pr>>)>)> {
+    let (negated, arms) = conditional_definition(node)?;
+    let loads = |stmt: &Node<'_>| {
+        branch_load(stmt).is_some_and(|call| matches!(constant_id_str(&call.name()), "include" | "require"))
+            || load_only_conditional(stmt).is_some()
+    };
+    arms.iter().all(|(_, stmts)| stmts.iter().all(loads)).then_some((negated, arms))
+}
+
 /// A class-body `if` / `unless` whose branches define a method but hold
 /// a statement [`conditional_definition`] does not admit: that statement,
 /// and why it keeps the conditional refused.
@@ -405,9 +417,36 @@ fn statement_has_unmodeled_call(stmt: &Node<'_>) -> bool {
         if !targets_includer {
             return false;
         }
-        return !TRACKED_DECLARATIONS.contains(&constant_id_str(&call.name()));
+        return !TRACKED_DECLARATIONS.contains(&constant_id_str(&call.name())) && class_side_attribute_names(&call).is_none();
     }
     branch_has_unmodeled_call(stmt)
+}
+
+/// `class_attribute :a, :b, instance_accessor: false, instance_predicate: false`: the names, whose only methods are
+/// the class side's public `a`, `a=` and `a?`. Not one with an instance accessor or predicate, whose visibility a
+/// bare marker before it may or may not reach.
+fn class_side_attribute_names(call: &ruby_prism::CallNode<'_>) -> Option<Vec<String>> {
+    if constant_id_str(&call.name()) != "class_attribute" || call.block().is_some() {
+        return None;
+    }
+    let mut names = Vec::new();
+    let (mut accessor_off, mut predicate_off) = (false, false);
+    for arg in call.arguments()?.arguments().iter() {
+        if let Some(options) = arg.as_keyword_hash_node() {
+            for element in options.elements().iter() {
+                let pair = element.as_assoc_node()?;
+                match symbol_or_string_value(&pair.key())?.as_str() {
+                    "instance_accessor" => accessor_off = pair.value().as_false_node().is_some(),
+                    "instance_predicate" => predicate_off = pair.value().as_false_node().is_some(),
+                    "default" => {}
+                    _ => return None,
+                }
+            }
+            continue;
+        }
+        names.push(symbol_or_string_value(&arg)?);
+    }
+    (accessor_off && predicate_off && !names.is_empty()).then_some(names)
 }
 
 /// Descend into an `if`/`unless` node's branches (both arms, and an
@@ -969,6 +1008,7 @@ impl Visibility {
         struct Declarations {
             invalid: bool,
             reject_defs: bool,
+            in_block: usize,
         }
         impl<'pr> ruby_prism::Visit<'pr> for Declarations {
             fn visit_branch_node_enter(&mut self, node: Node<'pr>) {
@@ -998,13 +1038,19 @@ impl Visibility {
                             .and_then(|clause| clause.statements())
                             .is_some_and(|s| body_has_marker(Some(s.as_node())))
                 } else {
-                    node.as_call_node().is_some_and(|c| c.receiver().is_none() && marker(&c))
+                    node.as_call_node().is_some_and(|c| c.receiver().is_none() && marker(&c) && (self.in_block == 0 || c.arguments().is_some()))
                 };
             }
             fn visit_def_node(&mut self, _node: &ruby_prism::DefNode<'pr>) {
                 // DSL blocks (e.g. has_many extensions) own their defs, not
                 // the enclosing class. Never inspect ordinary def bodies.
                 self.invalid |= self.reject_defs;
+            }
+            // Not a named marker (`with_options do protected :x= end` sets the class's `x=`): a bare one in a call's block sets the visibility of the block's own `def`s only, which whoever reads that block models or refuses.
+            fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+                self.in_block += !self.reject_defs as usize;
+                ruby_prism::visit_block_node(self, node);
+                self.in_block -= !self.reject_defs as usize;
             }
         }
         // A def inside a call's block belongs to that block's owner, not
@@ -1019,6 +1065,7 @@ impl Visibility {
         let mut declarations = Declarations {
             invalid: false,
             reject_defs: !owns_defs,
+            in_block: 0,
         };
         ruby_prism::Visit::visit(&mut declarations, node);
         if declarations.invalid {
@@ -1322,6 +1369,13 @@ impl Visibility {
                     self.walk_included(block.body(), file)?;
                 } else {
                     Self::reject_dynamic_declarations(node, file)?;
+                }
+            } else if let Some(attributes) = class_side_attribute_names(&call) {
+                // Rails defines them on the singleton class, public whatever marker stands before.
+                for attr in attributes {
+                    for method in [attr.clone(), format!("{attr}="), format!("{attr}?")] {
+                        self.define(offset, method, true, MethodVisibility::Public, file)?;
+                    }
                 }
             } else if matches!(name, "attr_reader" | "attr_writer" | "attr_accessor") {
                 if let Some(args) = call.arguments() {

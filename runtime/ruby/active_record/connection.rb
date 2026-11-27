@@ -148,6 +148,43 @@ module ActiveRecord
     end
   end
 
+  # PostgreSQL's uuid type as Rails casts a value bound to it
+  # (OID::Uuid#cast_value): the value's text when it matches
+  # ACCEPTABLE_UUID, `\A(\{)?([a-fA-F0-9]{4}-?){8}(?(1)\}|)\z`, in
+  # canonical form (lowercase 8-4-4-4-12), and nil otherwise, which
+  # Rails binds as NULL. Sent as written, PostgreSQL rejects a blank or
+  # malformed literal (`invalid input syntax for type uuid`). The answer
+  # is "" for no uuid, so it stays a String: a real one is never blank.
+  class UuidCast
+    def self.cast_text(value)
+      text = value.to_s
+      i = 0
+      stop = text.length
+      if text[0, 1].to_s == "{"
+        return "" unless stop >= 2 && text[stop - 1, 1].to_s == "}"
+        i = 1
+        stop -= 1
+      end
+      hex = +""
+      groups = 0
+      while groups < 8
+        return "" if i + 4 > stop
+        k = 0
+        while k < 4
+          char = text[i + k, 1].to_s.downcase
+          return "" unless "0123456789abcdef".include?(char)
+          hex << char
+          k += 1
+        end
+        i += 4
+        i += 1 if i < stop && text[i, 1].to_s == "-"
+        groups += 1
+      end
+      return "" unless i == stop
+      "#{hex[0, 8]}-#{hex[8, 4]}-#{hex[12, 4]}-#{hex[16, 4]}-#{hex[20, 12]}"
+    end
+  end
+
   # The edges of `Model.transaction`, for work that has to wait for the
   # COMMIT. No-ops here, so this file stays self-contained; the
   # Ruby-family job registry (runtime/job_registry.rb) redefines them to
@@ -687,6 +724,13 @@ module ActiveRecord
       {}
     end
 
+    # The PostgreSQL uuid columns whose query values cast as Rails' uuid
+    # type does (Relation#uuid_query_column?). Schema-generated models on
+    # PostgreSQL list theirs.
+    def self.schema_uuid_query_columns
+      []
+    end
+
     def self.schema_json_coder_columns
       []
     end
@@ -796,11 +840,18 @@ module ActiveRecord
       connection
     end
 
+    # Rails' `connection_handler`, for the call a request's end makes of it (message_bus's `close_db_connection!`).
+    def self.connection_handler
+      ActiveRecord::ConnectionAdapters::ConnectionHandler.shared
+    end
+
     # Rails' `with_connection` holds one connection for its block: the
     # handle's slot, leased once, so each statement through it is on that
     # connection (a raw BEGIN carries to the next one). The block's value
     # is bound before the slot is left, so the Spinel binary keeps it.
-    def self.with_connection
+    # `prevent_permanent_checkout:` is taken and not read: it keeps a connection a block leases from staying the
+    # thread's after it, and this runtime's handle holds one slot only for the block.
+    def self.with_connection(prevent_permanent_checkout: false)
       handle = connection
       handle._hold_slot
       result = nil
@@ -3000,6 +3051,28 @@ module ActiveRecord
     def cache_key_with_version
       version = cache_version
       version.nil? ? cache_key : "#{cache_key}-#{version}"
+    end
+  end
+end
+
+module ActiveRecord
+  module ConnectionAdapters
+    # Rails' connection handler, with the one call a request's end makes of it. This runtime leases a connection only
+    # for a request or a `with_connection` block and gives it back itself, so there is none to return here; the query
+    # cache goes off for the rest of the request, as each pool's `disable_query_cache!` turns it off in Rails.
+    class ConnectionHandler
+      def self.shared
+        @shared ||= ConnectionHandler.new
+      end
+
+      # nil, not the pools Rails' `each` hands back: this runtime has no pool objects to answer with.
+      def clear_active_connections!(role = nil)
+        # Not before the databases open (`connection_slot` -2): the Spinel Db keeps its replay cache on a connection,
+        # which it has none of yet; the CRuby one keeps it on the fiber, which this turns off with or without a lease.
+        return nil if Db.connection_slot(true) == -2
+        Db.query_cache_end if Db.query_cache_enabled?
+        nil
+      end
     end
   end
 end

@@ -132,6 +132,7 @@ fn tiny_blog_round_trips() {
         }],
         layout: Default::default(),
         sibling_classes: Vec::new(),
+        csp_header: false,
     };
 
     let routes = RouteTable {
@@ -148,6 +149,7 @@ fn tiny_blog_round_trips() {
         direct_helpers: vec![],
         redirects: vec![],
         diagnostics: vec![],
+        url_protocols: vec![],
     };
 
     let app = App {
@@ -184,6 +186,7 @@ fn tiny_blog_round_trips() {
         databases: Vec::new(),
         model_databases: Default::default(),
         database_refusals: Vec::new(),
+        current_attribute_refusals: Vec::new(),
         database_routes: None,
         ingest_drops: Vec::new(),
         library_class_files: Vec::new(),
@@ -232,6 +235,7 @@ fn tiny_blog_round_trips() {
         unknown_association_targets: Vec::new(),
         helper_modules: Default::default(),
         job_plans: Vec::new(),
+        native_plans: Vec::new(),
         queue_adapter: None,
         sidekiq_redis: Default::default(),
         sidekiq_worker: Default::default(),

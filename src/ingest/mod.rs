@@ -43,6 +43,7 @@ pub(crate) use concern_accessors::{library_classes_by_name, unconsumed_class_sid
 mod dry_initializer;
 mod dry_struct;
 mod dry_types;
+mod multi_json;
 mod oj;
 pub(crate) mod source_gems;
 mod auto_source_gems;
@@ -60,6 +61,8 @@ mod dry_monads;
 mod dry_validation;
 mod representable;
 mod active_model_serializer;
+mod active_model_serializer_08;
+mod class_arg_specialize;
 mod action_cable_config;
 mod recurring_commands;
 mod session_config;
@@ -77,6 +80,9 @@ mod boot_program;
 mod engine_config;
 mod engine_helpers;
 mod interpolated_renders;
+mod controller_csp;
+mod simple_format_sanitize;
+mod render_layout_choice;
 mod container_specialize;
 mod controller_class_methods;
 mod controller_delegates;
@@ -105,6 +111,8 @@ pub mod invisible_captcha;
 pub mod generated_helpers;
 pub mod jbuilder;
 pub mod library_class;
+mod top_level_mixins;
+mod platform_guards;
 mod file_program;
 pub(crate) use file_program::{normalize_source, resolve_gem_require};
 pub(crate) fn source_gems_mount() -> &'static str {
@@ -137,6 +145,7 @@ mod configured_superclass;
 mod gem_hooks;
 pub(crate) use gem_hooks::method_missing_readers;
 mod gem_routes;
+mod gem_shadowed_files;
 mod column_accessors;
 mod model_macros;
 mod referenced_carriers;
@@ -264,6 +273,7 @@ pub(crate) fn rails_application_class() -> crate::dialect::LibraryClass {
         parent_span: Default::default(),
         includes: Vec::new(),
         include_spans: Vec::new(),
+        include_statements: Vec::new(),
         methods: Vec::new(),
         nullable_columns: Vec::new(),
         origin: None,
