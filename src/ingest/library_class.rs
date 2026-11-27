@@ -4698,7 +4698,9 @@ fn walk_decl_body_with_visibility<'pr>(
                                     // Nor read off its value where the body changes it (`PROPERTIES.replace(…)`).
                                     let held = splat.expression().and_then(|e| e.as_constant_read_node()).and_then(|c| {
                                         let name = constant_id_str(&c.name()).to_string();
-                                        if out.unknown_calls.iter().any(|e| calls_on_constant(e, &name)) {
+                                        if out.unknown_calls.iter().any(|e| calls_on_constant(e, &name))
+                                            || out.methods.iter().any(|m| mutates_constant(&m.body, &name))
+                                        {
                                             return None;
                                         }
                                         out.constants.iter().rev().find(|(n, _)| n.as_str() == name).and_then(|(_, v)| literal_symbols(v))
@@ -9106,15 +9108,32 @@ fn literal_symbols(e: &Expr) -> Option<Vec<Symbol>> {
     }
 }
 
-/// Does `e` call a method on the constant `name` (a class body's `PROPERTIES.replace(…)`)?
+/// Does `e` call a method on the body's own constant `name`, unqualified (a class body's `PROPERTIES.replace(…)`;
+/// not `Other::PROPERTIES`)?
 fn calls_on_constant(e: &Expr, name: &str) -> bool {
     if let ExprNode::Send { recv: Some(r), .. } = &*e.node
         && let ExprNode::Const { path } = &*r.node
-        && path.last().is_some_and(|p| p.as_str() == name)
+        && path.len() == 1
+        && path[0].as_str() == name
     {
         return true;
     }
     let mut found = false;
     e.node.for_each_child(&mut |child| found = found || calls_on_constant(child, name));
+    found
+}
+
+/// Does a method body call one that changes the constant `name` on it (`PROPERTIES.replace(…)` in a `configure` the
+/// body may run before the `attr_reader`)?
+fn mutates_constant(e: &Expr, name: &str) -> bool {
+    if let ExprNode::Send { recv: Some(r), method, .. } = &*e.node
+        && let ExprNode::Const { path } = &*r.node
+        && path.last().is_some_and(|p| p.as_str() == name)
+        && (method.as_str().ends_with('!') || matches!(method.as_str(), "<<" | "push" | "append" | "concat" | "replace" | "unshift" | "prepend" | "insert" | "clear" | "delete" | "delete_at" | "delete_if" | "keep_if" | "pop" | "shift" | "fill" | "[]="))
+    {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |child| found = found || mutates_constant(child, name));
     found
 }

@@ -12507,7 +12507,9 @@ fn walk_load_time_callee_paths(
     if depth == 0 {
         return;
     }
-    if let ExprNode::Send { recv, method, .. } = &*e.node {
+    if let ExprNode::Send { recv, method, args, .. } = &*e.node {
+        let given = args.iter().filter(|a| !matches!(&*a.node, ExprNode::Hash { .. } | ExprNode::Splat { .. })).count();
+        let splat = args.iter().any(|a| matches!(&*a.node, ExprNode::Splat { .. }));
         let target: Option<(&LibraryClass, MethodReceiver)> = match recv.as_ref().map(|r| &*r.node) {
             Some(ExprNode::Const { path }) => {
                 let name = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
@@ -12528,7 +12530,7 @@ fn walk_load_time_callee_paths(
             } else {
                 (method.as_str(), side)
             };
-            walk_load_time_method(class, called, on, classes, visited, out, depth);
+            walk_load_time_method(class, called, on, if splat { 0 } else { given }, classes, visited, out, depth);
         }
     }
 
@@ -12574,6 +12576,7 @@ fn walk_load_time_method(
     class: &LibraryClass,
     called: &str,
     on: MethodReceiver,
+    given: usize,
     classes: &[LibraryClass],
     visited: &mut BTreeSet<String>,
     out: &mut BTreeSet<Vec<String>>,
@@ -12591,8 +12594,12 @@ fn walk_load_time_method(
             }
             let mut supers = false;
             for m in defs {
-                // Its parameters' defaults run when a call leaves them out; a closure it only stores runs later.
-                let defaults: Vec<&Expr> = m.params.iter().filter_map(|p| p.default.as_ref()).collect();
+                // Its parameters' defaults run when a call leaves them out (not a positional one the call gives); a
+                // closure it only stores runs later.
+                let defaults: Vec<&Expr> = m.params.iter().filter(|p| !p.keyword).enumerate()
+                    .filter(|(i, _)| *i >= given).filter_map(|(_, p)| p.default.as_ref())
+                    .chain(m.params.iter().filter(|p| p.keyword).filter_map(|p| p.default.as_ref()))
+                    .collect();
                 for e in std::iter::once(&m.body).chain(defaults) {
                     walk_load_time_const_paths(e, out);
                     // Not the defining class as self: the receiver's, whose methods a receiverless call reaches first.

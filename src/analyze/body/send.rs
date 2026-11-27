@@ -1373,6 +1373,10 @@ impl<'a> BodyTyper<'a> {
         };
         let mut out: Vec<Ty> = Vec::new();
         for (id, cls) in classes.iter().filter(|(id, _)| below(id)) {
+            // Not a subclass whose answer comes from a module it mixes in: dispatch reads it in an order this does not.
+            if !cls.instance_methods.contains_key(method) && cls.includes.iter().any(|m| self.lookup_in_module(m, method).is_some()) {
+                return Vec::new();
+            }
             if let Some(ty) = cls.instance_methods.get(method) {
                 let ty = unwrap_fn_ret(&ty.subst_self(&Ty::Class { id: id.clone(), args: Vec::new().into() }));
                 // Not an answer bounded by the typed ones where one is untyped: it may be declared so, or not typed

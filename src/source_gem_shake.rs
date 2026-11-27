@@ -553,6 +553,29 @@ impl<'a> Gems<'a> {
         self.names.contains(c.name.0.as_str())
     }
 
+    /// The values `@name` is assigned in class `c`'s methods.
+    fn ivar_writes(&self, c: Option<&str>, name: &str) -> Vec<&'a Expr> {
+        fn walk<'e>(e: &'e Expr, name: &str, out: &mut Vec<&'e Expr>) {
+            match &*e.node {
+                ExprNode::Assign { target: crate::expr::LValue::Ivar { name: n }, value }
+                | ExprNode::OpAssign { target: crate::expr::LValue::Ivar { name: n }, value, .. } if n.as_str() == name => out.push(value),
+                _ => {}
+            }
+            e.node.for_each_child(&mut |child| walk(child, name, out));
+        }
+        let mut out = Vec::new();
+        let entries: Vec<&&LibraryClass> = match c {
+            Some(c) => self.entries.get(c).into_iter().flatten().collect(),
+            None => self.entries.values().flatten().collect(),
+        };
+        for entry in entries {
+            for m in &entry.methods {
+                walk(&m.body, name, &mut out);
+            }
+        }
+        out
+    }
+
     /// Does a gem's code call a method that changes it on a constant of this name (`NAMES << :secret`)? Its
     /// written value is then not all it holds.
     fn const_mutated(&self, leaf: &str) -> bool {
@@ -1526,6 +1549,8 @@ fn names_of(e: &Expr, locals: &HashMap<String, Option<Vec<Name>>>, gems: Option<
 /// keep of them, and what a method of self's answers (`@filters ||= FILTERS.select { … }`); `None` when any.
 fn elems_names(e: &Expr, gems: Option<&Gems<'_>>, context: Option<(&str, bool, &str)>, depth: u8) -> Option<Vec<Name>> {
     match &*e.node {
+        // (a nil holds no names: iterating it raises)
+        ExprNode::Lit { value: Literal::Nil } => Some(Vec::new()),
         ExprNode::Array { elements, .. } => elements.iter().try_fold(Vec::new(), |mut all, el| {
             all.extend(names_of(el, &HashMap::default(), gems, context, depth)?);
             Some(all)
@@ -1546,19 +1571,38 @@ fn elems_names(e: &Expr, gems: Option<&Gems<'_>>, context: Option<(&str, bool, &
                 gems.entries.get(o).into_iter().flatten().flat_map(|c| c.constants.iter()).filter(|(n, _)| n.as_str() == leaf).map(|(_, v)| v).collect()
             };
             // Not one owner when the body's class is not known (a root's walk): every gem class's constant of the name.
+            let mut owner_name: Option<String> = None;
             let values: Vec<&Expr> = match owner {
-                Some(owner) => std::iter::once(owner.clone()).chain(gems.ancestors(&owner)).map(|o| held(&o)).find(|v| !v.is_empty())?,
+                Some(owner) => {
+                    let (o, v) = std::iter::once(owner.clone()).chain(gems.ancestors(&owner)).map(|o| { let v = held(&o); (o, v) }).find(|(_, v)| !v.is_empty())?;
+                    owner_name = Some(o);
+                    v
+                }
                 None => gems.entries.keys().flat_map(|o| held(o)).collect(),
             };
             if values.is_empty() || gems.const_mutated(&leaf) {
                 return None;
             }
+            // (in the defining class's context: a constant its value names is that class's)
+            let defining = owner_name.as_deref().map(|o| (o, false, ""));
             values.into_iter().try_fold(Vec::new(), |mut all, v| {
-                all.extend(elems_names(v, Some(gems), context, depth)?);
+                all.extend(elems_names(v, Some(gems), defining.or(context), depth)?);
                 Some(all)
             })
         }
         ExprNode::Seq { exprs } => elems_names(exprs.last()?, gems, context, depth),
+        // `@filters ||= …` keeps what another write stored: those writes' values too.
+        ExprNode::OpAssign { target: crate::expr::LValue::Ivar { name }, value, .. } => {
+            let mut names = elems_names(value, gems, context, depth)?;
+            let gems = gems?;
+            // (every gem class's writes of the name where the body's class is not known, a root's walk)
+            for other in gems.ivar_writes(context.map(|c| c.0), name.as_str()) {
+                if !std::ptr::eq(other, value) {
+                    names.extend(elems_names(other, Some(gems), context, depth)?);
+                }
+            }
+            Some(names)
+        }
         ExprNode::OpAssign { value, .. } | ExprNode::Assign { value, .. } => elems_names(value, gems, context, depth),
         // `@filters || (@filters = …)`: what the memo holds is what its write stores.
         ExprNode::BoolOp { left, right, .. } if matches!(&*left.node, ExprNode::Ivar { .. }) => elems_names(right, gems, context, depth),
@@ -1586,11 +1630,27 @@ fn elems_names(e: &Expr, gems: Option<&Gems<'_>>, context: Option<(&str, bool, &
                     .find(|m| m.name == *method && (m.receiver == MethodReceiver::Class) == side)
                     .map(|m| (a.clone(), &m.body))
             })?;
+            // Not an inherited body that calls on self: a subclass's override would answer there.
+            if owner != c && calls_on_self(body) {
+                return None;
+            }
             // In the defining class's context (a constant it names is its own), and every value it may return.
             elems_names_returned(body, Some(gems), Some((owner.as_str(), side, "")), depth - 1)
         }
         _ => None,
     }
+}
+
+/// Does `e` call a method on self (receiverless, or on `self`)?
+fn calls_on_self(e: &Expr) -> bool {
+    if let ExprNode::Send { recv, .. } = &*e.node
+        && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+    {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |child| found = found || calls_on_self(child));
+    found
 }
 
 /// The names the elements of what method body `body` returns may be: its tail's and every `return`'s.
@@ -1668,7 +1728,9 @@ fn bind_locals(e: &Expr, gems: Option<&Gems<'_>>, context: Option<(&str, bool, &
             if matches!(method.as_str(), "each" | "map" | "collect" | "flat_map" | "filter_map" | "select" | "filter" | "reject"
                 | "any?" | "all?" | "none?" | "find" | "detect" | "each_with_index" | "each_with_object" | "sum" | "count")
                 && let ExprNode::Lambda { params, rest_param: None, extra_params, block_param, body, .. } = &*b.node
-                && let Some(first) = params.first() =>
+                && let Some(first) = params.first()
+                // (not with a parameter default, which runs in the block and may write a local the body reads)
+                && extra_params.iter().all(|p| p.default.is_none()) =>
         {
             let names = elems_names(r, gems, context, 2);
             bind(first.as_str(), names);
