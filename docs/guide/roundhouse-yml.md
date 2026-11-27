@@ -128,6 +128,15 @@ The supported subset:
   and after the block, so a value changed in place reads as a change (the
   `by` forms compare the delta instead), and `from` is matched before the
   block runs. An Array or Hash `from`/`to` must hold plain literals.
+- in a request spec (`type: :request`, or `spec/requests` with
+  `infer_spec_type_from_file_location!`), the integration session's
+  `get`, `post` and the other verbs, and on its `response`:
+  `have_http_status` (an Integer, a status Symbol, or the generic
+  `:success` / `:successful`, `:redirect`, `:missing` / `:not_found`,
+  `:error` / `:server_error`, as rspec-rails reads them: `:redirect` is
+  the five redirect codes Rack's `redirect?` names, not every 3xx),
+  `redirect_to`, and the status predicates of `Rack::Response::Helpers`
+  (`be_successful`, `be_ok`, `be_not_found`, `be_redirect`, ...).
 
 Roundhouse reads `spec/spec_helper.rb` and `spec/rails_helper.rb`, and
 the `spec/support/` files they load with the generated
