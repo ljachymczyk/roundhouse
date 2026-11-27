@@ -4357,6 +4357,7 @@ mod tests {
               def change
                 create_table :posts do |t|
                   t.integer :author_id, null: false, default: 1
+                  t.index :author_id, unique: true
                 end
               end
             end
@@ -4364,7 +4365,7 @@ mod tests {
             r#"
             class AddAuthorToPosts < ActiveRecord::Migration[8.0]
               def change
-                add_reference :posts, :author, if_not_exists: true, index: false
+                add_reference :posts, :author, if_not_exists: true
               end
             end
             "#,
@@ -4372,6 +4373,9 @@ mod tests {
         let author = col(&schema, "posts", "author_id");
         assert!(!author.nullable);
         assert!(author.default.is_some());
+        let indexes = &schema.tables[&Symbol::from("posts")].indexes;
+        assert_eq!(indexes.len(), 1, "{indexes:?}");
+        assert!(indexes[0].unique, "the index already there keeps its uniqueness");
     }
 
     #[test]
