@@ -149,18 +149,14 @@ pub(in crate::analyze) fn register(
         // modeled, so a method this table does not list stays gradual instead
         // of failing dispatch.
         session.parent = Some(ClassId(Symbol::from("Rack::Session::Abstract::SessionHash")));
-        // Reads keep the String-or-nil answer the Hash typing gave: the
-        // blank-predicate grounding of `(rd = session[:k]).present?` needs a
-        // nilable String receiver to lower.
+        // A read answers whatever was stored: the cookie store round-trips
+        // the session as JSON, so `session[:at] = Time.now.to_i` reads back
+        // an Integer, as in Rails. Typed String-or-nil, `ts.present?` was
+        // grounded as `(ts || "").strip.empty?` and raised on that Integer;
+        // untyped, a blank predicate goes to ActiveSupport.blank?/present?.
         // Deleting a key returns the same value as reading it, or nil
         // when absent (e.g. `session.delete(:return_to) || root_url`).
-        for m in ["[]", "delete"] {
-            session.instance_methods.insert(
-                Symbol::from(m),
-                Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() },
-            );
-        }
-        for m in ["fetch", "dig"] {
+        for m in ["[]", "delete", "fetch", "dig"] {
             session.instance_methods.insert(Symbol::from(m), Ty::Untyped);
         }
         for m in ["[]=", "store", "clear", "destroy", "update", "merge!", "each", "reload!"] {
@@ -461,6 +457,18 @@ pub(in crate::analyze) fn register(
                     }),
                 },
             );
+        }
+        // The policy a controller's `content_security_policy` block narrows (`ingest::controller_csp`): the request's copy
+        // of the app's, which runtime/ruby/action_dispatch/content_security_policy.rb answers.
+        {
+            let policy = Ty::Class { id: ClassId(Symbol::from("ActionDispatch::ContentSecurityPolicy")), args: vec![].into() };
+            let policy_or_nil = Ty::Union { variants: vec![policy.clone(), Ty::Nil].into() };
+            request.instance_methods.insert(Symbol::from("content_security_policy"), policy_or_nil.clone());
+            request.instance_methods.insert(Symbol::from("content_security_policy="), policy_or_nil);
+            let csp = classes.entry(ClassId(Symbol::from("ActionDispatch::ContentSecurityPolicy"))).or_default();
+            csp.class_methods.insert(Symbol::from("new"), policy);
+            csp.class_methods.insert(Symbol::from("dynamic_source"), Ty::Str);
+            csp.instance_methods.insert(Symbol::from("set_directive"), Ty::Nil);
         }
         classes.insert(request_id.clone(), request);
         let request_ty = Ty::Class { id: request_id, args: vec![].into() };
