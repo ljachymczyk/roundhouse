@@ -1421,7 +1421,8 @@ fn response_matcher(span: Span, matcher: &Expr, positive: bool, ctx: &Ctx<'_>) -
                             span,
                             ExprNode::Const { path: vec![Symbol::from("ActionController"), Symbol::from("STATUS_CODES")] },
                         );
-                        let code = send(Some(codes), "[]", vec![expected.clone()], span);
+                        // Not `[]`: an unknown symbol would answer nil, and `refute(status == nil)` passes for every response.
+                        let code = send(Some(codes), "fetch", vec![expected.clone()], span);
                         check(send(Some(status()), "==", vec![code], span))
                     }
                 },
