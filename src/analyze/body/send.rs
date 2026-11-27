@@ -2253,6 +2253,17 @@ impl<'a> BodyTyper<'a> {
                 if id.0.as_str() == "BigDecimal" {
                     return bigdecimal_method(method, call_args).unwrap_or_else(unknown);
                 }
+                // OpenStruct answers any name it does not define through
+                // `method_missing`: a member read (nil when unset) or write.
+                // An instance's member may be named like a class method (`OpenStruct.new(new: "x").new`).
+                if id.0.as_str() == "OpenStruct"
+                    && !self.classes().get(id).is_some_and(|c| {
+                        c.instance_methods.contains_key(method)
+                            || (!instance_receiver && c.class_methods.contains_key(method))
+                    })
+                {
+                    return Ty::Untyped;
+                }
                 if id.0.as_str() == crate::analyze::indifferent::CLASS {
                     // Not `instance_receiver`: the bare `HashWithIndifferentAccess` alias is not marked a resolved class reference.
                     let answer = if let Some(value) = args.first().cloned() {
@@ -2507,6 +2518,13 @@ impl<'a> BodyTyper<'a> {
                 // through hash_method / array_method instead of falling
                 // back to the (no-op) class-method table. Element types
                 // start as Var; usage narrows them via flow-typing.
+                // A module has no `new`: `Module#new` is Class's alone. Only one the source defines nothing on: an app's module
+                // can answer the call itself (a `self.public_send` its literal-name dispatch reaches).
+                if method.as_str() == "new"
+                    && self.classes().get(id).is_some_and(|c| c.is_module && c.source_class_methods.is_empty() && c.source_instance_methods.is_empty())
+                {
+                    return unknown();
+                }
                 if method.as_str() == "new" {
                     match id.0.as_str() {
                         "Hash" => {

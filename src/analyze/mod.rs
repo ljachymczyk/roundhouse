@@ -38,7 +38,7 @@ mod class_new;
 pub(crate) use body::{creates_rows, indexed_pluck, string_answers};
 #[cfg(test)]
 pub(crate) use body::counted_first_last;
-pub(crate) use body::{ConstResolver, ConstResolverTask, definition_index, has_ambiguous_namespace, is_core_value_constant};
+pub(crate) use body::{ConstResolver, ConstResolverTask, definition_index, has_ambiguous_namespace, is_core_value_constant, platform_constant_type};
 pub use body::DefinitionIndex;
 pub use body::PreparedConstResolver;
 pub mod async_color;
@@ -220,6 +220,8 @@ pub struct Analyzer {
     predicate_bodies: HashMap<(ClassId, Symbol), (Vec<Symbol>, Expr)>,
     /// [`relation_params::relation_params`] of the app.
     relation_params: relation_params::RelationParams,
+    /// What the app stores under each session key, refreshed each production round (`body::app_session_key_types`).
+    session_key_types: HashMap<String, Ty>,
     /// Registered Data factories that use the generated initializer, so
     /// `.new` call-site types do not manufacture a source `initialize`.
     data_factories_without_custom_initialize: HashSet<ClassId>,
@@ -931,8 +933,9 @@ impl Analyzer {
                 ("attribute_in_database", Ty::Untyped),
                 ("saved_changes", Ty::Untyped),
                 ("saved_changes?", Ty::Bool),
-                ("changes", Ty::Untyped),
-                ("previous_changes", Ty::Untyped),
+                // runtime/ruby/active_record/base.rb: String-keyed, as `lower::indifferent_access` reads Rails' indifferent Hash.
+                ("changes", crate::analyze::indifferent::of(Ty::Untyped)),
+                ("previous_changes", crate::analyze::indifferent::of(Ty::Untyped)),
                 ("changed_attributes", Ty::Untyped),
                 ("changed", Ty::Array { elem: std::sync::Arc::new(Ty::Str) }),
                 // Turbo::Broadcastable, which turbo-rails mixes into
@@ -1226,6 +1229,7 @@ impl Analyzer {
         // Library classes (route-helper/Singleton includes, superclass links),
         // ActionMailer classes, ActiveJob classes, and Sidekiq workers —
         // see `registry::library`.
+        let catalog_classes: HashSet<ClassId> = classes.keys().cloned().collect();
         registry::library::register(&mut classes, app, &route_helper_names);
         for (class, readers) in crate::ingest::method_missing_readers() {
             let Some(cls) = classes.get_mut(&ClassId(Symbol::from(*class))) else { continue };
@@ -1341,6 +1345,8 @@ impl Analyzer {
                 }
             }
         }
+
+        registry::class_side::mark(&mut classes, app, &catalog_classes);
 
         for (id, method) in app.models.iter()
             .flat_map(|model| model.methods().map(move |method| (&model.name, method)))
@@ -1535,6 +1541,7 @@ impl Analyzer {
             constant_predicates: constant_predicates(app),
             predicate_bodies: predicate_bodies(app),
             relation_params: relation_params::relation_params(app),
+            session_key_types: HashMap::default(),
             data_factories_without_custom_initialize,
             view_seeds: None,
             callers_by_target: HashMap::default(),
@@ -1556,6 +1563,15 @@ impl Analyzer {
 
     /// Build a body-typer borrowing this analyzer's dispatch tables.
     /// Cheap — just a struct with a reference.
+    /// Re-join what the app stores under each session key (`body::app_session_key_types`); true when it
+    /// moved, so a write typed this round retypes every read of its key, wherever it is.
+    fn refresh_session_key_types(&mut self, app: &App) -> bool {
+        let keys = body::app_session_key_types(app);
+        let moved = keys != self.session_key_types;
+        self.session_key_types = keys;
+        moved
+    }
+
     fn body_typer(&self) -> BodyTyper<'_> {
         let typer = BodyTyper::new(&self.classes)
             .with_module_self_types(&self.module_self_types)
@@ -1566,7 +1582,7 @@ impl Analyzer {
             .with_open_classes(&self.open_classes)
             .with_typed_constants(&self.typed_constants)
             .with_data_factories(&self.data_factories);
-        let typer = typer.with_class_factories(&self.class_factories).with_constant_predicates(&self.constant_predicates).with_predicate_bodies(&self.predicate_bodies).with_relation_params(&self.relation_params);
+        let typer = typer.with_class_factories(&self.class_factories).with_constant_predicates(&self.constant_predicates).with_predicate_bodies(&self.predicate_bodies).with_relation_params(&self.relation_params).with_session_key_types(&self.session_key_types);
         if self.source_indexed { typer.with_const_resolver(self.const_resolver.clone()) } else { typer }
     }
 
@@ -1630,7 +1646,8 @@ impl Analyzer {
     /// the refined registry. Iterates to a fixed point (capped; see
     /// `FIXPOINT_CAP`) using a structural registry snapshot to detect convergence.
     pub fn analyze(&mut self, app: &mut App) {
-        crate::lower::i18n_translate::with_plan_cache(|| self.analyze_cached(app))
+        let catalog = std::sync::Arc::clone(&self.i18n);
+        crate::lower::i18n_translate::with_catalog_plans(&catalog, || self.analyze_cached(app))
     }
 
     fn analyze_cached(&mut self, app: &mut App) {
@@ -1791,11 +1808,13 @@ impl Analyzer {
                 self.unify_params_from_call_sites(app, UnifyScope::Production)
             });
             self.settle_oscillations(&prev_hints.sig);
+            let session_moved = self.refresh_session_key_types(app);
             // Returns+params settle independently of block-value
             // verdicts (`DirtyHints`); both must be quiet before the
             // loop stops, or a newly block-valued method leaves its
             // callers on the registered return instead of the block.
             if unseen.is_empty()
+                && !session_moved
                 && self.inference_matches(&prev_hints.sig)
                 && self.block_value_matches(&prev_hints)
             {
@@ -1812,7 +1831,7 @@ impl Analyzer {
             // so the later rounds retype the whole app for a handful of
             // returns. `dirty_classes_for_retype` is that handful plus
             // everything that reads it.
-            let mut dirty = self.dirty_classes_for_retype(app, &prev_hints);
+            let mut dirty = if session_moved { None } else { self.dirty_classes_for_retype(app, &prev_hints) };
             if let Some(dirty) = dirty.as_mut() {
                 dirty.extend(unseen.drain());
             }
@@ -1961,13 +1980,15 @@ impl Analyzer {
                 }
                 self.overlay_test_params(app);
                 self.settle_oscillations(&absorb_hints.sig);
-                if self.inference_matches(&absorb_hints.sig)
+                let session_moved = self.refresh_session_key_types(app);
+                if !session_moved
+                    && self.inference_matches(&absorb_hints.sig)
                     && self.block_value_matches(&absorb_hints)
                 {
                     rounds.absorb = LoopEnd::Settled(round);
                     break;
                 }
-                absorb_dirty = self.dirty_classes_for_retype(app, &absorb_hints);
+                absorb_dirty = if session_moved { None } else { self.dirty_classes_for_retype(app, &absorb_hints) };
                 absorb_hints = self.capture_dirty_hints();
             }
         } else {
@@ -2048,8 +2069,13 @@ impl Analyzer {
             self.overlay_test_params(app);
             self.apply_pinned_params();
             self.settle.params(&mut self.inferred_params, &before);
+            let session_moved = self.refresh_session_key_types(app);
+            if session_moved {
+                // Its readers anywhere; the frontier below reads only what the param rows moved.
+                fed = None;
+            }
             // Not pinned while the loop still moves: a `Var` mid-loop may be an argument the next round types.
-            if self.inferred_params == before && returns_settled && !(app.pins_unresolved_params && self.pin_open_params()) {
+            if !session_moved && self.inferred_params == before && returns_settled && !(app.pins_unresolved_params && self.pin_open_params()) {
                 rounds.restamp.end = LoopEnd::Settled(round);
                 break;
             }
@@ -4818,8 +4844,8 @@ impl Analyzer {
         // so their expression types are known at each `render` call site. We
         // then harvest the locals each render passes to the target partial,
         // keying by the partial's view name, and analyze partials with that
-        // seed. Nested partial-of-partial isn't handled here (would need a
-        // fixpoint); real-blog's dependency graph is shallow enough to skip.
+        // seed. A partial's own renders seed the partials it renders after
+        // Phase 3b, to a fixpoint (see below).
         let mut partial_locals_by_name: HashMap<Symbol, HashMap<Symbol, Ty>> = HashMap::default();
 
         // Renderer → partials-it-renders edges, harvested as views are
@@ -5069,9 +5095,16 @@ impl Analyzer {
         // and ivar_bindings from the propagated controller context, then
         // analyze.
         let attachable_partial_bindings = crate::lower::attachable::attachable_partial_bindings(app);
-        // Each partial types against the registry and the seeds above alone, so the partials are typed side by side.
-        let mut partials: Vec<&mut crate::dialect::View> = app.views.iter_mut().filter(|view| is_partial_view_name(&view.name)).collect();
-        parallel::map(&mut partials, |view| {
+        // The bodies as ingested, so a partial whose locals a nested render
+        // seeds below retypes from scratch rather than over its first typing.
+        // Kept by position, not name: a partial's formats share one (`_boost`
+        // is both `.html.erb` and `.json.jbuilder`).
+        let untyped_partials: Vec<Option<Expr>> = app
+            .views
+            .iter()
+            .map(|view| is_partial_view_name(&view.name).then(|| view.body.clone()))
+            .collect();
+        let type_partial = |view: &mut crate::dialect::View, locals_by_name: &HashMap<Symbol, HashMap<Symbol, Ty>>| {
             let mut view_ctx = Ctx::default();
             view_ctx.in_view = true; // `yield` here renders to a String
             view_ctx.view_name = Some(view.name.clone());
@@ -5082,7 +5115,7 @@ impl Analyzer {
                 args: vec![].into(),
             });
             view_ctx.constants = global_constants.clone();
-            if let Some(locals) = partial_locals_by_name.get(&view.name) {
+            if let Some(locals) = locals_by_name.get(&view.name) {
                 view_ctx.local_bindings = locals.clone();
             }
             // Partials the FRAMEWORK renders, so no site in the app seeds
@@ -5122,7 +5155,59 @@ impl Analyzer {
                 view_ctx.ivar_bindings = ivars.clone();
             }
             self.body_typer().analyze_expr(&mut view.body, &view_ctx);
-        });
+        };
+        // Each partial types against the registry and the seeds above alone, so the partials are typed side by side.
+        let mut partials: Vec<&mut crate::dialect::View> = app.views.iter_mut().filter(|view| is_partial_view_name(&view.name)).collect();
+        parallel::map(&mut partials, |view| type_partial(view, &partial_locals_by_name));
+
+        // A partial rendered from another partial (`articles/_form`
+        // rendering `_field_error`, resource: form.object) takes
+        // its locals from that render, which reads only once its renderer
+        // is typed. Each round harvests the typed partials' render sites,
+        // fills the locals no view or layout typed, and retypes the
+        // partials that gained one, until a round fills nothing. A local
+        // is filled once, so the rounds end even through a render cycle;
+        // the cap bounds them as the ivar propagation's does.
+        for _ in 0..16 {
+            let mut nested: HashMap<Symbol, HashMap<Symbol, Ty>> = HashMap::default();
+            for view in app.views.iter().filter(|view| is_partial_view_name(&view.name)) {
+                extract_partial_render_sites(&view.body, &view.name, &mut nested, &mut Vec::new());
+            }
+            let mut seeded: HashSet<Symbol> = HashSet::default();
+            for (partial, locals) in nested {
+                if !is_partial_view_name(&partial) {
+                    continue;
+                }
+                let entry = partial_locals_by_name.entry(partial.clone()).or_default();
+                for (local, ty) in locals {
+                    // Not `Array[unknown]` either: filled once, it would keep
+                    // out the `Array[Article]` a later round reads. A seed
+                    // that is itself `Array[unknown]` (`items: []`) gives way
+                    // to a known one; once known, a local is never refilled.
+                    if ty.mentions_unknown() || entry.get(&local).is_some_and(|prev| !prev.mentions_unknown()) {
+                        continue;
+                    }
+                    entry.insert(local, ty);
+                    seeded.insert(partial.clone());
+                }
+            }
+            if seeded.is_empty() {
+                break;
+            }
+            let mut retype: Vec<(&mut crate::dialect::View, &Expr)> = app
+                .views
+                .iter_mut()
+                .zip(&untyped_partials)
+                .filter_map(|(view, untyped)| match untyped {
+                    Some(body) if seeded.contains(&view.name) => Some((view, body)),
+                    _ => None,
+                })
+                .collect();
+            parallel::map(&mut retype, |(view, untyped)| {
+                view.body = untyped.clone();
+                type_partial(view, &partial_locals_by_name)
+            });
+        }
 
         // Record the render-site local types on the App. They already
         // seeded each partial's body typing above; persisting them is
@@ -5299,7 +5384,11 @@ impl Analyzer {
                     if method.as_str() != "prepend" || !recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) { continue; }
                     for arg in args {
                         if let ExprNode::Const { path } = &*arg.node {
-                            if let Some(id) = resolver.namespace(arg.span, path) { includes.entry(owner).or_default().push(id.clone()); }
+                            // Not by its span alone: a top-level mixin's opening writes the module rooted, at a span no reference is indexed at.
+                            let rooted = (path.first().is_some_and(|p| p.as_str().is_empty()) && arg.decisions & crate::expr::GENERATED_CONST_REF != 0)
+                                .then(|| ClassId(Symbol::from(path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::"))))
+                                .filter(|id| classes.contains_key(id));
+                            if let Some(id) = resolver.namespace(arg.span, path).cloned().or(rooted) { includes.entry(owner).or_default().push(id); }
                         }
                     }
                 }
@@ -9503,7 +9592,8 @@ fn guessed_receiver_sites<'a>(unknown: &[&'a SendSite], app: &'a App) -> Vec<(&'
     }
     let mut defining: HashMap<&Symbol, Vec<&ClassId>> = HashMap::default();
     for lc in &app.library_classes {
-        for m in lc.methods.iter().filter(|m| m.receiver == MethodReceiver::Instance) {
+        // Not a private method: a call with a receiver never reaches one (MissionControl's private `offset(executions_or_jobs)` took the Integer of `executions_or_jobs.offset(offset_value)`).
+        for m in lc.methods.iter().filter(|m| m.receiver == MethodReceiver::Instance && m.visibility != crate::dialect::MethodVisibility::Private) {
             defining.entry(&m.name).or_default().push(&lc.name);
         }
     }
@@ -10536,6 +10626,7 @@ mod source_method_index_tests {
             parent_span: Default::default(),
             includes: includes.iter().map(|i| id(i)).collect(),
             include_spans: Vec::new(),
+            include_statements: Vec::new(),
             methods,
             nullable_columns: Vec::new(),
             origin: None,
@@ -13120,6 +13211,7 @@ mod concern_method_snapshot_tests {
             parent_span: Span::synthetic(),
             includes: includes.iter().map(|n| ClassId(Symbol::from(*n))).collect(),
             include_spans: Vec::new(),
+            include_statements: Vec::new(),
             methods,
             nullable_columns: Vec::new(),
             origin: None,
@@ -13158,6 +13250,7 @@ mod concern_method_snapshot_tests {
             body: includes.iter().map(|n| mixin_item("include", n)).collect(),
             layout: crate::dialect::LayoutDecl::Inherit,
             sibling_classes: vec![],
+            csp_header: false,
         }
     }
 
@@ -13312,7 +13405,7 @@ impl Analyzer {
     /// is measured on a copy. Destructured without `..`, so a new field has
     /// to be listed here; `Copy` fields own no heap.
     pub fn census_drop(self) -> HashMap<ClassId, ClassInfo> {
-        let Analyzer { classes, module_self_types, upload_array_fields, materialized_associations, inferred_params, open_param_slots, pinned_param_slots, defaulted_param_slots, seeding_unseen_params: _, deferring_pending_slots: _, unseen_or_assign_classes, test_call_arities, declared_signatures, adapter, concern_folded, host_folded, inquirers, i18n, helper_modules, helper_index, open_classes, refined_action_bindings, const_resolver, source_indexed, typed_constants, data_factories, class_factories, constant_predicates, data_factories_without_custom_initialize, view_seeds, callers_by_target, controller_action_meta_cache, fixpoint_rounds, fixpoint_checks, settle, written_ivars, class_ivar_writes, site_cache, retyped_since_unify, settled_constants, surveys, retyped_since_survey, unify_memo } = self;
+        let Analyzer { classes, module_self_types, upload_array_fields, materialized_associations, inferred_params, open_param_slots, pinned_param_slots, defaulted_param_slots, seeding_unseen_params: _, deferring_pending_slots: _, unseen_or_assign_classes, test_call_arities, declared_signatures, adapter, concern_folded, host_folded, inquirers, i18n, helper_modules, helper_index, open_classes, refined_action_bindings, const_resolver, source_indexed, typed_constants, data_factories, class_factories, constant_predicates, data_factories_without_custom_initialize, view_seeds, callers_by_target, controller_action_meta_cache, fixpoint_rounds, fixpoint_checks, settle, written_ivars, class_ivar_writes, site_cache, retyped_since_unify, settled_constants, surveys, retyped_since_survey, unify_memo, session_key_types } = self;
         let mut freed: Vec<(&str, i64)> = vec![
             ("classes (kept)", crate::memory_census::live_delta(|| classes.clone())),
             ("module_self_types", crate::memory_census::freed_by(|| drop(module_self_types))),
@@ -13348,6 +13441,7 @@ impl Analyzer {
             ("fixpoint_checks", crate::memory_census::freed_by(|| drop(fixpoint_checks))),
             ("settle", crate::memory_census::freed_by(|| drop(settle))),
             ("written_ivars", crate::memory_census::freed_by(|| drop(written_ivars))),
+            ("session_key_types", crate::memory_census::freed_by(|| drop(session_key_types))),
             ("class_ivar_writes", crate::memory_census::freed_by(|| drop(class_ivar_writes))),
             ("site_cache", crate::memory_census::freed_by(|| drop(site_cache))),
             ("retyped_since_unify", crate::memory_census::freed_by(|| drop(retyped_since_unify))),

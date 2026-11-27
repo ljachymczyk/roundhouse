@@ -202,6 +202,7 @@ class Routing(unittest.TestCase):
             "runtime/spinel/tep/parser.rb", "runtime/spinel/tep/net.rb", "runtime/spinel/tep/tep.rb",
             "runtime/spinel/tep/server.rb", "runtime/spinel/tep/server_threaded.rb",
             "runtime/spinel/tep/server_scheduled.rb", "tests/tep_server_harness.rb",
+            "runtime/spinel/tep/tep_core.rb", "tests/spinel_body_pause.rs", "tests/spinel_body_pause.rb",
             "tests/spinel_chunked_body.rs", "tests/spinel_chunked_body.rb",
             "tests/spinel_chunked_body_native.rb", "tests/spinel_chunked_body_native_check.rb",
             "tests/spinel_chunked_body_app_check.rb",
@@ -1323,7 +1324,7 @@ class Routing(unittest.TestCase):
     def test_runtime_owners_choose_asymmetric_focused_binaries(self):
         cases = {
             "runtime/spinel/web_push_crypto.rb": "spinel_web_push_crypto",
-            "runtime/spinel/signed_cookies.rbs": "rails_compat_vectors_spinel",
+            "runtime/spinel/tep/url.rb": "rails_compat_vectors_spinel",
             "runtime/spinel/active_record_equality_spinel.rb": "framework_tests_spinel",
             "runtime/spinel/param_builder.rb": "spinel_param_builder",
             "runtime/spinel/multipart.rb": "spinel_param_builder",

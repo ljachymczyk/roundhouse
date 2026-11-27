@@ -58,11 +58,14 @@ fn forwarded_block_may_be_nil(ty: &Ty) -> bool {
     matches!(ty, Ty::Union { variants } if variants.iter().any(|v| matches!(v, Ty::Nil)))
 }
 
+mod class_side_miss;
 mod diagnostic;
+mod session_keys;
+pub(crate) use session_keys::app_session_key_types;
 pub(crate) use diagnostic::some_operands_take_it;
 mod const_resolution;
 mod lambda_local;
-pub(crate) use const_resolution::{ConstResolver, ConstResolverTask, definition_index, has_ambiguous_namespace, is_core_value_constant};
+pub(crate) use const_resolution::{ConstResolver, ConstResolverTask, definition_index, has_ambiguous_namespace, is_core_value_constant, platform_constant_type};
 pub use const_resolution::DefinitionIndex;
 pub use const_resolution::PreparedConstResolver;
 use const_resolution::ResolvedConstant;
@@ -398,6 +401,10 @@ pub struct ClassInfo {
     /// mixin, an ancestor the RBI could not name): a lookup that misses
     /// is unknown, not wrong.
     pub open: bool,
+    /// An app library class whose class-side surface the registry holds
+    /// whole (`registry::class_side`). A class-side call it does not
+    /// answer is a NoMethodError, not a gradual escape.
+    pub class_side_closed: bool,
     /// Declared in the app's own source (a model, controller, or
     /// library class), as opposed to the framework catalog. An app class
     /// is reachable from a bare name only through Ruby's constant
@@ -591,6 +598,8 @@ pub struct BodyTyper<'a> {
     constant_predicates: Option<&'a HashMap<(ClassId, Symbol), bool>>,
     predicate_bodies: Option<&'a HashMap<(ClassId, Symbol), (Vec<Symbol>, Expr)>>,
     relation_params: Option<&'a crate::analyze::relation_params::RelationParams>,
+    /// What the app stores under each session key (`session_keys`).
+    session_key_types: Option<&'a HashMap<String, Ty>>,
     /// Methods whose value is an ActiveSupport inquirer (see
     /// [`crate::analyze::inquiry`]); empty for the bare constructor,
     /// which the runtime-source typer and tests use.
@@ -681,6 +690,39 @@ impl<'a> BodyTyper<'a> {
             stack.extend(cls.parent.iter());
         }
         false
+    }
+
+    /// The controller scope a receiver-less translate call (or, with
+    /// `translate` false, any call) here reads for a lazy key, when it is
+    /// AbstractController::Translation's `t`.
+    fn translate_scope(&self, ctx: &Ctx, translate: bool, bare: bool) -> Option<String> {
+        match (!translate || ctx.in_view, bare && !ctx.class_side) {
+            (false, true) => self.translating_controller(ctx.self_ty.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Whose `t` a call here is (`lower::i18n_translate::Site`), given
+    /// `translate_scope`'s answer and the call's own decisions.
+    fn translate_site<'s>(
+        &self,
+        ctx: &'s Ctx,
+        scope: &'s Option<String>,
+        mailer: &'s Option<(String, String)>,
+        decisions: u64,
+    ) -> crate::lower::i18n_translate::Site<'s> {
+        // An `app/helpers` module runs in the view, so its `t` is ActionView's (with no template for a lazy key).
+        let in_helper = !ctx.class_side
+            && matches!(ctx.self_ty.as_ref(), Some(Ty::Class { id, .. }) if self.helper_modules.is_some_and(|h| h.contains(id)));
+        let helper_copy = decisions & (crate::expr::HELPER_COPY_TRANSLATE | crate::expr::HELPER_BODY_TRANSLATE) != 0;
+        match (scope, ctx.in_view) {
+            (_, true) => crate::lower::i18n_translate::Site::View(ctx.view_name.as_ref().map(|v| v.as_str())),
+            (None, false) if let Some((scope, action)) = mailer => crate::lower::i18n_translate::Site::Mailer(scope, action),
+            _ if helper_copy => crate::lower::i18n_translate::Site::View(None),
+            (None, false) if in_helper => crate::lower::i18n_translate::Site::View(None),
+            (Some(scope), false) => crate::lower::i18n_translate::Site::Controller(scope),
+            (None, false) => crate::lower::i18n_translate::Site::Other,
+        }
     }
 
     /// The lazy-lookup scope of a controller whose instance methods have
@@ -789,6 +831,7 @@ impl<'a> BodyTyper<'a> {
             constant_predicates: None,
             predicate_bodies: None,
             relation_params: None,
+            session_key_types: None,
             inquirers: None,
             i18n: None,
             helper_modules: None,
@@ -973,6 +1016,11 @@ impl<'a> BodyTyper<'a> {
 
     pub(super) fn with_relation_params(mut self, params: &'a crate::analyze::relation_params::RelationParams) -> Self {
         self.relation_params = Some(params);
+        self
+    }
+
+    pub(super) fn with_session_key_types(mut self, keys: &'a HashMap<String, Ty>) -> Self {
+        self.session_key_types = Some(keys);
         self
     }
 
@@ -1989,6 +2037,7 @@ impl<'a> BodyTyper<'a> {
                 // A later typing pass may resolve a value constant whose
                 // owner was unknown in an earlier constant fixpoint round.
                 crate::expr::ExprCold::set_diagnostic(&mut expr.cold, None);
+                let platform_guarded = expr.decisions & crate::expr::PLATFORM_GUARDED_CONST != 0;
                 let generated = expr_span.file.0 == 0
                     || expr.decisions & crate::expr::GENERATED_CONST_REF != 0;
                 // A real FileId outside the snapshot is an indexing
@@ -2236,6 +2285,10 @@ impl<'a> BodyTyper<'a> {
                     expr.decisions |= crate::expr::GUARDED_NAME_ERROR;
                     return self.compute(expr, ctx);
                 }
+                let ty = match ty {
+                    Ty::Var { .. } if platform_guarded => const_resolution::platform_constant_type(written_class_id(path).0.as_str()).unwrap_or(ty),
+                    ty => ty,
+                };
                 if indexed_source && matches!(ty, Ty::Var { .. }) {
                     crate::expr::ExprCold::set_diagnostic(&mut expr.cold, Some(crate::diagnostic::DiagnosticKind::Unsupported {
                         target: None,
@@ -2769,6 +2822,7 @@ impl<'a> BodyTyper<'a> {
                 }
                 if matches!(&crate::expr::ExprCold::diagnostic(&expr.cold), Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
                     if matches!(construct.as_str(), "Module protocol" | "ActiveModel::Errors" | "ActiveModel::Error" | "Rails" | "ActiveRecord::Base" | "String extension" | "Hash extension" | "not_nil!" | "Object extension" | "Module callback argument" | RUNTIME_MIXIN))
+                    || matches!(&crate::expr::ExprCold::diagnostic(&expr.cold), Some(crate::diagnostic::DiagnosticKind::SendDispatchFailed { .. }))
                 { crate::expr::ExprCold::set_diagnostic(&mut expr.cold, None); }
                 if self.inquirers.is_some()
                     && matches!(crate::expr::ExprCold::diagnostic(&expr.cold), Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
@@ -2888,6 +2942,25 @@ impl<'a> BodyTyper<'a> {
                     Some(r) => Some(self.analyze_receiver(r, ctx)),
                     None => ctx.self_ty.clone(),
                 };
+                // `t("term.js").to_json`: the Hash a key naming a node of Strings answers, written as JSON, which `lower::i18n_translate` folds to its text.
+                if method.as_str() == "to_json" && args.is_empty() && block.is_none()
+                    && let Some(r) = recv.as_mut()
+                    && let ExprNode::Send { recv: inner_recv, method: inner_method, .. } = &*r.node
+                    && matches!(inner_method.as_str(), "t" | "translate")
+                    && matches!(crate::expr::ExprCold::diagnostic(&r.cold), Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. }) if construct.as_str() == "I18n")
+                {
+                    let catalog = self.i18n.map_or(crate::i18n::Catalog::rails_default(), |c| c.or_rails_default());
+                    let scope = self.translate_scope(ctx, true, inner_recv.is_none());
+                    let mailer = match (!ctx.in_view && inner_recv.is_none() && !ctx.class_side, &scope) {
+                        (true, None) => self.translating_mailer(ctx),
+                        _ => None,
+                    };
+                    let site = self.translate_site(ctx, &scope, &mailer, r.decisions);
+                    if crate::lower::i18n_translate::subtree_json(catalog, r, site).is_some() {
+                        r.set_diagnostic(None);
+                        return Ty::Str;
+                    }
+                }
                 // Not by name alone: an application `tap`/`each` may answer its block's value.
                 if matches!(method.as_str(), "tap" | "each")
                     && let Some(b) = block.as_mut()
@@ -3386,6 +3459,12 @@ impl<'a> BodyTyper<'a> {
                         .clone()
                         .filter(|t| !matches!(t, Ty::Var { .. } | Ty::Untyped))
                     {
+                        // A writer nothing defines still raises; the value stays the argument's type.
+                        if self.inquirers.is_some() && crate::expr::ExprCold::diagnostic(&expr.cold).is_none() {
+                            if let Some(kind) = self.class_side_miss(recv.as_ref(), recv_ty.as_ref(), method, ctx) {
+                                crate::expr::ExprCold::set_diagnostic(&mut expr.cold, Some(kind));
+                            }
+                        }
                         return t;
                     }
                 }
@@ -3512,6 +3591,9 @@ impl<'a> BodyTyper<'a> {
                         || (receiver_is_instance && matches!(recv_ty.as_ref(), Some(Ty::Union { .. }))));
                 if let Some(rel) = self.coerced_operator(recv_ty.as_ref(), method, args) {
                     dispatched = rel;
+                }
+                if let Some(stored) = self.session_read(recv_ty.as_ref(), method, args) {
+                    dispatched = stored;
                 }
                 if block.is_none()
                     && let Some(r) = recv.as_ref()
@@ -3691,16 +3773,33 @@ impl<'a> BodyTyper<'a> {
                     let elem = args[0].ty.as_ref().and_then(kernel_array_elem);
                     return Ty::Array { elem: std::sync::Arc::new(elem.unwrap_or_else(unknown)) };
                 }
+                // Not typed from the argument's class alone: `rand(0)` is a Float, `rand(1.5)` an Integer and
+                // `rand(1...1)` nil, so only a literal whose value settles it is typed (`rand(0..9999)`, `rand(10)`).
+                if recv.is_none() && method.as_str() == "rand" && args.len() <= 1
+                    && block.is_none()
+                    && matches!(dispatched, Ty::Var { .. } | Ty::Untyped)
+                    && !self.app_defines(ctx.self_ty.as_ref(), method)
+                {
+                    let int = |e: &Option<Expr>| match e.as_ref().map(|e| &*e.node) {
+                        Some(ExprNode::Lit { value: crate::expr::Literal::Int { value } }) => Some(*value),
+                        _ => None,
+                    };
+                    let answer = match args.first().map(|a| &*a.node) {
+                        None => Some(Ty::Float),
+                        Some(ExprNode::Lit { value: crate::expr::Literal::Int { value } }) if *value != 0 => Some(Ty::Int),
+                        Some(ExprNode::Range { begin, end, exclusive }) => match (int(begin), int(end)) {
+                            (Some(b), Some(e)) if if *exclusive { b < e } else { b <= e } => Some(Ty::Int),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(answer) = answer {
+                        return answer;
+                    }
+                }
                 let translate = matches!(method.as_str(), "t" | "translate");
                 let catalog = self.i18n.map_or(crate::i18n::Catalog::rails_default(), |c| c.or_rails_default());
-                let scope = match (!translate || ctx.in_view, recv.is_none() && !ctx.class_side) {
-                    (false, true) => self.translating_controller(ctx.self_ty.as_ref()),
-                    _ => None,
-                };
-                // An `app/helpers` module runs in the view, so its `t` is ActionView's (with no template for a lazy key).
-                let in_helper = !ctx.class_side
-                    && matches!(ctx.self_ty.as_ref(), Some(Ty::Class { id, .. }) if self.helper_modules.is_some_and(|h| h.contains(id)));
-                let helper_copy = expr.decisions & (crate::expr::HELPER_COPY_TRANSLATE | crate::expr::HELPER_BODY_TRANSLATE) != 0;
+                let scope = self.translate_scope(ctx, translate, recv.is_none());
                 let mailer = match (translate && !ctx.in_view && recv.is_none() && !ctx.class_side, &scope) {
                     (true, None) => self.translating_mailer(ctx),
                     _ => None,
@@ -3716,14 +3815,7 @@ impl<'a> BodyTyper<'a> {
                         detail: "a mailer's `t` reads its lazy key under the action being processed, which a method other than an action does not know".to_string(),
                     }));
                 }
-                let site = match (&scope, ctx.in_view) {
-                    (_, true) => crate::lower::i18n_translate::Site::View(ctx.view_name.as_ref().map(|v| v.as_str())),
-                    (None, false) if let Some((scope, action)) = &mailer => crate::lower::i18n_translate::Site::Mailer(scope, action),
-                    _ if helper_copy => crate::lower::i18n_translate::Site::View(None),
-                    (None, false) if in_helper => crate::lower::i18n_translate::Site::View(None),
-                    (Some(scope), false) => crate::lower::i18n_translate::Site::Controller(scope),
-                    (None, false) => crate::lower::i18n_translate::Site::Other,
-                };
+                let site = self.translate_site(ctx, &scope, &mailer, expr.decisions);
                 if translate
                     && crate::lower::i18n_translate::tree_answer(catalog, recv.as_ref(), method.as_str(), args, block.as_ref()).is_some()
                 {
@@ -4064,6 +4156,11 @@ impl<'a> BodyTyper<'a> {
                         construct: Symbol::from("ActionDispatch::Cookies::CookieJar"),
                         detail: "cookies.each is modeled with a block only; the blockless Enumerator is not".to_string(),
                     }));
+                }
+                if matches!(dispatched, Ty::Var { .. }) && self.inquirers.is_some() && crate::expr::ExprCold::diagnostic(&expr.cold).is_none() {
+                    if let Some(kind) = self.class_side_miss(recv.as_ref(), recv_ty.as_ref(), method, ctx) {
+                        crate::expr::ExprCold::set_diagnostic(&mut expr.cold, Some(kind));
+                    }
                 }
                 dispatched
             }
@@ -5690,6 +5787,19 @@ impl BodyTyper<'_> {
             if let Some(ty) = classes.get(module).and_then(|m| m.instance_methods.get(name)) {
                 return Some(ty.clone()).filter(|t| !t.is_open());
             }
+        }
+        // Past its own includes, a module's `super` is the next method of the class that mixes it in: one that
+        // `prepend`s it (not among its includes) answers with its own (redis's `Redis::LibIdentity#connection_prelude`).
+        if info.is_module
+            && !class_side
+            && info.parent.is_none()
+            && let Some((_, Ty::Class { id: host, .. })) = self.module_self_types.and_then(|m| m.get(owner))
+            && host != owner
+            && let Some(host_info) = classes.get(host)
+            && !host_info.includes.contains(owner)
+            && let Some(ty) = host_info.instance_methods.get(name)
+        {
+            return Some(ty.clone()).filter(|t| !t.is_open());
         }
         let mut parent = info.parent.clone();
         let mut seen = 0;

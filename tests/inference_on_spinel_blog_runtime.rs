@@ -716,13 +716,18 @@ fn untyped_subexpressions_baseline() {
     // active_record/relation.rb), so the record is the list's nil arm.
     // MEASURED 1471 on merging main 2d9d16d0c (1465) with the uuid casts'
     // +6 (1470 less 1464), which add up.
-    // MEASURED 1507 on db:migrate (main 878d9c5e4: 1471): `ActiveRecord::Migrator`
-    // runs `db:migrate` / `db:prepare` over the adapter seam. Its parameters and
-    // the rows it reads back are vars on this RBS-less probe: +36 (`boot` +11,
-    // `load_schema` +9, `prepare` +7, `pending` +5, `migrate` +2,
-    // `record_environment` +1, `postgresql?` +1), every other method's count
-    // unchanged, and migrator.rbs types all 36.
-    const CEILING: usize = 1507;
+    // MEASURED 1474 on the connection handler (1471):
+    // `ConnectionHandler#clear_active_connections!` asks
+    // `Db.connection_slot(true) == -2` and `Db.query_cache_enabled?`
+    // (+3 in active_record/connection.rb), which read as untyped on this
+    // RBS-less probe, as the other `Db` results do.
+    // MEASURED 1482 on carrying `references` through `or!`, `and!` and
+    // `merge!` (1473): each hands its untyped `other` to
+    // `merge_reference_names!`, whose body reads that `other`, as the rest
+    // of those methods already do (+9 in active_record/relation.rb).
+    // `ActiveRecord::Migrator` (db:migrate / db:prepare over the adapter seam) adds 36 RBS-less vars,
+    // measured on its own as 1471 -> 1507; on top of 1482 that is 1518.
+    const CEILING: usize = 1518;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \

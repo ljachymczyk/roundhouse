@@ -2517,7 +2517,7 @@ fn report_native_ruby_syntax(app: &App, target: BuildTarget) {
     if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby) {
         return;
     }
-    fn visit(expr: &crate::expr::Expr, target: BuildTarget, load_time: bool) {
+    fn visit(expr: &crate::expr::Expr, target: BuildTarget, load_time: bool, app_loaders: &[&str]) {
         use crate::expr::{ExprNode, LValue};
         let construct = match &*expr.node {
             ExprNode::ForwardKeywords if target == BuildTarget::Spinel => None,
@@ -2572,6 +2572,15 @@ fn report_native_ruby_syntax(app: &App, target: BuildTarget) {
             | ExprNode::OpAssign { target: LValue::Var { name, .. }, .. }
                 if name.as_str().starts_with('$') => Some("global variable write"),
             ExprNode::Var { name, .. } if name.as_str().starts_with("@@") && target != BuildTarget::Spinel => Some("class variable read"),
+            // message_bus's `require "message_bus/backends/#{backend}"`: the tree has no load path, and Spinel resolves a
+            // require as it builds, so a name only the run time knows loads nothing (a LoadError where Ruby loads it).
+            ExprNode::Send { recv: None, method, args, block: None, .. }
+                if matches!(method.as_str(), "require" | "load")
+                    && !app_loaders.contains(&method.as_str())
+                    && matches!(args.as_slice(), [a] if !matches!(&*a.node, ExprNode::Lit { .. })) =>
+            {
+                Some("require of a name built at run time")
+            }
             _ => None,
         };
         if let Some(construct) = construct {
@@ -2580,11 +2589,19 @@ fn report_native_ruby_syntax(app: &App, target: BuildTarget) {
                 "native Ruby semantics have no verified implementation on this target",
             );
         }
-        expr.node.for_each_child(&mut |child| visit(child, target, load_time));
+        expr.node.for_each_child(&mut |child| visit(child, target, load_time, app_loaders));
     }
+    // An app method of the name anywhere (a model's `load(name)`) keeps its calls out of the refusal, as
+    // `report_ruby_only_sends` keeps them: the call's body carries no mark of the method it dispatched to.
+    let defines = |name: &str| {
+        app.models.iter().any(|model| model.methods().any(|method| method.name.as_str() == name))
+            || app.library_classes.iter().any(|class| class.methods.iter().any(|method| method.name.as_str() == name))
+            || app.controllers.iter().any(|controller| controller.actions().any(|action| action.name.as_str() == name))
+    };
+    let app_loaders: Vec<&str> = ["require", "load"].into_iter().filter(|name| defines(name)).collect();
     let load_time = crate::lower::defined_const_fold::load_time_roots(app);
     crate::lower::for_each_emit_body_ref(app, &mut |expr| {
-        visit(expr, target, load_time.contains(&(expr as *const crate::expr::Expr as usize)))
+        visit(expr, target, load_time.contains(&(expr as *const crate::expr::Expr as usize)), &app_loaders)
     });
 }
 
@@ -4446,14 +4463,17 @@ fn with_sidekiq_readme(mut files: Vec<(String, String)>, target: BuildTarget, ap
          `:concurrency:`, then `RAILS_MAX_THREADS`, then 5), `-q queue[,weight]` the \
          queues (repeatable; default: config/sidekiq.yml's `:queues:`, then \
          `default`), and `-t seconds` the shutdown timeout (default: \
-         config/sidekiq.yml's `:timeout:`, then 25). Each thread has its own Redis \
-         connection, and the database pool is sized to the threads plus headroom \
-         unless `DATABASE_POOL_SIZE` is set. TSTP stops fetching; TERM or INT \
-         waits for running jobs up to the timeout and pushes the rest back. A job \
-         that raises is retried with Sidekiq's backoff (up to config/sidekiq.yml's \
-         `:max_retries:`, then 25), then goes to the dead set, and the worker moves \
-         due retries and scheduled jobs back onto their queues, as Sidekiq's \
-         scheduler does.\n\n\
+         config/sidekiq.yml's `:timeout:`, then 25), and `-g tag` the tag the \
+         Sidekiq Web UI shows (default: the current directory's name). Each thread \
+         has its own Redis connection, and the database pool is sized to the \
+         threads plus headroom unless `DATABASE_POOL_SIZE` is set. TSTP stops \
+         fetching; TERM or INT waits for running jobs up to the timeout and pushes \
+         the rest back. A job that raises is retried with Sidekiq's backoff (up to \
+         config/sidekiq.yml's `:max_retries:`, then 25), then goes to the dead set, \
+         and the worker moves due retries and scheduled jobs back onto their \
+         queues, as Sidekiq's scheduler does. It heartbeats as a Sidekiq 8.1 \
+         process does, so the Sidekiq Web UI's Busy page lists it, labeled \
+         `roundhouse`, with its running jobs, and its Quiet and Stop buttons work.\n\n\
          {cable}\n\n"
     );
     if let Some((_, readme)) = files.iter_mut().find(|(p, _)| p == "README.md") {
@@ -5874,6 +5894,7 @@ fn ruby_family_runtime_files(
     apply_app_requires(&mut files, app, RequireTarget::RubyFamily);
     apply_puma_boot_hooks(&mut files, app, RequireTarget::RubyFamily)?;
     apply_rails_version(&mut files, app);
+    apply_database_paths(&mut files, app);
     // Overlay boot replaces the spinel boot wholesale (see comment above
     // on apply_module_mixins), wiping the Date-package inject from
     // `spinel_files`. Re-inject only the shared `date_*` helpers — not
@@ -6018,6 +6039,38 @@ fn rewrite_carried_requires(files: &mut [(String, String)], app: &App, program: 
             *content = lines.join("\n") + "\n";
         }
     }
+}
+
+// Not loaded lazily: production Rails eager-loads a gem's Zeitwerk-managed files at boot (mission_control-jobs' `push_dir`).
+fn zeitwerk_eager_programs(app: &App, is_program: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in &app.boot_gem_entries {
+        let entry = normalize_source(entry);
+        let Some(text) = app.sources.iter().find(|f| normalize_source(&f.path) == entry).map(|f| f.text.as_str()) else { continue };
+        let Some(at) = entry.rfind("/lib/") else { continue };
+        let lib = std::path::Path::new(&entry[..at + 4]);
+        let dir = std::path::Path::new(&entry).parent().unwrap_or(lib);
+        let Some((roots, mut ignores)) = crate::ingest::source_gems::zeitwerk_dirs(text, dir, lib) else { continue };
+        let Some(lazy) = crate::ingest::source_gems::zeitwerk_eager_exclusions(text, dir) else { continue };
+        ignores.extend(lazy);
+        let mut managed: Vec<String> = app
+            .sources
+            .iter()
+            .map(|f| normalize_source(&f.path))
+            .filter(|p| *p != entry && is_program(p))
+            .filter(|p| {
+                let path = std::path::Path::new(p);
+                roots.iter().any(|r| path.starts_with(r)) && !ignores.iter().any(|i| path.starts_with(i))
+            })
+            .collect();
+        managed.sort();
+        for p in managed {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
 }
 
 fn apply_file_programs(files: &mut Vec<(String, String)>, app: &App) {
@@ -6248,9 +6301,11 @@ fn apply_file_programs(files: &mut Vec<(String, String)>, app: &App) {
         }
         files.push((format!("app/{}.rb", anchor_of(&program.source)), out));
     }
-    // What boot reaches: the gem entries' programs and what they require.
+    // What boot reaches: the gem entries' programs, what they require, and what their Zeitwerk loaders eager-load.
+    let eager = zeitwerk_eager_programs(app, |p| programs.contains_key(p));
     let mut reached: crate::det::HashSet<String> = Default::default();
     let mut pending: Vec<String> = app.boot_gem_entries.iter().map(|e| normalize_source(e)).filter(|e| programs.contains_key(e)).collect();
+    pending.extend(eager.iter().cloned());
     while let Some(next) = pending.pop() {
         if reached.insert(next.clone()) {
             pending.extend(edges.get(&next).into_iter().flatten().cloned());
@@ -6348,6 +6403,9 @@ fn apply_file_programs(files: &mut Vec<(String, String)>, app: &App) {
         if programs.contains_key(&entry) {
             writeln!(boot, "RoundhouseAutoload.require_gem_file({:?})", anchor_of(&entry)).unwrap();
         }
+    }
+    for program in &eager {
+        writeln!(boot, "RoundhouseAutoload.require_gem_file({:?})", anchor_of(program)).unwrap();
     }
     // A declaration file's load-time require of a constant under an
     // autoloaded namespace loads that namespace's program, as reading the
@@ -6716,17 +6774,13 @@ fn apply_postgresql_tree(files: &mut Vec<(String, String)>, app: &App, target: R
     gemfile.1 = gemfile.1.replace("gem \"sqlite3\"", "gem \"pg\"");
 
     const SERVER_POSTGRESQL: &str = "    # PostgreSQL: the server DATABASE_URL names, else libpq's PG*\n    # variables (apply_postgresql_tree).\n    path = ENV.fetch(\"DATABASE_URL\", \"\")\n";
-    // The Ruby overlay's server spells the SQLite path out; the Spinel
-    // server asks `Main.default_db_path`, and its --help names the file.
+    // Both servers ask `Main.default_db_path`; the Spinel --help names the file.
     let server: &[(&str, &str)] = match target {
-        RequireTarget::RubyFamily => &[(
-            "    db_path = ENV[\"BLOG_DB\"]\n    path = (!db_path.nil? && !db_path.empty?) ? db_path : \"storage/development.sqlite3\"\n",
-            SERVER_POSTGRESQL,
-        )],
+        RequireTarget::RubyFamily => &[("    path = Main.default_db_path\n", SERVER_POSTGRESQL)],
         RequireTarget::Spinel => &[
             ("    path = Main.default_db_path\n", SERVER_POSTGRESQL),
             (
-                "    puts \"  SQLite file: BLOG_DB env (default storage/development.sqlite3)\"\n",
+                "    puts \"  SQLite file: BLOG_DB env, else config/database.yml for RAILS_ENV, else storage/development.sqlite3\"\n",
                 "    puts \"  PostgreSQL: DATABASE_URL env, else libpq's PG* variables\"\n",
             ),
         ],
@@ -7923,13 +7977,14 @@ fn apply_database_routes(files: &mut [(String, String)], app: &App) {
 /// `apply_global_id_locate`; an app with no payload jobs keeps a
 /// registry whose `perform` answers false.
 /// Whether a tree pushes jobs to Redis: the app is on `queue_adapter
-/// :sidekiq` and has at least one payload job (`lower::job_payload`). An
-/// app on `:sidekiq` whose jobs all keep their Proc, or that has no
-/// ActiveJob jobs at all (Mastodon's are native Sidekiq workers), gets
-/// no Redis client and no dependency.
+/// :sidekiq` and has at least one payload job (`lower::job_payload`) or
+/// native Sidekiq worker it can push (`lower::sidekiq_native`). An app
+/// on `:sidekiq` whose jobs all keep their Proc, or that has no jobs at
+/// all, gets no Redis client and no dependency.
 pub(crate) fn needs_redis(app: &App) -> bool {
     app.queue_adapter.as_deref() == Some("sidekiq")
         && (app.job_plans.iter().any(|p| p.is_payload())
+            || app.native_plans.iter().any(|p| p.is_payload())
             || !crate::lower::broadcast_job::models(app).is_empty())
 }
 
@@ -8087,8 +8142,15 @@ fn apply_job_registry(files: &mut [(String, String)], app: &App) {
         worker_defaults_source(&app.sidekiq_worker),
     );
     let redis = format!("{redis}{}", cable_redis_source(app));
+    let native = if needs_redis(app) {
+        crate::lower::sidekiq_native::registry_source(&app.native_plans)
+            + &crate::lower::sidekiq_native::perform_native_source(&app.native_plans)
+            + &crate::lower::sidekiq_native::retry_hooks_source(app, &app.native_plans)
+    } else {
+        String::new()
+    };
     let generated = format!(
-        "{HEAD}{}\n{flag}{redis}{TAIL}",
+        "{HEAD}{native}{}\n{flag}{redis}{TAIL}",
         crate::lower::job_payload::registry_source_with_broadcasts(
             &app.job_plans,
             needs_redis(app),
@@ -8658,6 +8720,42 @@ fn apply_rails_version(files: &mut [(String, String)], app: &App) {
             boot.push_str(&block);
         }
     }
+}
+
+/// `config/database.yml`'s main database per environment, as
+/// `AppDatabase.path_for(env)` in boot.rb, for `Main.default_db_path`:
+/// with `RAILS_ENV=production` the binary opens the file Rails would,
+/// not `storage/development.sqlite3`. Always defined (nil for an
+/// environment the file does not name), so main.rb can call it as is.
+fn apply_database_paths(files: &mut [(String, String)], app: &App) {
+    const MARK: &str = "# The app's database per environment, from config/database.yml";
+    let Some((_, boot)) = files.iter_mut().find(|(p, _)| p == "boot.rb") else { return };
+    if boot.contains(MARK) {
+        return;
+    }
+    // A computed (ERB) path and a server database have no file here; that environment keeps the default.
+    let paths: Vec<(&str, &str)> = app
+        .databases
+        .iter()
+        .filter(|d| d.primary && d.adapter == crate::database::DatabaseAdapter::Sqlite3)
+        .filter_map(|d| d.database.as_deref().map(|path| (d.env.as_str(), path)))
+        .collect();
+    let mut body = String::from("    case env\n");
+    for (env, path) in &paths {
+        body.push_str(&format!(
+            "    when {} then {}\n",
+            crate::emit::ruby::expr::ruby_str_literal(env),
+            crate::emit::ruby::expr::ruby_str_literal(path)
+        ));
+    }
+    body.push_str("    end\n");
+    if paths.is_empty() {
+        body = "    nil\n".to_string();
+    }
+    boot.push_str(&format!(
+        "\n{MARK} (see project.rs::apply_database_paths).\n\
+         module AppDatabase\n  def self.path_for(env)\n{body}  end\nend\n"
+    ));
 }
 
 /// `AppEnvironment` at the end of boot.rb. `assume_ssl?(env)` is
@@ -9716,7 +9814,7 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
         // rqrcode_core's / spinel-rqrcode's.
         | "RQRCodeCore::QRCodeRunTimeError" | "RQRCodeCore::QRCodeArgumentError"
         | "GC" | "OpenSSL::HMAC" | "CSV::MalformedCSVError"
-        | "Enumerator::Product" | "Enumerator::Lazy" | "Enumerator::Chain"
+        | "Enumerator::Product" | "Enumerator::Lazy" | "Enumerator::Chain" | "OpenStruct"
         | "Monitor" | "ConditionVariable" | "Thread::ConditionVariable"
         | "UNIXServer" | "UNIXSocket" | "Open3" | "Find"
         // weakref: Ruby's own on the ruby family, `packages/weakref` on
@@ -10286,7 +10384,8 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
         if !matches!(target, "jruby" | "spinel")
             && let crate::expr::ExprNode::Const { path } = &*expr.node
             && let ["Socket", flag] = path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect::<Vec<_>>()[..]
-            && crate::analyze::is_core_value_constant(&format!("Socket::{flag}"))
+            && (crate::analyze::is_core_value_constant(&format!("Socket::{flag}"))
+                || crate::analyze::platform_constant_type(&format!("Socket::{flag}")).is_some())
         {
             emit::diagnostics::report_unsupported(
                 expr.span,
@@ -11410,12 +11509,13 @@ fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(St
         files.push(("sig/runtime/local_secret.rbs".to_string(), rbs));
     }
 
-    // Signed-cookie sidecar — ActionDispatch::SignedCookie and the
-    // Session reopen in runtime/signed_cookies.rb (ruby family only).
+    // Session-cookie sidecar - ActionDispatch::CookieStore in
+    // runtime/cookie_store.rb, Rails' encrypted session cookie and the
+    // flash inside it (ruby family only).
     {
-        let rbs = crate::runtime_files::read_to_string("runtime/spinel/signed_cookies.rbs")
-            .map_err(|e| format!("read runtime/spinel/signed_cookies.rbs: {e}"))?;
-        files.push(("sig/runtime/signed_cookies.rbs".to_string(), rbs));
+        let rbs = crate::runtime_files::read_to_string("runtime/spinel/cookie_store.rbs")
+            .map_err(|e| format!("read runtime/spinel/cookie_store.rbs: {e}"))?;
+        files.push(("sig/runtime/cookie_store.rbs".to_string(), rbs));
     }
 
     // Hash#to_query nesting sidecar — the reopen in
@@ -11859,6 +11959,7 @@ fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(St
     apply_app_requires(&mut files, app, RequireTarget::Spinel);
     apply_puma_boot_hooks(&mut files, app, RequireTarget::Spinel)?;
     apply_rails_version(&mut files, app);
+    apply_database_paths(&mut files, app);
     // All three scaffold targets (spinel + the ruby/jruby trees derived
     // from this set) ship the comprehensive scaffold README as SPECIMEN.md,
     // freeing README.md for the generated quick-start `ensure_readme`
@@ -13906,11 +14007,11 @@ fn with_bundled_requires(mut files: Vec<(String, String)>) -> Vec<(String, Strin
 }
 
 /// The libraries in `BUNDLED` that are bundled gems, not default gems,
-/// as of Ruby 3.4. Under bundler a bundled gem is not on the load path
+/// as of Ruby 3.4 (ostruct as of 4.0). Under bundler a bundled gem is not on the load path
 /// unless the Gemfile names it. rexml has been one since Ruby 3.0, and
 /// its feature is `rexml/document`, so a require of the gem name or of a
 /// path under it counts.
-const BUNDLED_GEMS: [&str; 4] = ["base64", "bigdecimal", "csv", "rexml"];
+const BUNDLED_GEMS: [&str; 5] = ["base64", "bigdecimal", "csv", "rexml", "ostruct"];
 
 /// Names in the Gemfile each bundled gem that the tree requires.
 /// Without the line, `bundle exec` stops at the require with "cannot
@@ -13974,12 +14075,44 @@ fn drop_facades_the_program_defines(files: &mut [(String, String)]) {
         })
         .flat_map(|(_, c)| c.lines().filter_map(top_name).collect::<Vec<_>>())
         .collect();
+    // The paths the gem's own top-level headers open, whole (`SVG::Graph::Graph`, `SVG`), and how: a module, a class, or a
+    // class with a superclass.
+    let declared: std::collections::BTreeMap<String, &'static str> = files
+        .iter()
+        .filter(|(p, c)| {
+            !p.starts_with("runtime/")
+                && p.ends_with(".rb")
+                && c.lines().any(|l| l.starts_with("#<SPINEL_SOURCE>") && l.contains(crate::ingest::source_gems::MOUNT))
+        })
+        .flat_map(|(_, c)| {
+            c.lines()
+                .filter_map(|l| {
+                    let (kind, rest) = match (l.strip_prefix("module "), l.strip_prefix("class ")) {
+                        (Some(rest), _) => ("module", rest),
+                        (_, Some(rest)) => ("class", rest),
+                        _ => return None,
+                    };
+                    let path: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':').collect();
+                    let kind = if kind == "class" && rest[path.len()..].trim_start().starts_with('<') { "subclass" } else { kind };
+                    Some((path, kind))
+                })
+                .collect::<Vec<_>>()
+        })
+        .fold(std::collections::BTreeMap::new(), |mut map, (path, kind)| {
+            // A class with a superclass in one header is that class in every other.
+            let entry = map.entry(path).or_insert(kind);
+            if kind == "subclass" || (kind == "class" && *entry == "module") {
+                *entry = kind;
+            }
+            map
+        });
     for (path, content) in files.iter_mut() {
         if path != "runtime/gem_facades.rb" && path != "runtime/gem_facades.rbs" {
             continue;
         }
         let lines: Vec<&str> = content.lines().collect();
         let mut keep = vec![true; lines.len()];
+        let mut replaced: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
         let mut i = 0;
         while i < lines.len() {
             if top_name(lines[i]).is_some_and(|n| defined.contains(&n)) {
@@ -13990,13 +14123,59 @@ fn drop_facades_the_program_defines(files: &mut [(String, String)]) {
                 }
                 let end = (i + 1..lines.len()).find(|&j| lines[j] == "end").unwrap_or(lines.len() - 1);
                 keep[start..=end].iter_mut().for_each(|k| *k = false);
+                // Not the namespaces too: a gem's compound headers (`class SVG::Graph::Graph`) were written for the
+                // runtime anchor this file was, and a namespace with nothing of its own (svg-graph's `SVG::Graph`)
+                // has no other definition in the program.
+                // Only a module holding a declaration is a namespace: ROTP's `module Base32` façade is the gem's `class
+                // ROTP::Base32`, and an empty `module Base32` would contradict it.
+                let indent_of = |line: &str| line.len() - line.trim_start().len();
+                let declares = |line: &str| line.trim_start().starts_with("module ") || line.trim_start().starts_with("class ");
+                let mut open: Vec<usize> = Vec::new();
+                let mut names: Vec<String> = Vec::new();
+                for j in i..=end {
+                    let line = lines[j];
+                    let indent = indent_of(line);
+                    let trimmed = line.trim_start();
+                    let is_module = trimmed.strip_prefix("module ").is_some_and(|rest| rest.chars().all(|c| c.is_alphanumeric() || c == '_'));
+                    if is_module && open.len() * 2 == indent {
+                        let close = (j + 1..=end).find(|&k| lines[k].trim_start() == "end" && indent_of(lines[k]) == indent).unwrap_or(end);
+                        let name = trimmed["module ".len()..].trim().to_string();
+                        let path = names.iter().cloned().chain(std::iter::once(name.clone())).collect::<Vec<_>>().join("::");
+                        // The gem's own kind for a path it declares: a `module` shell would reopen its class as a module. Not a
+                        // class it gives a superclass: this file loads first, and a bare `class` here would be Object's.
+                        let header = match declared.get(&path).copied() {
+                            None | Some("module") => Some("module"),
+                            Some("class") => Some("class"),
+                            _ => None,
+                        };
+                        if let Some(header) = header
+                            && (j + 1..close).any(|k| declares(lines[k]) && indent_of(lines[k]) == indent + 2)
+                        {
+                            open.push(indent);
+                            names.push(name.clone());
+                            keep[j] = true;
+                            if header == "class" {
+                                replaced.insert(j, format!("{}class {name}", " ".repeat(indent)));
+                            }
+                        }
+                    } else if trimmed == "end" && open.last() == Some(&indent) {
+                        open.pop();
+                        names.pop();
+                        keep[j] = true;
+                    }
+                }
                 i = end + 1;
             } else {
                 i += 1;
             }
         }
         if keep.iter().any(|k| !k) {
-            let mut out: String = lines.iter().zip(&keep).filter(|(_, k)| **k).map(|(l, _)| format!("{l}\n")).collect();
+            let mut out: String = lines
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| keep[*j])
+                .map(|(j, l)| format!("{}\n", replaced.get(&j).map(String::as_str).unwrap_or(l)))
+                .collect();
             if !content.ends_with('\n') {
                 out.pop();
             }
@@ -14008,7 +14187,7 @@ fn drop_facades_the_program_defines(files: &mut [(String, String)]) {
 /// Constant → bundled library that provides it. One table, read by
 /// both the pass that writes the requires and the gate that checks a
 /// tree for missing ones — a second copy is how the rule drifts.
-const BUNDLED: [(&str, &str); 32] = [
+const BUNDLED: [(&str, &str); 34] = [
     // INERT in our trees, and deliberately: `runtime/spinel/base64.rb`
     // defines `Base64` without requiring the library, which the second
     // condition below reads as "the program defines it" and drops the
@@ -14097,12 +14276,13 @@ const BUNDLED: [(&str, &str); 32] = [
     // `packages/openssl`; an app that signs a payload without HTTP never
     // loads it through net/http.
     ("OpenSSL", "openssl"),
-    // `Monitor.new`, `UNIXServer.new` / `UNIXSocket.new`, `Open3.capture3`
+    // `Monitor.new`, `Socket.const_defined?(:SOL_TCP)`, `UNIXServer.new` / `UNIXSocket.new`, `Open3.capture3`
     // and `Find.find`: the standard library on CRuby/JRuby; spinel
     // defines Monitor and the socket classes only after the require, and
     // takes `packages/open3` and `packages/find`.
     ("Monitor", "monitor"),
     ("MonitorMixin", "monitor"),
+    ("Socket", "socket"),
     ("UNIXServer", "socket"),
     ("UNIXSocket", "socket"),
     ("Open3", "open3"),
@@ -14118,6 +14298,9 @@ const BUNDLED: [(&str, &str); 32] = [
     // `packages/yaml` and `packages/psych`.
     ("YAML", "yaml"),
     ("Psych", "psych"),
+    // `OpenStruct.new(hash)`: a bundled gem on CRuby 4.0; without the
+    // require both CRuby and spinel raise NameError on the constant.
+    ("OpenStruct", "ostruct"),
 ];
 
 fn bundled_libraries() -> impl Iterator<Item = (&'static str, &'static str)> {
@@ -15635,6 +15818,7 @@ mod tests {
             parent_span: Default::default(),
             includes: Vec::new(),
             include_spans: Vec::new(),
+            include_statements: Vec::new(),
             methods: crate::runtime_src::parse_methods("def __roundhouse_puma_after_booted\n  nil\nend").unwrap(),
             nullable_columns: Vec::new(),
             origin: None,
@@ -17146,6 +17330,35 @@ mod tests {
     /// `require "bcrypt"`, its sidecar drops, the manifest declares the
     /// dependency, and the Makefile's binary build delegates to
     /// `spin build` (the raw $(SPINEL) lane can't resolve the package).
+    /// A gem compiled from source replaces its façade, but keeps the façade's
+    /// namespaces: the gem's compound `class SVG::Graph::Graph` headers were
+    /// written against them, and svg-graph declares nothing in `SVG::Graph`. A
+    /// module the façade only fills (ROTP's `Base32`, the gem's class) is not one.
+    #[test]
+    fn a_sourced_gem_keeps_its_facades_namespaces() {
+        let facade = "module GemFacade\nend\n\n# SVG — the stats graph.\nmodule SVG\n  module Graph\n    class TimeSeries\n      def initialize(_opts)\n        @opts = _opts\n      end\n    end\n  end\nend\n\nmodule ROTP\n  module Base32\n    def self.random\n      \"\"\n    end\n  end\nend\n\nmodule Mail\nend\n";
+        let gem = "#<SPINEL_SOURCE>lobsters/.roundhouse/source_gems/svg-graph-2.2.2/lib/SVG/Graph/Graph.rb:1\nclass SVG::Graph::Graph\nend\n";
+        let rotp = "#<SPINEL_SOURCE>lobsters/.roundhouse/source_gems/rotp-6.3.0/lib/rotp/base32.rb:1\nclass ROTP::Base32\nend\n";
+        let mut files = vec![
+            ("runtime/gem_facades.rb".to_string(), facade.to_string()),
+            ("app/models/svg/graph/graph.rb".to_string(), gem.to_string()),
+            ("app/models/rotp/base32.rb".to_string(), rotp.to_string()),
+        ];
+        let mut declared = files.clone();
+        drop_facades_the_program_defines(&mut files);
+        assert_eq!(files[0].1, "module GemFacade\nend\n\nmodule SVG\n  module Graph\n  end\nend\n\nmodule ROTP\nend\n\nmodule Mail\nend\n");
+        // A gem that declares the namespace itself (`class SVG`) gets no `module` shell to reopen it as.
+        declared[1].1 = "#<SPINEL_SOURCE>lobsters/.roundhouse/source_gems/svg-graph-2.2.2/lib/SVG.rb:1\nclass SVG\nend\nclass SVG::Graph::Graph\nend\n".to_string();
+        let mut subclassed = declared.clone();
+        drop_facades_the_program_defines(&mut declared);
+        // A class without a superclass keeps a `class` shell, so `SVG::Graph` still exists for the compound header.
+        assert_eq!(declared[0].1, "module GemFacade\nend\n\nclass SVG\n  module Graph\n  end\nend\n\nmodule ROTP\nend\n\nmodule Mail\nend\n");
+        // Not one with a superclass: this file loads before the gem, and a bare `class SVG` would make it Object's.
+        subclassed[1].1 = subclassed[1].1.replace("class SVG\n", "class SVG < Base\n");
+        drop_facades_the_program_defines(&mut subclassed);
+        assert_eq!(subclassed[0].1, "module GemFacade\nend\n\n\nmodule ROTP\nend\n\nmodule Mail\nend\n");
+    }
+
     #[test]
     fn spin_shape_swaps_bcrypt_facade_for_the_package() {
         let makefile = "SPINEL ?= spinel\n\
@@ -17470,6 +17683,7 @@ mod tests {
             parent_span: Default::default(),
             includes: Vec::new(),
             include_spans: Vec::new(),
+            include_statements: Vec::new(),
             methods: Vec::new(),
             nullable_columns: Vec::new(),
             origin: None,
@@ -17645,6 +17859,7 @@ mod tests {
             parent_span: Default::default(),
             includes: Vec::new(),
             include_spans: Vec::new(),
+            include_statements: Vec::new(),
             methods: Vec::new(),
             nullable_columns: Vec::new(),
             origin: None,
