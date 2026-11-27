@@ -2516,10 +2516,11 @@ impl<'a> BodyTyper<'a> {
                     }
                     current_id = cls.parent.as_ref();
                 }
-                // Not unanswered where the class's subclasses define the method: a value of the class is an instance of
-                // one of them where the call runs (parslet's `Parser#try` calls `root`, which each parser defines). A
-                // plain instance raises there, so their answers are all the call has.
-                if !kernel_class_side && !class_dynamic_finder && !unknown_named_ancestor && (instance_receiver || !self.class_side_defines(id, method)) {
+                // Not unanswered where `self`'s class lacks the method but its subclasses define it: self is an
+                // instance of one of them where the call runs (parslet's `Parser#try` calls `root`, which each parser
+                // defines), and a plain instance raises there. Only for self: a value typed as the class is an
+                // instance of it (`URI::Generic` has no `request_uri`).
+                if instance_receiver && IMPLICIT_SELF.with(|f| f.get()) && !kernel_class_side && !class_dynamic_finder && !unknown_named_ancestor {
                     let below = self.descendant_instance_answers(id, method);
                     if !below.is_empty() {
                         return below.into_iter().fold(Ty::Bottom, crate::analyze::body::union_of);
@@ -4835,6 +4836,19 @@ pub(crate) const ENUMERABLE_METHODS: &[&str] = &[
     "min_by", "minmax", "none?", "one?", "partition", "reduce", "reject", "reverse_each", "select", "sort", "sort_by",
     "sum", "take", "take_while", "tally", "to_a", "uniq", "zip",
 ];
+
+thread_local! {
+    /// Set while a receiverless or `self.` call dispatches (`implicit_self_dispatch`).
+    static IMPLICIT_SELF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `f` with the dispatch it runs marked as a call on self.
+pub(super) fn implicit_self_dispatch<T>(on_self: bool, f: impl FnOnce() -> T) -> T {
+    let before = IMPLICIT_SELF.with(|c| c.replace(on_self));
+    let out = f();
+    IMPLICIT_SELF.with(|c| c.set(before));
+    out
+}
 
 fn unwrap_fn_ret(ty: &Ty) -> Ty {
     match ty {

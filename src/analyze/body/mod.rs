@@ -3512,9 +3512,11 @@ impl<'a> BodyTyper<'a> {
                         }));
                     }
                 }
-                let mut dispatched =
+                let on_self = recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef));
+                let mut dispatched = send::implicit_self_dispatch(on_self, || {
                     self.dispatch_on(recv_ty.as_ref(), method, block_ret.as_ref(), args, instance_receiver
-                        || (receiver_is_instance && matches!(recv_ty.as_ref(), Some(Ty::Union { .. }))));
+                        || (receiver_is_instance && matches!(recv_ty.as_ref(), Some(Ty::Union { .. }))))
+                });
                 if let Some(rel) = self.coerced_operator(recv_ty.as_ref(), method, args) {
                     dispatched = rel;
                 }
