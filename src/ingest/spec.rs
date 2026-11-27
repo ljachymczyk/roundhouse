@@ -2234,6 +2234,26 @@ end
         assert!(refused.refused.iter().any(|f| f.0.is_none()), "an unread library configuration leaves every example out");
     }
 
+    // Each form leaves every example out: what it registers or matches is not read.
+    #[test]
+    fn unread_helper_forms_leave_every_example_out() {
+        let cases: &[(&str, &[u8])] = &[
+            ("a suite hook", b"RSpec.configure do |config|\n  config.before(:suite, type: :model) { setup }\nend\n"),
+            ("built-in metadata", b"RSpec.configure do |config|\n  config.before(file_path: /article_spec/) { setup }\nend\n"),
+            ("a computed type", b"RSpec.configure do |config|\n  config.before(type: Config.spec_type) { setup }\nend\n"),
+            ("a computed include filter", b"RSpec.configure do |config|\n  config.include Helpers, type: Config.spec_type\nend\n"),
+            ("an interpolated matcher name", b"RSpec::Matchers.define(:\"be_#{:nil}\") { match { |_| false } }\n"),
+        ];
+        for (what, src) in cases {
+            let mut config = SpecConfig::default();
+            let _ = super::super::survey::surveying(|| config.read_helper(src, "/app/spec/rails_helper.rb", &mut |_, _| Ok(())));
+            assert!(config.refused.iter().any(|f| f.0.is_none()), "{what} must leave every example out");
+        }
+        let mut config = SpecConfig::default();
+        let _ = super::super::survey::surveying(|| config.read_support(b"require_relative \"../spec_helper\"\n", "/app/spec/support/setup.rb"));
+        assert!(config.refused.iter().any(|f| f.0.is_none()), "a support file's own load must leave every example out");
+    }
+
     // Without `infer_spec_type_from_file_location!` a file's folder gives
     // it no type, as in rspec-rails.
     #[test]
