@@ -740,6 +740,8 @@ fn apply_table_verb(
                             && !cols.iter().any(|c| c.name == x.name)
                     });
                     table.columns.extend(cols);
+                    // `if_not_exists` reaches the index too: one already under the name stays as it is (its `unique:` and all).
+                    let idxs: Vec<Index> = idxs.into_iter().filter(|n| !(if_not_exists && table.indexes.iter().any(|i| i.name == n.name))).collect();
                     table.indexes.retain(|i| !idxs.iter().any(|n| n.name == i.name));
                     table.indexes.extend(idxs);
                     apply_reference_foreign_key(&args[1..], table, file)?;
@@ -2480,7 +2482,12 @@ fn table_from_create_table(
                             match column_from_call(&call, &table_name, file, dialect) {
                                 Ok(Some(col)) => {
                                     for name in &names {
-                                        let col = Column { name: Symbol::from(name.as_str()), ..col.clone() };
+                                        // Each name its own target, not the first name's.
+                                        let col_type = match &col.col_type {
+                                            ColumnType::Reference { .. } => ColumnType::Reference { table: TableRef(Symbol::from(name.as_str())) },
+                                            other => other.clone(),
+                                        };
+                                        let col = Column { name: Symbol::from(name.as_str()), col_type, ..col.clone() };
                                         match reference_definition(&table_name, col, &rargs[1.min(rargs.len())..], file) {
                                             Ok((cols, idxs)) => {
                                                 columns.extend(cols);
