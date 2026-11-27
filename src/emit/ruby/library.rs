@@ -9918,6 +9918,25 @@ fn emit_library_class_decl_inner(
     let resolve_all = |e: &Expr, load_time: bool| -> BTreeSet<String> {
         let mut paths: BTreeSet<Vec<String>> = BTreeSet::new();
         walk_const_paths(e, &mut paths);
+        // Not only what the value names: a class method it calls as the file loads runs then, and what that names
+        // must be loaded too (et-orbi's `ZONES_OLSON = TZInfo::Timezone.all…` reaches TZInfo::DataSource, which Ruby
+        // has loaded by et-orbi's `require 'tzinfo'`).
+        if load_time {
+            let mut reached: BTreeSet<Vec<String>> = BTreeSet::new();
+            walk_load_time_callee_paths(e, None, classes, &mut BTreeSet::new(), &mut reached, 6);
+            // Not only what the walk reads: a call it reaches into a gem compiled from source runs that gem's code
+            // through receivers the walk cannot type, and Ruby has loaded the whole gem by then (et-orbi's
+            // `require 'tzinfo'`), so its every class is loaded first.
+            let gems: BTreeSet<String> = reached.iter()
+                .filter_map(|path| classes.iter().find(|c| c.name.0.as_str() == path.join("::")))
+                .chain(callee_receivers(e, classes))
+                .filter_map(|c| source_gem_dir(app, c))
+                .collect();
+            for c in classes.iter().filter(|c| source_gem_dir(app, c).is_some_and(|g| gems.contains(&g))) {
+                reached.insert(c.name.0.as_str().split("::").map(str::to_string).collect());
+            }
+            paths.extend(reached);
+        }
         paths.iter().filter_map(|p| resolve(p, load_time)).collect()
     };
     // Initializers and eager constants share the source's load-time order,
@@ -12471,6 +12490,116 @@ pub(super) fn walk_const_paths(e: &Expr, out: &mut BTreeSet<Vec<String>>) {
 /// expression calls it right there (`(-> { … }).call`). A block a call
 /// runs now (`map`, `each`) is walked, as `partition_deferred_constants`
 /// reads it.
+/// The constants the methods `e` calls name, as they run: `K.m(…)` on a class of `classes` walks `K.m` (`K.new` its
+/// `initialize`), and a receiverless call in a method the same class's method of the name on that side, to `depth`
+/// calls deep.
+fn walk_load_time_callee_paths(
+    e: &Expr,
+    current: Option<(&LibraryClass, MethodReceiver)>,
+    classes: &[LibraryClass],
+    visited: &mut BTreeSet<String>,
+    out: &mut BTreeSet<Vec<String>>,
+    depth: u8,
+) {
+    if depth == 0 {
+        return;
+    }
+    if let ExprNode::Send { recv, method, .. } = &*e.node {
+        let target: Option<(&LibraryClass, MethodReceiver)> = match recv.as_ref().map(|r| &*r.node) {
+            Some(ExprNode::Const { path }) => {
+                let name = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
+                let suffix = format!("::{name}");
+                classes.iter().find(|c| c.name.0.as_str() == name)
+                    .or_else(|| classes.iter().find(|c| c.name.0.as_str().ends_with(&suffix)))
+                    .map(|c| (c, MethodReceiver::Class))
+            }
+            None | Some(ExprNode::SelfRef) => current,
+            _ => None,
+        };
+        if let Some((class, side)) = target {
+            // `new` runs `initialize` on the instance it makes.
+            let (called, on) = if method.as_str() == "new" && side == MethodReceiver::Class
+                && !class.methods.iter().any(|m| m.name.as_str() == "new" && m.receiver == MethodReceiver::Class)
+            {
+                ("initialize", MethodReceiver::Instance)
+            } else {
+                (method.as_str(), side)
+            };
+            walk_load_time_method(class, called, on, classes, visited, out, depth);
+        }
+    }
+
+    e.node.for_each_child(&mut |child| walk_load_time_callee_paths(child, current, classes, visited, out, depth));
+}
+
+/// The source gem a class was compiled from (`tzinfo-2.0.6`), by its file's path under `source_gems/`.
+fn source_gem_dir(app: &App, c: &LibraryClass) -> Option<String> {
+    let file = std::iter::once(c.parent_span.file)
+        .chain(c.constants.iter().map(|(_, value)| value.span.file))
+        .chain(c.methods.iter().map(|m| m.body.span.file))
+        .find(|file| file.0 != 0)?;
+    let path = app.source_path(file)?;
+    let (_, rest) = path.split_once("source_gems/")?;
+    Some(rest.split('/').next()?.to_string())
+}
+
+/// The classes of `classes` a call in `e` names as its receiver (`TZInfo::Timezone.all`).
+fn callee_receivers<'c>(e: &Expr, classes: &'c [LibraryClass]) -> Vec<&'c LibraryClass> {
+    let mut out = Vec::new();
+    fn walk<'c>(e: &Expr, classes: &'c [LibraryClass], out: &mut Vec<&'c LibraryClass>) {
+        if let ExprNode::Send { recv: Some(r), .. } = &*e.node
+            && let ExprNode::Const { path } = &*r.node
+        {
+            let name = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
+            if let Some(c) = classes.iter().find(|c| c.name.0.as_str() == name) {
+                out.push(c);
+            }
+        }
+        e.node.for_each_child(&mut |child| walk(child, classes, out));
+    }
+    walk(e, classes, &mut out);
+    out
+}
+
+/// `called` on `side` of `class` as Ruby finds it, the class's own or the nearest ancestor's, walked as it runs; a
+/// `super` in it the next ancestor's of the name, too.
+fn walk_load_time_method(
+    class: &LibraryClass,
+    called: &str,
+    on: MethodReceiver,
+    classes: &[LibraryClass],
+    visited: &mut BTreeSet<String>,
+    out: &mut BTreeSet<Vec<String>>,
+    depth: u8,
+) {
+    let mut owner = Some(class);
+    let mut steps = 0;
+    while let Some(c) = owner {
+        let defs: Vec<&MethodDef> = c.methods.iter().filter(|m| m.name.as_str() == called && m.receiver == on).collect();
+        if !defs.is_empty() {
+            let key = format!("{}{}{called}", c.name.0.as_str(), if on == MethodReceiver::Class { "." } else { "#" });
+            if !visited.insert(key) {
+                return;
+            }
+            let mut supers = false;
+            for m in defs {
+                walk_const_paths(&m.body, out);
+                // Not the defining class as self: the receiver's, whose methods a receiverless call reaches first.
+                walk_load_time_callee_paths(&m.body, Some((class, on)), classes, visited, out, depth - 1);
+                supers |= contains_super(&m.body);
+            }
+            if !supers {
+                return;
+            }
+        }
+        steps += 1;
+        if steps > 32 {
+            return;
+        }
+        owner = c.parent.as_ref().and_then(|p| classes.iter().find(|k| k.name == *p));
+    }
+}
+
 fn walk_load_time_const_paths(e: &Expr, out: &mut BTreeSet<Vec<String>>) {
     /// The body of a stored closure literal.
     fn stored_body(e: &Expr) -> Option<&Expr> {
