@@ -124,15 +124,13 @@ module ActionController
 
   # The first requested format that has an arm (or a `*/*`); "" for none.
   def self.first_requested_format(accepted, order)
-    hits = []
     i = 0
     while i < accepted.length
       name = accepted[i]
-      hits << name if name == "*/*" || order.include?(name)
+      return name if name == "*/*" || order.include?(name)
       i += 1
     end
-    return "" if hits.empty?
-    hits[0].to_s
+    ""
   end
 
   def self.sanitize_location(path)

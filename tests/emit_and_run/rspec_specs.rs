@@ -1,7 +1,7 @@
 use super::emit_and_run;
 
 // RSpec's verdict on CRuby is the expectation: the spec is written to pass
-// unchanged under `rspec` in the generated blog (7 examples). The
+// unchanged under `rspec` in the generated blog (8 + 3 examples). The
 // emitted tests must pass on the same app, and fail where RSpec fails.
 const SPEC: &str = r#"require "rails_helper"
 
@@ -71,26 +71,97 @@ RSpec.describe Article, type: :model do
       expect { article.valid? }.not_to change { Article.count }
     end
   end
+
+  describe "helper configuration" do
+    it "runs the helper's hooks and includes its modules" do
+      expect(@configured).to eq(true)
+      expect(article_title_for(article)).to eq("Getting Started")
+    end
+  end
 end
 "#;
 
-const CONFIG: &str = "test_paths:\n  - spec/models\n";
+// What `rails generate rspec:install` writes, trimmed, plus a hook and an
+// included support module.
+const RAILS_HELPER: &str = r#"require "spec_helper"
+ENV["RAILS_ENV"] ||= "test"
+require_relative "../config/environment"
+abort("The Rails environment is running in production mode!") if Rails.env.production?
+require "rspec/rails"
+Dir[Rails.root.join("spec", "support", "**", "*.rb")].sort.each { |f| require f }
+
+RSpec.configure do |config|
+  config.use_transactional_fixtures = true
+  config.infer_spec_type_from_file_location!
+  config.filter_rails_from_backtrace!
+  config.before { @configured = true }
+  config.include ArticleHelpers
+end
+"#;
+
+const SPEC_HELPER: &str = r#"RSpec.configure do |config|
+  config.expect_with :rspec do |expectations|
+    expectations.include_chain_clauses_in_custom_matcher_descriptions = true
+  end
+  config.shared_context_metadata_behavior = :apply_to_host_groups
+end
+"#;
+
+const SUPPORT: &str = "module ArticleHelpers\n  def article_title_for(article)\n    article.title\n  end\nend\n";
+
+// A request spec against the blog's scaffold controller.
+const RESPONSE_SPEC: &str = r#"require "rails_helper"
+
+RSpec.describe "Articles", type: :request do
+  let!(:article) { Article.create!(title: "Request spec", body: "A body that is long enough.") }
+
+  it "lists articles" do
+    get articles_path
+    expect(response).to have_http_status(:ok)
+    expect(response).to be_successful
+    expect(response.body).to include("Request spec")
+  end
+
+  it "creates an article and redirects to it" do
+    expect {
+      post articles_path, params: { article: { title: "From a spec", body: "A body that is long enough." } }
+    }.to change(Article, :count).by(1)
+    expect(response).to redirect_to(article_path(Article.last))
+    expect(response).to have_http_status(:redirect)
+    expect(response).not_to be_successful
+  end
+
+  it "rejects an invalid article" do
+    post articles_path, params: { article: { title: "", body: "" } }
+    expect(response).to have_http_status(:unprocessable_content)
+    expect(response).not_to have_http_status(:redirect)
+  end
+end
+"#;
+
+const CONFIG: &str = "test_paths:\n  - spec/models\n  - spec/requests\n";
 
 fn app(spec: &str) -> emit_and_run::Overlay {
     emit_and_run::real_blog()
         .write("roundhouse.yml", CONFIG)
+        .write("spec/rails_helper.rb", RAILS_HELPER)
+        .write("spec/spec_helper.rb", SPEC_HELPER)
+        .write("spec/support/article_helpers.rb", SUPPORT)
         .write("spec/models/article_spec.rb", spec)
+        .write("spec/requests/articles_spec.rb", RESPONSE_SPEC)
 }
 
 // One emitted test file per example group that owns examples, named by
 // the spec file and the group.
-const FILES: [(&str, usize); 6] = [
+const FILES: [(&str, usize); 8] = [
     ("models_article_spec", 1),
     ("models_article_without_title_spec", 1),
     ("models_article_with_short_body_spec", 1),
     ("models_article_let_spec", 1),
     ("models_article_let_spec2", 1),
     ("models_article_block_expectations_spec", 2),
+    ("models_article_helper_configuration_spec", 1),
+    ("requests_articles_spec", 3),
 ];
 
 #[test]
@@ -143,6 +214,26 @@ fn failing_block_expectations_fail_the_emitted_test() {
         ("not_to change { Article.count }", "to change { Article.count }"),
     ] {
         let run = app(&SPEC.replacen(find, replace, 1)).run_test("test/models/models_article_block_expectations_spec_test.rb");
+        assert!(run.errors.is_empty(), "{find}: {:?}", run.errors);
+        assert!(!run.program_succeeded(), "`{replace}` passed:\n{}\n{}", run.stdout, run.stderr);
+    }
+}
+
+// The response matchers fail where rspec-rails' do.
+#[test]
+fn failing_response_matchers_fail_the_emitted_test() {
+    for (find, replace) in [
+        ("expect(response).to have_http_status(:ok)", "expect(response).to have_http_status(:not_found)"),
+        ("expect(response).not_to be_successful", "expect(response).to be_successful"),
+        ("expect(response).not_to have_http_status(:redirect)", "expect(response).to have_http_status(:redirect)"),
+    ] {
+        let run = emit_and_run::real_blog()
+            .write("roundhouse.yml", CONFIG)
+            .write("spec/rails_helper.rb", RAILS_HELPER)
+            .write("spec/spec_helper.rb", SPEC_HELPER)
+            .write("spec/support/article_helpers.rb", SUPPORT)
+            .write("spec/requests/articles_spec.rb", &RESPONSE_SPEC.replacen(find, replace, 1))
+            .run_test("test/models/requests_articles_spec_test.rb");
         assert!(run.errors.is_empty(), "{find}: {:?}", run.errors);
         assert!(!run.program_succeeded(), "`{replace}` passed:\n{}\n{}", run.stdout, run.stderr);
     }

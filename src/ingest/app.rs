@@ -2907,19 +2907,105 @@ end
         }
     }
 
+    // The RSpec files among them: a `*_spec.rb` whose top level is an
+    // example group (a `*_spec.rb` holding a test class is read as
+    // before). When there are any, RSpec's helper files are read once:
+    // what they configure applies to every spec file.
+    let is_spec = |f: &PathBuf| f.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with("_spec.rb"));
+    let mut rspec_files: crate::det::HashSet<PathBuf> = crate::det::HashSet::default();
+    for f in test_files.iter().filter(|f| is_spec(f)) {
+        if let Ok(source) = vfs.read(f) {
+            if super::spec::is_rspec_source(&source) {
+                rspec_files.insert(f.clone());
+            }
+        }
+    }
+    let mut spec_config = super::spec::SpecConfig::default();
+    if !rspec_files.is_empty() {
+        // The helpers the run loads: `.rspec`'s `--require`s, then each spec's own `require`s. RSpec's
+        // configuration is global, so a helper any selected spec loads configures every example.
+        let mut entries: Vec<&'static str> = Vec::new();
+        if let Ok(options) = vfs.read(&dir.join(".rspec")) {
+            let options = String::from_utf8_lossy(&options);
+            // RSpec skips comment lines and reads the rest shell-style: `--require "spec_helper"` names spec_helper.
+            let tokens: Vec<String> = options
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .flat_map(|l| l.split_whitespace().map(|w| w.trim_matches(|c| c == '"' || c == '\'').to_string()).collect::<Vec<_>>())
+                .collect();
+            let mut words = tokens.iter().map(String::as_str);
+            while let Some(word) = words.next() {
+                let required = match word.strip_prefix("--require=") {
+                    Some(name) => Some(name),
+                    None if word == "--require" || word == "-r" => words.next(),
+                    None => None,
+                };
+                if let Some(name) = required.and_then(super::spec::helper_file_name) {
+                    entries.push(name);
+                }
+            }
+        }
+        let mut specs: Vec<&PathBuf> = rspec_files.iter().collect();
+        specs.sort();
+        for f in specs {
+            let Ok(source) = vfs.read(f) else { continue };
+            for line in String::from_utf8_lossy(&source).lines() {
+                let line = line.trim();
+                let Some(rest) = line.strip_prefix("require_relative").or_else(|| line.strip_prefix("require")) else { continue };
+                // The first quoted argument, whatever follows it (`require "rails_helper" # setup`).
+                let rest = rest.trim().trim_start_matches('(');
+                let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else { continue };
+                let Some(required) = rest[1..].split(quote).next() else { continue };
+                if let Some(name) = super::spec::helper_file_name(required) {
+                    entries.push(name);
+                }
+            }
+        }
+        let mut loaded: crate::det::HashSet<&'static str> = crate::det::HashSet::default();
+        let mut support_loaded: crate::det::HashSet<PathBuf> = crate::det::HashSet::default();
+        for entry in entries {
+            load_spec_helper(vfs, dir, entry, &mut spec_config, &mut loaded, &mut support_loaded)?;
+        }
+        // Fixtures RSpec loads from a folder other than `test/fixtures`, which is all the emitted suite loads:
+        // the examples would read other data, so they are left out.
+        for path in std::mem::take(&mut spec_config.fixture_paths) {
+            let folder = path.trim_start_matches("./").trim_end_matches('/');
+            if folder == "test/fixtures" {
+                continue;
+            }
+            let full = dir.join(folder);
+            let holds_fixtures = vfs.is_dir(&full)
+                && vfs.read_dir(&full).is_ok_and(|entries| entries.iter().any(|e| e.to_string_lossy().ends_with(".yml")));
+            if holds_fixtures {
+                spec_config.refuse_all(
+                    &dir.join("spec/rails_helper.rb").display().to_string(),
+                    &format!("`config.fixture_paths` naming `{folder}` (the emitted suite loads `test/fixtures`)"),
+                )?;
+            }
+        }
+        spec_config.finish(&dir.join("spec/rails_helper.rb").display().to_string())?;
+    }
+
     for entry in test_files {
+        // In an app with RSpec files, RSpec runs only `*_spec.rb` files;
+        // the rest of its spec folder (support files, helpers) is read
+        // above or not at all, never as a Minitest file.
+        // Only the files RSpec's loader owns: its helpers and `spec/support`; a Minitest file there is still one.
+        let rspec_owned = entry.strip_prefix(dir).is_ok_and(|rel| {
+            rel == Path::new("spec/spec_helper.rb") || rel == Path::new("spec/rails_helper.rb") || rel.starts_with("spec/support")
+        });
+        if !rspec_files.is_empty() && rspec_owned {
+            continue;
+        }
         let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
-        // An RSpec file in a listed folder (`test_paths: [spec/models]`):
-        // a `*_spec.rb` whose top level is an example group. RSpec loads
-        // its own helper, never `test/test_helper.rb`, so nothing from
-        // that file is spliced into its modules. A `*_spec.rb` holding a
-        // test class is read as before.
-        if entry.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with("_spec.rb"))
-            && super::spec::is_rspec_source(&source)
-        {
-            if let Some(tms) =
-                unwrap_or_record(super::spec::ingest_spec_files(&source, &entry.display().to_string()))?
-            {
+        // RSpec loads its own helper, never `test/test_helper.rb`, so
+        // nothing from that file is spliced into a spec's modules.
+        if rspec_files.contains(&entry) {
+            if let Some(tms) = unwrap_or_record(super::spec::ingest_spec_files_with(
+                &source,
+                &entry.display().to_string(),
+                &spec_config,
+            ))? {
                 for mut tm in tms {
                     // Names are unique within one spec file, but two files
                     // can give the same one (`article/comments_spec.rb` and
@@ -16413,7 +16499,7 @@ fn splice_test_case_setup(tm: &mut TestModule, case_setup: &crate::expr::Expr) {
 /// The qualified one is rewritten to the bare one here rather than by
 /// keeping the module around, so there is exactly one definition of the
 /// value in the emitted file.
-fn splice_test_helpers(tm: &mut TestModule, helpers: &[LibraryClass]) {
+pub(super) fn splice_test_helpers(tm: &mut TestModule, helpers: &[LibraryClass]) {
     // Candidate pool: every shared instance method the class does not
     // already define itself (its own definition wins, as Ruby's class
     // body beats an included module).
@@ -17052,6 +17138,58 @@ fn mime_extension_lookups(app: &mut App) {
         e.node.for_each_child_mut(&mut rewrite);
     }
     crate::lower::for_each_emit_body(app, &mut rewrite);
+}
+
+
+
+/// One RSpec helper file (`spec/<name>.rb`), once, with what it loads where it loads it: another
+/// helper, and the support files its glob names. A file the configuration needs and cannot read
+/// leaves every example out (`SpecConfig::refuse_all`), since what it registers is unknown.
+fn load_spec_helper<V: Vfs + ?Sized>(
+    vfs: &V,
+    dir: &Path,
+    name: &'static str,
+    config: &mut super::spec::SpecConfig,
+    loaded: &mut crate::det::HashSet<&'static str>,
+    support_loaded: &mut crate::det::HashSet<PathBuf>,
+) -> IngestResult<()> {
+    if !loaded.insert(name) {
+        return Ok(());
+    }
+    let path = dir.join(format!("spec/{name}.rb"));
+    if path_has_symlink_component(vfs, dir, &path) || !vfs.exists(&path) {
+        return Ok(());
+    }
+    let file = path.display().to_string();
+    let Some(source) = read_or_ledger(vfs, &path)? else {
+        return config.refuse_all(&file, "a helper file that could not be read");
+    };
+    config.read_helper(&source, &file, &mut |config, load| match load {
+        super::spec::Load::Helper(other) => {
+            let other = super::spec::helper_file_name(&other).unwrap_or("spec_helper");
+            load_spec_helper(vfs, dir, other, config, loaded, support_loaded)
+        }
+        super::spec::Load::Support(glob) => {
+            let support = dir.join("spec/support");
+            if path_has_symlink_component(vfs, dir, &support) || !vfs.is_dir(&support) {
+                return Ok(());
+            }
+            let mut files = read_test_rb_files(vfs, dir, &support)?;
+            if glob == super::spec::SupportGlob::TopLevel {
+                files.retain(|f| f.parent() == Some(support.as_path()));
+            }
+            files.sort();
+            // Each glob reads what it matches that no earlier load read, as Ruby's `require` does.
+            files.retain(|f| support_loaded.insert(f.clone()));
+            for f in files {
+                match read_or_ledger(vfs, &f)? {
+                    Some(source) => config.read_support(&source, &f.display().to_string())?,
+                    None => config.refuse_all(&f.display().to_string(), "a support file that could not be read")?,
+                }
+            }
+            Ok(())
+        }
+    })
 }
 
 /// What a trimmed, non-comment config line sets

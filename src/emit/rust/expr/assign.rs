@@ -53,7 +53,12 @@ pub(super) fn emit_assign(target: &LValue, value: &Expr) -> String {
                 if back_propagated.is_some() {
                     record_back_propagated_hash(name_str.clone());
                 }
-                let ty = back_propagated.or_else(|| value.ty.clone());
+                // The binding holds the field's Rust type, not the body-typer's view of the read.
+                let field = match &*value.node {
+                    ExprNode::Ivar { name } if !in_constructor() && !in_module_singleton() => ivar_field_ty(name.as_str()),
+                    _ => None,
+                };
+                let ty = back_propagated.or(field).or_else(|| value.ty.clone());
                 if let Some(t) = ty {
                     // An Array index read is `T | Nil` in the IR —
                     // Ruby's `Array#[]` answers nil past the end — but
@@ -397,6 +402,21 @@ fn maybe_to_string_coercion(ivar_name: &str, value: &Expr, rhs: &str) -> String 
         Some(crate::ty::Ty::Union { variants }) if variants.iter().any(|v| matches!(v, crate::ty::Ty::Nil))
     );
     let str_color_handled = super::has_str_coercion(value);
+    if let (crate::ty::Ty::Array { elem }, ExprNode::Array { elements, .. }) = (&inner_field_ty, &*value.node) {
+        if matches!(&**elem, crate::ty::Ty::Str | crate::ty::Ty::Sym)
+            && elements.iter().any(|e| matches!(&*e.node, ExprNode::Lit { value: Literal::Str { .. } | Literal::Sym { .. } }) && !super::has_str_coercion(e))
+        {
+            let parts: Vec<String> = elements
+                .iter()
+                .map(|e| match &*e.node {
+                    ExprNode::Lit { value: Literal::Str { .. } | Literal::Sym { .. } } if !super::has_str_coercion(e) => format!("{}.to_string()", super::emit_expr(e)),
+                    _ => super::emit_expr(e),
+                })
+                .collect();
+            let vec = format!("vec![{}]", parts.join(", "));
+            return if needs_some { format!("Some({vec})") } else { vec };
+        }
+    }
     let coerced = if !str_color_handled
         && matches!(inner_field_ty, crate::ty::Ty::Str | crate::ty::Ty::Sym)
         && matches!(effective_value_ty.as_ref(), Some(crate::ty::Ty::Str) | Some(crate::ty::Ty::Sym))
