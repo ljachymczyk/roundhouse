@@ -231,15 +231,73 @@ fn reference_removal_aliases_cannot_remove_and_recreate_generated_operands() {
 }
 
 #[test]
+fn reference_removal_aliases_check_the_id_column_they_remove() {
+    // Rails 8.1.4 fails to drop `author_id` from under `label` on SQLite and
+    // PostgreSQL, but removes it when only an ordinary `author` feeds `label`.
+    // The key is a string, as `t.references :author, type: :string` writes it.
+    for (operand, rejected) in [("author_id", true), ("author", false)] {
+        let mut schema = ingest_schema(
+            format!(
+                "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table \"people\", force: :cascade do |t|\n    t.string \"author\"\n    t.string \"author_id\"\n    t.virtual \"label\", type: :string, as: \"'#' || {operand}\", stored: true\n  end\nend\n"
+            )
+            .as_bytes(),
+            "db/schema.rb",
+        )
+        .expect("generated-column schema should ingest");
+        let original = schema.clone();
+        let result = apply_migration(&mut schema, &one_operation("remove_reference :people, :author"));
+        if rejected {
+            let error = result.expect_err("removing a generated operand's `_id` column must be rejected");
+            assert!(error.contains("generated column") && error.contains("remove_reference"), "{error}");
+            assert_eq!(schema, original);
+        } else {
+            result.expect("an `_id` column no generated column reads is removable");
+            let names: Vec<&str> = table(&schema, "people").columns.iter().map(|c| c.name.as_str()).collect();
+            assert_eq!(names, ["id", "author", "label"]);
+        }
+    }
+}
+
+#[test]
+fn reference_removal_aliases_keep_a_generated_name_when_the_id_column_goes() {
+    // Rails 8.1.4 removes `author_id` and keeps a generated `author` that
+    // reads `first_name`, but fails when `author` reads `author_id`.
+    for (operand, rejected) in [("first_name", false), ("author_id", true)] {
+        let mut schema = ingest_schema(
+            format!(
+                "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table \"people\", force: :cascade do |t|\n    t.string \"first_name\"\n    t.string \"author_id\"\n    t.virtual \"author\", type: :string, as: \"{operand} || '!'\", stored: true\n  end\nend\n"
+            )
+            .as_bytes(),
+            "db/schema.rb",
+        )
+        .expect("generated-column schema should ingest");
+        let original = schema.clone();
+        let result = apply_migration(&mut schema, &one_operation("remove_reference :people, :author"));
+        if rejected {
+            let error = result.expect_err("removing a generated operand's `_id` column must be rejected");
+            assert!(error.contains("generated column") && error.contains("remove_reference"), "{error}");
+            assert_eq!(schema, original);
+        } else {
+            result.expect("a generated `author` that does not read `author_id` stays");
+            let names: Vec<&str> = table(&schema, "people").columns.iter().map(|c| c.name.as_str()).collect();
+            assert_eq!(names, ["id", "first_name", "author"]);
+        }
+    }
+}
+
+#[test]
 fn reference_removal_aliases_still_remove_ordinary_references() {
     for (verb, target) in [
         ("remove_reference", "author"),
         ("remove_belongs_to", "reviewer"),
     ] {
+        // `t.references "author"` is an `author_id` column with an index,
+        // as Rails creates it; `remove_reference :people, :author` removes both
+        let target_column = format!("{target}_id");
         let mut schema = reference_schema();
         let before = table(&schema, "people");
         assert!(matches!(
-            &column(before, target).col_type,
+            &column(before, &target_column).col_type,
             ColumnType::Reference { .. }
         ));
 
@@ -254,14 +312,20 @@ fn reference_removal_aliases_still_remove_ordinary_references() {
             people
                 .columns
                 .iter()
-                .all(|column| column.name.as_str() != target)
+                .all(|column| column.name.as_str() != target_column)
+        );
+        assert!(
+            people
+                .indexes
+                .iter()
+                .all(|index| index.columns.iter().all(|c| c.as_str() != target_column))
         );
         assert_eq!(column(people, "name").default.as_deref(), Some("keep"));
         assert!(!column(people, "name").nullable);
         let other_reference = if target == "author" {
-            "reviewer"
+            "reviewer_id"
         } else {
-            "author"
+            "author_id"
         };
         assert!(matches!(
             &column(people, other_reference).col_type,

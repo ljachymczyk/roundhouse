@@ -66,6 +66,8 @@ RSpec.describe Article, type: :model do
     it "change values" do
       expect { Article.create!(title: "New", body: "A body that is long enough.") }.to change(Article, :count).by(1)
       expect { article.title = "Renamed" }.to change { article.title }.from("Getting Started").to("Renamed")
+      # `from`'s argument is read when the matcher is built, before the block runs.
+      expect { article.title = "Again" }.to change { article.title }.from(article.title).to("Again")
       expect { article.valid? }.not_to change { Article.count }
     end
   end
@@ -179,7 +181,7 @@ fn a_failing_expectation_fails_the_emitted_test() {
     );
     let run = app(&failing).run_test("test/models/models_article_spec_test.rb");
     assert!(run.errors.is_empty(), "{:?}", run.errors);
-    assert!(!run.success, "a false `eq` passed:\n{}\n{}", run.stdout, run.stderr);
+    assert!(!run.program_succeeded(), "a false `eq` passed:\n{}\n{}", run.stdout, run.stderr);
 }
 
 // Two files can give one module name (`article/comments_spec.rb` and
@@ -200,7 +202,7 @@ fn spec_files_with_the_same_module_name_keep_their_own_tests() {
     let first = overlay().run_test("test/models/models_article_comments_spec_test.rb");
     let second = overlay().run_test("test/models/models_article_comments_spec2_test.rb");
     assert!(first.errors.is_empty() && second.errors.is_empty(), "{:?} {:?}", first.errors, second.errors);
-    assert!(first.success != second.success, "one file passes and the other fails:\n{}\n{}", first.stdout, second.stdout);
+    assert!(first.program_succeeded() != second.program_succeeded(), "one file passes and the other fails:\n{}\n{}", first.stdout, second.stdout);
 }
 
 // The block expectations fail where RSpec's do.
@@ -213,7 +215,7 @@ fn failing_block_expectations_fail_the_emitted_test() {
     ] {
         let run = app(&SPEC.replacen(find, replace, 1)).run_test("test/models/models_article_block_expectations_spec_test.rb");
         assert!(run.errors.is_empty(), "{find}: {:?}", run.errors);
-        assert!(!run.success, "`{replace}` passed:\n{}\n{}", run.stdout, run.stderr);
+        assert!(!run.program_succeeded(), "`{replace}` passed:\n{}\n{}", run.stdout, run.stderr);
     }
 }
 
@@ -233,8 +235,26 @@ fn failing_response_matchers_fail_the_emitted_test() {
             .write("spec/requests/articles_spec.rb", &RESPONSE_SPEC.replacen(find, replace, 1))
             .run_test("test/models/requests_articles_spec_test.rb");
         assert!(run.errors.is_empty(), "{find}: {:?}", run.errors);
-        assert!(!run.success, "`{replace}` passed:\n{}\n{}", run.stdout, run.stderr);
+        assert!(!run.program_succeeded(), "`{replace}` passed:\n{}\n{}", run.stdout, run.stderr);
     }
+}
+
+// Two `after` hooks: the generated teardown loads (each hook in its own `begin`/`ensure`), and the
+// second still runs when the first raises.
+#[test]
+fn every_after_hook_runs_when_one_raises() {
+    let spec = SPEC.replacen(
+        "  describe \"let\" do\n",
+        "  describe \"let\" do\n    after { raise \"second hook ran #{defined?(local_of_first) ? \"seeing\" : \"blind to\"} the first's local\" }\n    after { local_of_first = 1; raise \"first hook ran\" }\n",
+        1,
+    );
+    let run = app(&spec).run_test("test/models/models_article_let_spec_test.rb");
+    assert!(run.errors.is_empty(), "{:?}", run.errors);
+    let out = format!("{}{}", run.stdout, run.stderr);
+    assert!(!run.program_succeeded(), "the raising hooks did not fail the test:\n{out}");
+    assert!(!out.contains("syntax error") && !out.contains("SyntaxError"), "{out}");
+    // RSpec runs `after` hooks in reverse: the one written last first, and the other after it raises.
+    assert!(out.contains("second hook ran blind to the first's local"), "the hook after the raising one did not run on its own locals:\n{out}");
 }
 
 // An `after` hook runs after the example: one that raises fails it.
@@ -247,7 +267,7 @@ fn after_hooks_run_after_the_example() {
     );
     let run = app(&spec).run_test("test/models/models_article_let_spec_test.rb");
     assert!(run.errors.is_empty(), "{:?}", run.errors);
-    assert!(!run.success, "the raising after hook did not fail the test:\n{}\n{}", run.stdout, run.stderr);
+    assert!(!run.program_succeeded(), "the raising after hook did not fail the test:\n{}\n{}", run.stdout, run.stderr);
     assert!(format!("{}{}", run.stdout, run.stderr).contains("after hook ran"), "{}\n{}", run.stdout, run.stderr);
 }
 
@@ -283,7 +303,7 @@ fn rspec_mocks_run_as_mocha_on_ruby() {
             .write("spec/models/article_mocks_spec.rb", &MOCKS_SPEC.replacen(find, replace, 1))
             .run_test("test/models/models_article_mocks_spec_test.rb");
         assert!(run.errors.is_empty(), "{replace}: {:?}", run.errors);
-        assert!(!run.success, "`{replace}` passed:\n{}\n{}", run.stdout, run.stderr);
+        assert!(!run.program_succeeded(), "`{replace}` passed:\n{}\n{}", run.stdout, run.stderr);
     }
 }
 
@@ -346,7 +366,7 @@ fn app_method_stubs_from_specs_run_on_ruby() {
     ] {
         let run = stubs_app(&STUBS_SPEC.replacen(find, replace, 1)).run_test("test/models/models_greeter_spec_test.rb");
         assert!(run.errors.is_empty(), "{find}: {:?}", run.errors);
-        assert!(!run.success, "`{find}` -> `{replace}` passed:\n{}\n{}", run.stdout, run.stderr);
+        assert!(!run.program_succeeded(), "`{find}` -> `{replace}` passed:\n{}\n{}", run.stdout, run.stderr);
     }
 }
 
@@ -368,6 +388,21 @@ fn app_method_stubs_from_specs_pass_in_the_spinel_build() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+// A spec whose only Mocha call is a `double` still gets Mocha's helper wiring.
+#[test]
+fn a_double_only_spec_runs_on_ruby() {
+    let spec = r#"require "rails_helper"
+
+RSpec.describe Article, type: :model do
+  it "answers through a double" do
+    thing = double("thing", name: "Named")
+    expect(thing.name).to eq("Named")
+  end
+end
+"#;
+    app(SPEC).write("spec/models/article_double_spec.rb", spec).run_test("test/models/models_article_double_spec_test.rb").assert_passes();
 }
 
 // The point of the lane: the same examples run inside the Spinel build.
@@ -430,6 +465,6 @@ fn request_specs_run_as_integration_tests() {
 fn a_request_spec_with_the_wrong_status_fails() {
     let run = request_app(&REQUEST_SPEC.replace("eq(200)", "eq(404)")).run_test("test/models/requests_articles_spec_test.rb");
     assert!(run.errors.is_empty(), "{:?}", run.errors);
-    assert!(!run.success, "a wrong status passed:\n{}\n{}", run.stdout, run.stderr);
+    assert!(!run.program_succeeded(), "a wrong status passed:\n{}\n{}", run.stdout, run.stderr);
     assert!(run.stdout.contains("FAIL RequestsArticlesSpec#test_lists_the_articles: assertion failed"), "failed for another reason:\n{}\n{}", run.stdout, run.stderr);
 }

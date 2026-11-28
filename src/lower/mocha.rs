@@ -1253,7 +1253,8 @@ fn lower_app_answer(span: crate::span::Span, chain: &Chain, ctx: &mut AppMethods
     if params.iter().any(|p| p.keyword || p.rest || p.forwarding || p.default.is_some()) {
         return None;
     }
-    let Some(Ty::Fn { params: param_tys, ret, .. }) = signature else { return None };
+    let Some(Ty::Fn(sig)) = signature else { return None };
+    let (param_tys, ret) = (&sig.params, &sig.ret);
     if param_tys.len() != params.len() {
         return None;
     }
@@ -1318,7 +1319,7 @@ fn lower_app_answer(span: crate::span::Span, chain: &Chain, ctx: &mut AppMethods
     let slot = ctx.answer_slots.entry(key).or_insert_with(|| AnswerSlot {
         stem: stem.clone(),
         params: params.iter().zip(param_tys.iter()).map(|(p, t)| (p.name.clone(), (*t.ty).clone())).collect(),
-        ret: (*ret).clone(),
+        ret: (**ret).clone(),
         exceptions: BTreeSet::new(),
     });
     if let Some(e) = &raises {
@@ -1553,6 +1554,7 @@ fn guard_answer_slots(app: &mut App, slots: &BTreeMap<(String, String, bool), An
         parent_span: Default::default(),
         includes: Vec::new(),
         include_spans: Vec::new(),
+        include_statements: Vec::new(),
         methods: Vec::new(),
         nullable_columns: Vec::new(),
         origin: None,

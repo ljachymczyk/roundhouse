@@ -93,7 +93,7 @@ fn app_method_answers_fail_where_mocha_does() {
     ] {
         let run = app(&TEST.replacen(find, replace, 1)).run_test("test/models/greeter_test.rb");
         assert!(run.errors.is_empty(), "{replace}: {:?}", run.errors);
-        assert!(!run.success, "`{replace}` passed:\n{}\n{}", run.stdout, run.stderr);
+        assert!(!run.program_succeeded(), "`{replace}` passed:\n{}\n{}", run.stdout, run.stderr);
     }
 }
 

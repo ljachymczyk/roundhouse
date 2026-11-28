@@ -123,11 +123,11 @@ The supported subset:
   class, a literal message (equal to the error's message, or matched by a
   Regexp), or both; `expect { }.not_to raise_error`;
 - `expect { }.to change { value }` and `change(receiver, :message)`, bare
-  or with `by`, `by_at_least`, `by_at_most`, `from` and `to`; a collection
-  or String value is copied before the block runs, as RSpec does. RSpec
-  also compares the value's `hash` before and after; roundhouse does not,
-  so another object changed in place with an unchanged `==` is not seen
-  as a change.
+  or with `by`, `by_at_least`, `by_at_most`, `from` and `to`. As in
+  RSpec, the value is not copied: it and its `hash` are compared before
+  and after the block, so a value changed in place reads as a change (the
+  `by` forms compare the delta instead), and `from` is matched before the
+  block runs. An Array or Hash `from`/`to` must hold plain literals.
 - in a request spec (`type: :request`, or `spec/requests` with
   `infer_spec_type_from_file_location!`), the integration session's
   `get`, `post` and the other verbs, and on its `response`:
@@ -181,7 +181,8 @@ read.
 
 Anything else is refused by name: `roundhouse check` reports it, and
 `--continue` lists every refused construct and leaves out the examples
-that need it. Not read yet: test doubles, shared examples and contexts,
+that need it. Not read yet: `spy`, `instance_spy`, `class_spy` and
+`object_double`, shared examples and contexts,
 `around` hooks, `before(:all)` and `before(:suite)`, and modules from
 gems (`config.include FactoryBot::Syntax::Methods`).
 
@@ -318,7 +319,14 @@ A `require` of a Rails framework feature is left to the runtime, as are
 statement that cannot be carried is an error (`file_statement_unsupported`),
 as is a `require_relative` of a file the tree does not carry
 (`file_require_not_carried`). The `spinel` tree compiles the gem's
-declarations only.
+declarations and loads no file, so its boot runs the statements instead,
+ahead of the app's initializer code, in the order Ruby loads their files:
+the boot's requires as above, then the files declaring a constant the
+app's own code names and the files an `autoload` of such a constant
+names. Only a call on a class the tree carries is run there
+(`Warden::Strategies.add(:database_authenticatable, …)`); any other
+statement of those files, and one inside a file-level `if`, is a warning
+(`gem file statement`): the `spinel` tree does not run it.
 
 Extension gem facts also select the locked gems' Tapioca RBIs under
 `sorbet/rbi/gems/`. This includes gems classified as infrastructure or
