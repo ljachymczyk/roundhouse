@@ -94,9 +94,11 @@ end
     });
     assert_eq!(survey_files, strict_files, "no emitted behavior changed");
     assert_eq!(survey_emit, strict_emit);
+    let article = surveyed.models.iter().find(|m| m.name.0.as_str() == "Article").unwrap();
+    let unclaimed = roundhouse::lower::model_to_library::unclaimed::model_diagnostics(article, &surveyed.schema);
     assert!(
-        survey_diags.iter().any(|d| d.message.contains("labeled") && d.severity == roundhouse::diagnostic::Severity::Error),
-        "the unread declaration must stay reported: {survey_diags:?}"
+        unclaimed.iter().any(|d| d.message.contains("labeled") && d.severity == roundhouse::diagnostic::Severity::Error),
+        "the unread declaration must stay reported: {unclaimed:?}"
     );
     let article = survey_files
         .iter()

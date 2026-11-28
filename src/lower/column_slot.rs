@@ -96,6 +96,8 @@ impl Logical {
 pub struct ColumnSlot<'a> {
     col: &'a Column,
     codec: Option<Codec>,
+    /// A JSON column a `store` declares, read and written through Rails' indifferent coder.
+    store: bool,
 }
 
 impl<'a> ColumnSlot<'a> {
@@ -103,7 +105,8 @@ impl<'a> ColumnSlot<'a> {
     /// accessors, so a `json`/`jsonb` type there is not this codec.
     pub fn classify(col: &'a Column, model: &Model) -> Self {
         let codec = codec_for(&col.col_type, is_generic_json(col, model));
-        Self { col, codec }
+        let store = matches!(codec, Some(Codec::Json)) && super::serialize::json_store_columns(model).contains(&col.name);
+        Self { col, codec, store }
     }
 
     pub fn is_temporal(&self) -> bool {
@@ -209,7 +212,8 @@ impl<'a> ColumnSlot<'a> {
         if !self.is_json() {
             return None;
         }
-        Some(json_column(value.span, "dump", vec![value], super::model_to_library::ty_of_column_slot(self.col)))
+        let dump = if self.store { "dump_store" } else { "dump" };
+        Some(json_column(value.span, dump, vec![value], super::model_to_library::ty_of_column_slot(self.col)))
     }
 
     /// Method hydration calls. JSON skips `dump`. A temporal column
@@ -242,7 +246,7 @@ impl<'a> ColumnSlot<'a> {
             Expr::new(Span::synthetic(), ExprNode::Ivar { name: self.storage_name() }),
             super::model_to_library::ty_of_column_slot(self.col),
         );
-        json_column(Span::synthetic(), "load", vec![stored], Ty::Untyped)
+        json_column(Span::synthetic(), if self.store { "load_store" } else { "load" }, vec![stored], Ty::Untyped)
     }
 }
 

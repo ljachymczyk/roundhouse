@@ -117,7 +117,30 @@ pub(crate) fn token_for_decls(model: &Model) -> Vec<TokenForDecl> {
 /// `report_unclaimed_unknowns` asks.
 pub(crate) fn claims(model: &Model, span: Span) -> bool {
     model_decls(model).is_some()
-        && parse_decls(&model.body).iter().any(|d| matches!(d, Ok(decl) if decl.span == span))
+        && (parse_decls(&model.body).iter().any(|d| matches!(d, Ok(decl) if decl.span == span))
+            || superseded(&model.body, span))
+}
+
+/// A declaration a later one of the same purpose replaces, as Rails' `token_definitions` keeps only the last.
+fn superseded(body: &[ModelBodyItem], span: Span) -> bool {
+    let purposes: Vec<(Span, &Symbol)> = body
+        .iter()
+        .filter_map(|item| {
+            let ModelBodyItem::Unknown { expr, .. } = item else { return None };
+            let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { return None };
+            if method.as_str() != "generates_token_for" {
+                return None;
+            }
+            match args.first().map(|a| &*a.node) {
+                Some(ExprNode::Lit { value: Literal::Sym { value } }) => Some((expr.span, value)),
+                _ => None,
+            }
+        })
+        .collect();
+    purposes
+        .iter()
+        .position(|(s, _)| *s == span)
+        .is_some_and(|at| purposes[at + 1..].iter().any(|(_, p)| *p == purposes[at].1))
 }
 
 /// The last declaration of each purpose, or `None` when the model is

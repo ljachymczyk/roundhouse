@@ -397,7 +397,7 @@ raise unless Widget.where.not(number: "abc").order(:id).pluck(:id) == [0,1]
         failures.join("\n")
     );
     for body in &cases[..4] {
-        app()
+        let run = app()
             .write(
                 "app/models/widget.rb",
                 &format!("class Widget < ApplicationRecord\n{body}\nend\n"),
@@ -408,8 +408,10 @@ Widget.connection.execute("INSERT INTO widgets(id,number) VALUES(0,0),(1,1),(2,N
 raise unless Widget.where(number: "1suffix").order(:id).pluck(:id) == []
 raise unless Widget.where.not(number: "abc").order(:id).pluck(:id) == [0,1]
 "##,
-            )
-            .assert_passes();
+            );
+        // Only the query cast is under test; a declaration whose reader the output does not carry stays reported.
+        assert!(run.errors.iter().all(|e| e.contains("`attribute` in the body of `Widget`")), "{body}: {:#?}", run.errors);
+        assert!(run.program_succeeded(), "{body}: {}\n{}", run.stdout, run.stderr);
     }
 }
 

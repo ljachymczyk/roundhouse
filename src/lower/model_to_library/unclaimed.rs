@@ -94,6 +94,19 @@ pub(crate) fn unclaimed_calls(model: &Model, schema: &Schema) -> Vec<Unclaimed> 
             if crate::lower::sti_scope::turns_sti_off(expr).is_some() {
                 continue;
             }
+            // `false` is Rails' own default (no `config.active_record.strict_loading_by_default`), so writing it changes nothing.
+            if name == "strict_loading_by_default="
+                && matches!(args.as_slice(), [a] if matches!(&*a.node, ExprNode::Lit { value: Literal::Bool { value: false } }))
+            {
+                continue;
+            }
+            // `"type"` is Rails' own default, so writing it changes nothing.
+            if name == "inheritance_column="
+                && matches!(args.as_slice(), [a] if matches!(&*a.node, ExprNode::Lit { value: Literal::Str { value } } if value == "type")
+                    || matches!(&*a.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "type"))
+            {
+                continue;
+            }
             // Literal table settings are consumed by ingest::model's
             // explicit_class_setting; dynamic values remain unsupported.
             if matches!(name, "table_name=" | "table_name_prefix=")
@@ -199,7 +212,7 @@ pub(crate) fn unclaimed_calls(model: &Model, schema: &Schema) -> Vec<Unclaimed> 
         }
         // `serialize :col, coder: JSON` (and legacy positional `JSON`) —
         // claimed by lower::serialize; accessors go through RoundhouseJsonColumn.
-        if name == "serialize"
+        if matches!(name, "serialize" | "store")
             && crate::lower::serialize::serialize_decls(model)
                 .iter()
                 .any(|d| d.span == expr.span)
@@ -340,6 +353,10 @@ pub(crate) fn unclaimed_calls(model: &Model, schema: &Schema) -> Vec<Unclaimed> 
                     let written =
                         path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
                     if matches!(written.as_str(), "T::Sig" | "T::Helpers" | "T::Generic") {
+                        continue;
+                    }
+                    // Only makes `define_model_callbacks` callable, which `markers` lowers or reports itself.
+                    if written == "ActiveModel::Callbacks" {
                         continue;
                     }
                 }

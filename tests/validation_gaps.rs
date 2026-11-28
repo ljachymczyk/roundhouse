@@ -193,7 +193,8 @@ end
     assert_eq!(ruby.len(), presence.len(), "{ruby:?}");
     assert!(ruby.iter().all(|w| w.contains(", presence: not supported (ruby)")), "{ruby:?}");
     // Left unheld, the subclass's numericality reads the raw `"abc"`.
-    overlay().run_test("test/models/widget_test.rb").assert_passes();
+    // The one error is the `normalizes` no lowering reads (`with: method(:Integer)`).
+    overlay().run_test("test/models/widget_test.rb").assert_runs_reporting("`normalizes` in the body of `Parcel`");
 }
 
 /// The app's tests, as Rails runs them: the ruby target's runtime

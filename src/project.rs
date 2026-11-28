@@ -2382,6 +2382,24 @@ fn report_array_columns(app: &App, target: BuildTarget) {
 /// ActionController::Base, and only the Ruby family's runtime issues and
 /// verifies the token (`runtime/ruby/action_controller/authenticity_token.rb`).
 /// Elsewhere the check passes every request, so the gap is named once.
+/// `store :col, coder: JSON` reads its Hash by a Symbol as well, through the ruby overlay's
+/// HashWithIndifferentAccess; the other runtimes have none, so a Symbol key would read nothing.
+fn report_json_store(app: &App, target: BuildTarget) {
+    if matches!(target, BuildTarget::Ruby | BuildTarget::Jruby) {
+        return;
+    }
+    for model in &app.models {
+        for decl in crate::lower::serialize::serialize_decls(model).into_iter().filter(|d| d.store) {
+            crate::emit::diagnostics::report_unsupported(
+                decl.span,
+                target.as_str(),
+                "store",
+                "this target's runtime has no HashWithIndifferentAccess, so the stored Hash would not answer a Symbol key",
+            );
+        }
+    }
+}
+
 fn report_forgery_protection(app: &App, target: BuildTarget) {
     if matches!(target, BuildTarget::Blog | BuildTarget::Roda | BuildTarget::Futamura | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel) {
         return;
@@ -3922,6 +3940,7 @@ fn target_files_inner(
     report_sqlite_index_predicates(app);
     report_array_columns(app, target);
     report_forgery_protection(app, target);
+    report_json_store(app, target);
     report_native_ruby_syntax(app, target);
     report_self_bindings(app, target);
     report_ruby_only_sends(app, target);

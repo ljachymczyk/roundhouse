@@ -731,6 +731,14 @@ impl Run {
         self.success
     }
 
+    /// A program that runs although `check` reports what it drops: each error names `dropped`, and the
+    /// program ran clean. For a test of what runs beside a construct the output does not carry.
+    #[allow(dead_code)]
+    pub fn assert_runs_reporting(&self, dropped: &str) {
+        assert!(!self.errors.is_empty() && self.errors.iter().all(|e| e.contains(dropped)), "expected only `{dropped}`:\n{}", self.errors.join("\n"));
+        assert!(self.success, "the emitted program failed: `{}` in {}\n=== stdout ===\n{}\n=== stderr ===\n{}", self.command, self.emitted.display(), self.stdout, self.stderr);
+    }
+
     /// The whole claim: analysis and emit report no errors AND the emitted
     /// program ran clean. Either half alone is not support.
     pub fn assert_passes(&self) {

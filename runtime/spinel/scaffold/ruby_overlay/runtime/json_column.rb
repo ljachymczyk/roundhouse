@@ -22,4 +22,15 @@ module RoundhouseJsonColumn
     return nil if value.nil?
     ActiveSupport::JSON.encode_without_escape(value)
   end
+
+  # `store :col, coder: JSON`: Rails' `IndifferentCoder`, whose Hash reads by a Symbol too and stands in for nil.
+  def self.load_store(serialized)
+    decoded = serialized.nil? || serialized.empty? ? nil : JSON.parse(serialized)
+    decoded.is_a?(Hash) ? ActiveSupport::HashWithIndifferentAccess.new(decoded) : ActiveSupport::HashWithIndifferentAccess.new
+  end
+
+  def self.dump_store(value)
+    hash = value.is_a?(Hash) ? ActiveSupport::HashWithIndifferentAccess.new(value) : ActiveSupport::HashWithIndifferentAccess.new
+    ActiveSupport::JSON.encode_without_escape(hash)
+  end
 end

@@ -4721,9 +4721,13 @@ end
         ),
     ]);
     let errors = errors_of(&app);
-    assert_eq!(errors.len(), 2, "the two declined models' finders error; got {errors:?}");
-    assert!(errors.iter().any(|e| e.contains("Redeclared")), "got {errors:?}");
-    assert!(errors.iter().any(|e| e.contains("Quoted")), "got {errors:?}");
+    let declarations: Vec<_> = errors.iter().filter(|e| e.contains("`generates_token_for` in the body of")).collect();
+    assert_eq!(errors.len() - declarations.len(), 2, "the two declined models' finders error; got {errors:?}");
+    assert!(errors.iter().any(|e| e.contains("Redeclared") && !declarations.contains(&e)), "got {errors:?}");
+    assert!(errors.iter().any(|e| e.contains("Quoted") && !declarations.contains(&e)), "got {errors:?}");
+    // Each declaration of a declined model is dropped; Superseded's first is replaced, as in Rails.
+    assert_eq!(declarations.len(), 4, "got {errors:?}");
+    assert!(!declarations.iter().any(|e| e.contains("Superseded")), "got {errors:?}");
 }
 
 /// `ProductMailer.with(product:, subscriber:)` makes `params[:subscriber]`
