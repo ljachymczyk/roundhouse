@@ -90,6 +90,7 @@ module WebAuthn
   def self.configure
     GemFacade.fail!("WebAuthn.configure")
     yield Configuration.new
+    nil
   end
 
   def self.generate_user_id

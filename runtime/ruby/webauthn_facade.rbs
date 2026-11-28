@@ -51,7 +51,7 @@ module WebAuthn
   end
 
   def self.configuration: () -> Configuration
-  def self.configure: () { (Configuration) -> untyped } -> untyped
+  def self.configure: () { (Configuration) -> void } -> nil
   def self.generate_user_id: () -> String
 
   module PublicKeyCredential

@@ -1402,7 +1402,10 @@ fn every_runtime_method_body_concretely_typed() {
     // its block gives (+1 in active_storage.rb), as `transaction` does; the
     // thread-held url_options are read through `.to_s` and add none.
     // The ceiling is the measure.
-    const CEILING: usize = 1014;
+    // MEASURED 1015 on the webauthn façade (1014): `WebAuthn.configure`'s
+    // yield is its block's value (+1 in webauthn_facade.rb), as `set` and
+    // `transaction` are; the method itself answers nil and adds none.
+    const CEILING: usize = 1015;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}"
