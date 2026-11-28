@@ -12528,9 +12528,11 @@ fn walk_load_time_callee_paths(
             let mut chain = Some(class);
             let mut steps = 0;
             let mut defines_new = false;
+            let mut new_supers = false;
             while let Some(c) = chain.filter(|_| steps < 32) {
                 if own_new(c) {
                     defines_new = true;
+                    new_supers = c.methods.iter().any(|m| m.name.as_str() == "new" && m.receiver == MethodReceiver::Class && contains_super(&m.body));
                     break;
                 }
                 steps += 1;
@@ -12542,6 +12544,10 @@ fn walk_load_time_callee_paths(
                 (method.as_str(), side)
             };
             walk_load_time_method(class, called, on, if splat { 0 } else { given }, classes, visited, out, depth);
+            // (a `new` whose `super` reaches Class#new runs `initialize` too)
+            if method.as_str() == "new" && side == MethodReceiver::Class && new_supers {
+                walk_load_time_method(class, "initialize", MethodReceiver::Instance, 0, classes, visited, out, depth);
+            }
         }
     }
 
@@ -12621,7 +12627,9 @@ fn walk_load_time_method(
                     // Not the defining class as self: the receiver's, whose methods a receiverless call reaches first.
                     walk_load_time_callee_paths(e, Some((class, on)), classes, visited, out, depth - 1);
                 }
-                if let Some(n) = super_given(&m.body, given) {
+                // (a bare `super` forwards every positional the method binds, its defaults' too)
+                let bound = if m.params.iter().any(|p| p.rest) { given } else { given.max(m.params.iter().filter(positional).count()) };
+                if let Some(n) = super_given(&m.body, bound) {
                     supers = Some(supers.map_or(n, |s| s.min(n)));
                 }
             }

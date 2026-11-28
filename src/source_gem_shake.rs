@@ -574,12 +574,21 @@ impl<'a> Gems<'a> {
             None => self.entries.iter().flat_map(|(k, v)| v.iter().map(move |e| (k.as_str(), e))).collect(),
         };
         // Each write with the class and side it is written in: its value's constants are that class's.
+        // (a parameter default runs ahead of the body; a class-body write is the class side's)
         for (owner, entry) in entries {
             for m in &entry.methods {
                 let mut found = Vec::new();
                 walk(&m.body, name, &mut found);
+                for d in m.params.iter().filter_map(|p| p.default.as_ref()) {
+                    walk(d, name, &mut found);
+                }
                 out.extend(found.into_iter().map(|v| (owner, m.receiver == MethodReceiver::Class, v)));
             }
+            let mut found = Vec::new();
+            for init in &entry.class_ivar_initializers {
+                walk(init, name, &mut found);
+            }
+            out.extend(found.into_iter().map(|v| (owner, true, v)));
         }
         out
     }
@@ -2265,6 +2274,11 @@ mod tests {
         let reach = |table: &str| reach_from(table, "Kit::Table");
         assert!(reach(
             "module Kit\n  class Table\n    def self.names = [:secret]\n    def names = [:size]\n    NAMES = names\n\n    def same?(other)\n      NAMES.all? { |n| other.public_send(n) }\n    end\n  end\nend\n",
+        ));
+        // A class-side memo a class-body write already set.
+        assert!(reach_from(
+            "module Kit\n  class Table\n    @filters = [:secret]\n\n    def self.filters\n      @filters ||= [:size]\n    end\n\n    def self.check(other)\n      filters.all? { |n| other.public_send(n) }\n    end\n\n    def same?(other) = true\n  end\nend\n",
+            "Kit::Table.check(other) && Kit::Table",
         ));
         // A constant whose later initializer names itself is read to a bound.
         assert!(reach(
