@@ -151,6 +151,8 @@ mod utc_zone_time;
 mod model_body_unknown_call;
 #[path = "emit_and_run/rspec_specs.rs"]
 mod rspec_specs;
+#[path = "emit_and_run/mocha_app_answers.rs"]
+mod mocha_app_answers;
 #[path = "support/after_initialize_boot.rs"]
 mod after_initialize_boot_contract;
 #[path = "emit_and_run/after_initialize.rs"]
