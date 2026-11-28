@@ -553,6 +553,69 @@ impl<'a> Gems<'a> {
         self.names.contains(c.name.0.as_str())
     }
 
+    /// The values `@name` is assigned in class `c`'s methods.
+    fn ivar_writes<'s>(&'s self, c: Option<&str>, name: &str) -> Vec<(&'s str, bool, &'a Expr)> {
+        fn walk<'e>(e: &'e Expr, name: &str, out: &mut Vec<&'e Expr>) {
+            match &*e.node {
+                ExprNode::Assign { target: crate::expr::LValue::Ivar { name: n }, value }
+                | ExprNode::OpAssign { target: crate::expr::LValue::Ivar { name: n }, value, .. } if n.as_str() == name => out.push(value),
+                _ => {}
+            }
+            e.node.for_each_child(&mut |child| walk(child, name, out));
+        }
+        let mut out = Vec::new();
+        // (an instance of `c` runs its ancestors' writes, and one of a subclass the subclass's too)
+        let entries: Vec<(&'s str, &&'a LibraryClass)> = match c {
+            Some(c) => {
+                let up = self.ancestors(c);
+                self.entries.iter().filter(|(k, _)| up.contains(k) || self.ancestors(k).iter().any(|a| a == c))
+                    .flat_map(|(k, v)| v.iter().map(move |e| (k.as_str(), e))).collect()
+            }
+            None => self.entries.iter().flat_map(|(k, v)| v.iter().map(move |e| (k.as_str(), e))).collect(),
+        };
+        // Each write with the class and side it is written in: its value's constants are that class's.
+        // (a parameter default runs ahead of the body; a class-body write is the class side's)
+        for (owner, entry) in entries {
+            for m in &entry.methods {
+                let mut found = Vec::new();
+                walk(&m.body, name, &mut found);
+                for d in m.params.iter().filter_map(|p| p.default.as_ref()) {
+                    walk(d, name, &mut found);
+                }
+                out.extend(found.into_iter().map(|v| (owner, m.receiver == MethodReceiver::Class, v)));
+            }
+            let mut found = Vec::new();
+            for init in &entry.class_ivar_initializers {
+                walk(init, name, &mut found);
+            }
+            out.extend(found.into_iter().map(|v| (owner, true, v)));
+        }
+        out
+    }
+
+    /// Does a gem's code call a method that changes it on a constant of this name (`NAMES << :secret`)? Its
+    /// written value is then not all it holds.
+    fn const_mutated(&self, leaf: &str) -> bool {
+        fn walk(e: &Expr, leaf: &str) -> bool {
+            if let ExprNode::Send { recv: Some(r), method, .. } = &*e.node
+                && let ExprNode::Const { path } = &*r.node
+                && path.last().is_some_and(|p| p.as_str() == leaf)
+                && (method.as_str().ends_with('!') || matches!(method.as_str(), "<<" | "push" | "append" | "concat" | "replace" | "unshift" | "prepend" | "insert" | "clear" | "delete" | "delete_at" | "delete_if" | "keep_if" | "pop" | "shift" | "fill" | "[]="))
+            {
+                return true;
+            }
+            let mut found = false;
+            e.node.for_each_child(&mut |child| found = found || walk(child, leaf));
+            found
+        }
+        self.entries.values().flatten().any(|c| {
+            c.methods.iter().any(|m| walk(&m.body, leaf))
+                || c.unknown_calls.iter().any(|e| walk(e, leaf))
+                || c.class_ivar_initializers.iter().any(|e| walk(e, leaf))
+                || c.constants.iter().any(|(_, v)| walk(v, leaf))
+        })
+    }
+
     fn known(&self, name: &str) -> bool {
         self.entries.contains_key(name)
     }
@@ -838,7 +901,7 @@ impl<'a> Gems<'a> {
             consts.push((None, "ActionView::Base".to_string()));
         }
         // Not only the app's code: the stack builds each middleware (`Warden::Manager.new(app) { … }`) and calls it.
-        for class in &app.gem_middlewares {
+        for class in app.gem_middlewares.iter().chain(&app.app_outermost_middlewares) {
             consts.push((None, class.clone()));
         }
         // Then Rails finalizes the routes (`ActionDispatch::Routing::RouteSet.finalize_app!`), which a gem prepends to.
@@ -1499,6 +1562,169 @@ fn names_of(e: &Expr, locals: &HashMap<String, Option<Vec<Name>>>, gems: Option<
     }
 }
 
+/// The names the elements of `e` may be: an Array literal's, a gem constant's that holds one, what `select` and its kin
+/// keep of them, and what a method of self's answers (`@filters ||= FILTERS.select { … }`); `None` when any.
+fn elems_names(e: &Expr, gems: Option<&Gems<'_>>, context: Option<(&str, bool, &str)>, depth: u8) -> Option<Vec<Name>> {
+    match &*e.node {
+        // (a nil holds no names: iterating it raises)
+        ExprNode::Lit { value: Literal::Nil } => Some(Vec::new()),
+        ExprNode::Array { elements, .. } => elements.iter().try_fold(Vec::new(), |mut all, el| {
+            all.extend(names_of(el, &HashMap::default(), gems, context, depth)?);
+            Some(all)
+        }),
+        ExprNode::Send { recv: Some(r), method, .. }
+            if matches!(method.as_str(), "select" | "filter" | "reject" | "sort" | "uniq" | "compact" | "to_a" | "freeze" | "dup" | "reverse") =>
+        {
+            // Not the builtin's elements where a gem reopens Array with its own of the name.
+            if gems.is_some_and(|g| g.entries.get("Array").into_iter().flatten().any(|c| c.methods.iter().any(|m| m.name == *method))) {
+                return None;
+            }
+            elems_names(r, gems, context, depth)
+        }
+        ExprNode::Const { path } => {
+            let gems = gems?;
+            let name = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
+            let (owner, leaf) = match name.rsplit_once("::") {
+                Some((o, l)) => (Some(gems.resolve(context.map(|c| c.0), o)?), l.to_string()),
+                None => (context.map(|c| c.0.to_string()), name.clone()),
+            };
+            let held = |o: &str| -> Vec<&Expr> {
+                gems.entries.get(o).into_iter().flatten().flat_map(|c| c.constants.iter()).filter(|(n, _)| n.as_str() == leaf).map(|(_, v)| v).collect()
+            };
+            // Not one owner when the body's class is not known (a root's walk): every gem class's constant of the name.
+            let mut owner_name: Option<String> = None;
+            let values: Vec<&Expr> = match owner {
+                Some(owner) => {
+                    let (o, v) = std::iter::once(owner.clone()).chain(gems.ancestors(&owner)).map(|o| { let v = held(&o); (o, v) }).find(|(_, v)| !v.is_empty())?;
+                    owner_name = Some(o);
+                    v
+                }
+                None => gems.entries.keys().flat_map(|o| held(o)).collect(),
+            };
+            if values.is_empty() || gems.const_mutated(&leaf) {
+                return None;
+            }
+            // (in the defining class body's context: a constant its value names is that class's, a call its class method)
+            let defining = owner_name.as_deref().map(|o| (o, true, ""));
+            // (a level spent per initializer followed: `NAMES = NAMES.freeze` names itself)
+            let depth = depth.checked_sub(1)?;
+            values.into_iter().try_fold(Vec::new(), |mut all, v| {
+                all.extend(elems_names(v, Some(gems), defining.or(context), depth)?);
+                Some(all)
+            })
+        }
+        ExprNode::Seq { exprs } => elems_names(exprs.last()?, gems, context, depth),
+        // `@filters ||= …` keeps what another write stored: those writes' values too.
+        ExprNode::OpAssign { target: crate::expr::LValue::Ivar { name }, value, .. } => {
+            let mut names = elems_names(value, gems, context, depth)?;
+            let gems = gems?;
+            // (every gem class's writes of the name where the body's class is not known, a root's walk)
+            for (owner, side, other) in gems.ivar_writes(context.map(|c| c.0), name.as_str()) {
+                if !std::ptr::eq(other, value) {
+                    // (one level spent per write followed: two memos that store each other cycle)
+                    names.extend(elems_names(other, Some(gems), Some((owner, side, "")), depth.checked_sub(1)?)?);
+                }
+            }
+            Some(names)
+        }
+        ExprNode::OpAssign { value, .. } | ExprNode::Assign { value, .. } => elems_names(value, gems, context, depth),
+        // `@filters || (@filters = …)`: what the memo holds is what its write stores.
+        ExprNode::BoolOp { left, right, .. } if matches!(&*left.node, ExprNode::Ivar { .. }) => elems_names(right, gems, context, depth),
+        ExprNode::Send { recv, method, args, block: None, .. }
+            if depth > 0 && args.is_empty() && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) =>
+        {
+            let gems = gems?;
+            let Some((c, side, _)) = context else {
+                // Not one class's when the body's class is not known (a root's walk): every gem method of the name.
+                // Nor gems' alone where an app model defines it: that body's names are not read here.
+                if gems.model_copies.keys().any(|(_, _, n)| n == method.as_str()) {
+                    return None;
+                }
+                let bodies: Vec<(&str, bool, &Expr)> = gems.entries.iter()
+                    .flat_map(|(o, entries)| entries.iter().flat_map(|entry| entry.methods.iter()).map(move |m| (o.as_str(), m)))
+                    .filter(|(_, m)| m.name == *method && m.params.is_empty())
+                    .map(|(o, m)| (o, m.receiver == MethodReceiver::Class, &m.body))
+                    .collect();
+                if bodies.is_empty() {
+                    return None;
+                }
+                return bodies.into_iter().try_fold(Vec::new(), |mut all, (o, side, body)| {
+                    all.extend(elems_names_returned(body, Some(gems), Some((o, side, "")), depth - 1)?);
+                    Some(all)
+                });
+            };
+            let (owner, body) = gems.ancestors(c).into_iter().find_map(|a| {
+                gems.entries.get(a.as_str()).into_iter().flatten().flat_map(|entry| entry.methods.iter())
+                    .find(|m| m.name == *method && (m.receiver == MethodReceiver::Class) == side)
+                    .map(|m| (a.clone(), &m.body))
+            })?;
+            // Not an inherited body that calls on self: a subclass's override would answer there.
+            if owner != c && calls_on_self(body) {
+                return None;
+            }
+            // Nor a method a subclass of the body's class overrides: self there may be that subclass's instance.
+            let overridden = gems.entries.iter().any(|(k, entries)| {
+                k != c && gems.ancestors_on(k, side).iter().any(|a| a == c)
+                    && entries.iter().any(|e| e.methods.iter().any(|m| m.name == *method && (m.receiver == MethodReceiver::Class) == side))
+            });
+            if overridden {
+                return None;
+            }
+            // In the defining class's context (a constant it names is its own), and every value it may return.
+            elems_names_returned(body, Some(gems), Some((owner.as_str(), side, "")), depth - 1)
+        }
+        _ => None,
+    }
+}
+
+/// Does `e` call a method on self (receiverless, or on `self`)?
+fn calls_on_self(e: &Expr) -> bool {
+    if let ExprNode::Send { recv, .. } = &*e.node
+        && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+    {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |child| found = found || calls_on_self(child));
+    found
+}
+
+/// The names the elements of what method body `body` returns may be: its tail's and every `return`'s.
+fn elems_names_returned(body: &Expr, gems: Option<&Gems<'_>>, context: Option<(&str, bool, &str)>, depth: u8) -> Option<Vec<Name>> {
+    let mut returned = Vec::new();
+    collect_returns(body, &mut returned);
+    let mut names = elems_names(body, gems, context, depth)?;
+    for value in returned {
+        names.extend(elems_names(value, gems, context, depth)?);
+    }
+    Some(names)
+}
+
+/// The builtin classes a union of builtin values is of; `None` when a member may be any other object.
+fn builtin_targets(variants: &[Ty]) -> Option<Vec<Target>> {
+    let mut out: Vec<Target> = Vec::new();
+    for v in variants {
+        let names: &[&str] = match v {
+            Ty::Int => &["Integer"],
+            Ty::Float => &["Float"],
+            Ty::Str => &["String"],
+            Ty::Sym => &["Symbol"],
+            Ty::Nil => &["NilClass"],
+            Ty::Bool => &["TrueClass", "FalseClass"],
+            Ty::Array { .. } | Ty::Tuple { .. } => &["Array"],
+            Ty::Hash { .. } | Ty::Record { .. } => &["Hash"],
+            _ => return None,
+        };
+        for n in names {
+            let t = Target::Virtual(n.to_string(), false);
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 fn collect_returns<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
     if let ExprNode::Return { value } = &*e.node {
         out.push(value);
@@ -1530,6 +1756,33 @@ fn bind_locals(e: &Expr, gems: Option<&Gems<'_>>, context: Option<(&str, bool, &
                     bind(name.as_str(), None);
                 }
             }
+        }
+        // `[:title, :body].map { |c| record.public_send(c) }` (lobsters' FullTextSearch, its columns spelled in at the
+        // include), `FILTERS.select { … }`, `filters.all? { |property| … }` (mission_control's JobsRelation): the block's
+        // first parameter holds each element's name.
+        ExprNode::Send { recv: Some(r), method, block: Some(b), .. }
+            if matches!(method.as_str(), "each" | "map" | "collect" | "flat_map" | "filter_map" | "select" | "filter" | "reject"
+                | "any?" | "all?" | "none?" | "find" | "detect" | "each_with_index" | "each_with_object" | "sum" | "count")
+                && let ExprNode::Lambda { params, rest_param: None, extra_params, block_param, body, .. } = &*b.node
+                && let Some(first) = params.first()
+                // (not with a parameter default, which runs in the block and may write a local the body reads)
+                && extra_params.iter().all(|p| p.default.is_none()) =>
+        {
+            // Not the receiver's elements where a gem reopens Array with its own iterator of the name.
+            let reopened = gems.is_some_and(|g| g.entries.get("Array").into_iter().flatten().any(|c| c.methods.iter().any(|m| m.name == *method)));
+            let names = if reopened { None } else { elems_names(r, gems, context, 2) };
+            bind(first.as_str(), names);
+            for p in params.iter().skip(1).chain(extra_params.iter().map(|p| &p.name)).chain(block_param.iter()) {
+                bind(p.as_str(), None);
+            }
+            bind_locals(r, gems, context, locals);
+            if let ExprNode::Send { args, .. } = &*e.node {
+                for a in args {
+                    bind_locals(a, gems, context, locals);
+                }
+            }
+            bind_locals(body, gems, context, locals);
+            return;
         }
         ExprNode::Lambda { params, rest_param, extra_params, block_param, .. } => {
             for p in params.iter().chain(rest_param.iter()).chain(extra_params.iter().map(|p| &p.name)).chain(block_param.iter()) {
@@ -1570,6 +1823,8 @@ fn scan(e: &Expr, s: &mut Scan<'_>) {
             }
         }
         ExprNode::Send { recv, method, args, block, .. } => {
+            // The other builtin classes a union receiver may be of (`length[:dur]` of an Integer, String or bool).
+            let mut also: Vec<Target> = Vec::new();
             let target = match recv {
                 None => s.context.map_or(Target::Any, |(c, side, _)| Target::Virtual(c.to_string(), side)),
                 Some(r) => match &*r.node {
@@ -1597,32 +1852,46 @@ fn scan(e: &Expr, s: &mut Scan<'_>) {
                         Some(Ty::Str) => Target::Virtual("String".to_string(), false),
                         Some(Ty::Sym) => Target::Virtual("Symbol".to_string(), false),
                         Some(Ty::Int) => Target::Virtual("Integer".to_string(), false),
+                        Some(Ty::Union { variants }) => match builtin_targets(variants) {
+                            Some(mut all) => {
+                                let first = all.remove(0);
+                                also = all;
+                                first
+                            }
+                            None => Target::Any,
+                        },
                         _ => Target::Any,
                     },
                 },
             };
             let by_name = matches!(method.as_str(), "send" | "public_send" | "__send__" | "method" | "public_method" | "respond_to?" | "instance_method");
             s.calls.push((target.clone(), method.as_str().to_string()));
+            for t in &also {
+                s.calls.push((t.clone(), method.as_str().to_string()));
+            }
             if block.is_some() {
-                let on = match &target {
-                    Target::Virtual(c, _) if !c.starts_with('\u{0}') => Some(c.clone()),
-                    _ => None,
-                };
                 let named: Vec<String> = match args.first().map(|a| &*a.node) {
                     _ if !matches!(method.as_str(), "send" | "public_send" | "__send__") => vec![method.as_str().to_string()],
                     Some(ExprNode::Lit { value: Literal::Sym { value } }) => vec![value.as_str().to_string()],
                     // Not every method's when the receiver's class is known: one of its lineage's (`Class\u{1}*`).
                     _ => vec!["*".to_string()],
                 };
-                let named: Vec<String> = match &on {
-                    Some(c) => named.into_iter().map(|n| format!("{c}\u{1}{n}")).collect(),
-                    None => named,
-                };
                 let forwarder = block.as_ref().and_then(|b| s.forwarder(b));
-                s.calls.extend(named.into_iter().map(|n| match &forwarder {
-                    Some(from) => (Target::Any, format!("{FORWARD}{from}\u{2}{n}")),
-                    None => (Target::Any, format!("{BLOCK}{n}")),
-                }));
+                // For each class a union receiver may be of, as its call is.
+                for t in std::iter::once(&target).chain(also.iter()) {
+                    let on = match t {
+                        Target::Virtual(c, _) if !c.starts_with('\u{0}') => Some(c.clone()),
+                        _ => None,
+                    };
+                    let named: Vec<String> = match &on {
+                        Some(c) => named.iter().map(|n| format!("{c}\u{1}{n}")).collect(),
+                        None => named.clone(),
+                    };
+                    s.calls.extend(named.into_iter().map(|n| match &forwarder {
+                        Some(from) => (Target::Any, format!("{FORWARD}{from}\u{2}{n}")),
+                        None => (Target::Any, format!("{BLOCK}{n}")),
+                    }));
+                }
             }
             s.pass(method.as_str(), Some(args));
             // `after_update :send_email_changed_notification, if: :send_email_changed_notification?` in a class body
@@ -1663,13 +1932,18 @@ fn scan(e: &Expr, s: &mut Scan<'_>) {
                     let own = s.context.is_none() && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef));
                     let rest = if matches!(method.as_str(), "method" | "public_method") { None } else { Some(&args[1..]) };
                     s.send_by(if own { &Target::AppSelf } else { &target }, &args[0], rest);
+                    for t in also.iter().filter(|_| !own) {
+                        s.send_by(t, &args[0], rest);
+                    }
                     // The Method is called later, maybe with a block (`method(name).call { … }`), as a `method(:name)` is.
                     if matches!(method.as_str(), "method" | "public_method") {
-                        let every = match &target {
-                            Target::Virtual(c, _) if !c.starts_with('\u{0}') => format!("{c}\u{1}*"),
-                            _ => "*".to_string(),
-                        };
-                        s.calls.push((Target::Any, format!("{BLOCK}{every}")));
+                        for t in std::iter::once(&target).chain(also.iter()) {
+                            let every = match t {
+                                Target::Virtual(c, _) if !c.starts_with('\u{0}') => format!("{c}\u{1}*"),
+                                _ => "*".to_string(),
+                            };
+                            s.calls.push((Target::Any, format!("{BLOCK}{every}")));
+                        }
                     }
                 }
                 _ => {}
@@ -1946,6 +2220,85 @@ mod tests {
         let reached = gems.reach(app);
         assert_eq!(reached, reference(&gems, app), "the worklist and the fixpoint disagree");
         reached
+    }
+
+    /// A send whose name a block takes from a list (a gem constant's, `select`ed; an app's literal) and one on a value
+    /// of builtin classes only: neither reaches every method of every reached class (lobsters' FullTextSearch, its
+    /// FlaggedCommenters' `length[:dur].send(…)`, mission_control's JobsRelation), which kept parslet's `Parslet.exp`
+    /// and through it the `Transform` whose `Context` Spinel refuses.
+    #[test]
+    fn a_name_a_list_holds_reaches_only_the_list_s_methods() {
+        let app = spinel_app(
+            &[("kit (1.0)", &[])],
+            &[
+                ("kit-1.0/lib/kit.rb", "require \"kit/table\"\nrequire \"kit/hidden\"\nrequire \"kit/deep\"\n"),
+                (
+                    "kit-1.0/lib/kit/table.rb",
+                    "module Kit\n  class Table\n    FILTERS = %i[size label]\n\n    def filters\n      @filters ||= FILTERS.select { |f| f }\n    end\n\n    def same?(other)\n      filters.all? { |property| other.public_send(property) }\n    end\n  end\nend\n",
+                ),
+                ("kit-1.0/lib/kit/hidden.rb", "module Kit\n  class Hidden\n    def secret\n      Kit::Deep.new\n    end\n  end\nend\n"),
+                ("kit-1.0/lib/kit/deep.rb", "module Kit\n  class Deep\n  end\nend\n"),
+            ],
+            &[(
+                "app/models/article.rb",
+                "class Article < ApplicationRecord\n",
+                "class Article < ApplicationRecord\n  def checked(other)\n    Kit::Hidden\n    Kit::Table.new.same?(other)\n  end\n\n  def columns\n    [:title, :body].map { |c| public_send(c) }\n  end\n\n",
+            )],
+        );
+        let reached = reached(&app);
+        assert!(reached.methods.contains(&("Kit::Table".to_string(), false, "same?".to_string())));
+        assert!(reached.classes.contains("Kit::Hidden"));
+        assert!(!reached.methods.contains(&("Kit::Hidden".to_string(), false, "secret".to_string())), "a name the list does not hold: {:?}", reached.methods);
+    }
+
+    /// A constant's initializer runs in its class body, where a receiverless call is the class method; two memos that
+    /// store each other are read to a bound, not until the stack runs out.
+    #[test]
+    fn a_constant_initializer_reads_class_side_and_cyclic_memos_stop() {
+        let reach_from = |table: &str, made: &str| {
+            let app = spinel_app(
+                &[("kit (1.0)", &[])],
+                &[
+                    ("kit-1.0/lib/kit.rb", "require \"kit/table\"\nrequire \"kit/hidden\"\n"),
+                    ("kit-1.0/lib/kit/table.rb", table),
+                    ("kit-1.0/lib/kit/hidden.rb", "module Kit\n  class Hidden\n    def secret\n      1\n    end\n  end\nend\n"),
+                ],
+                &[(
+                    "app/models/article.rb",
+                    "class Article < ApplicationRecord\n",
+                    &format!("class Article < ApplicationRecord\n  def checked(other)\n    Kit::Hidden\n    {made}.new.same?(other)\n  end\n\n"),
+                )],
+            );
+            reached(&app).methods.contains(&method("Kit::Hidden", false, "secret"))
+        };
+        let reach = |table: &str| reach_from(table, "Kit::Table");
+        assert!(reach(
+            "module Kit\n  class Table\n    def self.names = [:secret]\n    def names = [:size]\n    NAMES = names\n\n    def same?(other)\n      NAMES.all? { |n| other.public_send(n) }\n    end\n  end\nend\n",
+        ));
+        // A class-side memo a class-body write already set.
+        assert!(reach_from(
+            "module Kit\n  class Table\n    @filters = [:secret]\n\n    def self.filters\n      @filters ||= [:size]\n    end\n\n    def self.check(other)\n      filters.all? { |n| other.public_send(n) }\n    end\n\n    def same?(other) = true\n  end\nend\n",
+            "Kit::Table.check(other) && Kit::Table",
+        ));
+        // A constant whose later initializer names itself is read to a bound.
+        assert!(reach(
+            "module Kit\n  class Table\n    NAMES = [:secret]\n    NAMES = NAMES.freeze\n\n    def same?(other)\n      NAMES.all? { |n| other.public_send(n) }\n    end\n  end\nend\n",
+        ));
+        // A parent's write of the memo reads its constant in the parent.
+        assert!(reach(
+            "module Kit\n  class Base\n    FILTERS = [:secret]\n\n    def initialize\n      @filters = FILTERS\n    end\n  end\n\n  class Table < Base\n    FILTERS = [:size]\n\n    def filters\n      @filters ||= [:size]\n    end\n\n    def same?(other)\n      filters.all? { |n| other.public_send(n) }\n    end\n  end\nend\n",
+        ));
+        // A memo's existing value a parent's write stored, and a list a subclass's override answers.
+        assert!(reach(
+            "module Kit\n  class Base\n    def initialize\n      @filters = [:secret]\n    end\n  end\n\n  class Table < Base\n    def filters\n      @filters ||= [:size]\n    end\n\n    def same?(other)\n      filters.all? { |n| other.public_send(n) }\n    end\n  end\nend\n",
+        ));
+        assert!(reach_from(
+            "module Kit\n  class Table\n    def filters = picked\n    def picked = [:size]\n\n    def same?(other)\n      filters.all? { |n| other.public_send(n) }\n    end\n  end\n\n  class Wide < Table\n    def picked = [:secret]\n  end\nend\n",
+            "Kit::Wide",
+        ));
+        assert!(reach(
+            "module Kit\n  class Table\n    def filters\n      @filters ||= (@fallback ||= [:size])\n    end\n\n    def fallback\n      @fallback ||= (@filters ||= [:secret])\n    end\n\n    def same?(other)\n      filters.all? { |n| other.public_send(n) }\n    end\n  end\nend\n",
+        ));
     }
 
     fn method(owner: &str, class_side: bool, name: &str) -> MethodKey {

@@ -4722,12 +4722,37 @@ fn walk_decl_body_hosted<'pr>(
                         let is_class_attr =
                             kw.starts_with("cattr_") || kw.starts_with("mattr_");
                         let mut names: Vec<Symbol> = Vec::new();
+                        let mut unread_splat = false;
                         if let Some(args) = call.arguments() {
                             for arg in args.arguments().iter() {
                                 if let Some(s) = symbol_value(&arg) {
                                     names.push(Symbol::from(s));
+                                } else if let Some(splat) = arg.as_splat_node() {
+                                    // `attr_reader *PROPERTIES` (mission_control's JobsRelation): the names a constant of the
+                                    // body above holds as a literal list. Not dropped where it holds no such list.
+                                    // Nor read off its value where the body changes it (`PROPERTIES.replace(…)`).
+                                    let held = splat.expression().and_then(|e| e.as_constant_read_node()).and_then(|c| {
+                                        let name = constant_id_str(&c.name()).to_string();
+                                        let own = owner.0.as_str().rsplit("::").next().unwrap_or_default().to_string();
+                                        if out.unknown_calls.iter().any(|e| calls_on_constant(e, &name, &own))
+                                            || out.methods.iter().any(|m| mutates_constant(&m.body, &name))
+                                        {
+                                            return None;
+                                        }
+                                        out.constants.iter().rev().find(|(n, _)| n.as_str() == name).and_then(|(_, v)| literal_symbols(v))
+                                    });
+                                    match held {
+                                        Some(list) => names.extend(list),
+                                        None => unread_splat = true,
+                                    }
                                 }
                             }
+                        }
+                        if unread_splat {
+                            if let Ok(e) = ingest_expr(&stmt, file) {
+                                out.unknown_calls.push(e);
+                            }
+                            continue;
                         }
                         // Unmodeled mattr/cattr options (instance_*, splats,
                         // uningestible defaults) stay as unknown_calls — same
@@ -9179,4 +9204,49 @@ fn file_constants_holder(file: &str, constants: &[(Symbol, Expr)]) -> LibraryCla
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     }
+}
+
+/// The names an Array literal of Symbols holds (`%i[queue_name status]`, frozen or not); `None` for any other value.
+fn literal_symbols(e: &Expr) -> Option<Vec<Symbol>> {
+    match &*e.node {
+        ExprNode::Array { elements, .. } => elements
+            .iter()
+            .map(|el| match &*el.node {
+                ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => Some(value.clone()),
+                _ => None,
+            })
+            .collect(),
+        ExprNode::Send { recv: Some(r), method, args, .. } if method.as_str() == "freeze" && args.is_empty() => literal_symbols(r),
+        _ => None,
+    }
+}
+
+/// Does `e` call a method on the body's own constant `name`, bare or qualified by the class's own name `own` (a class
+/// body's `PROPERTIES.replace(…)` or `Probe::PROPERTIES.replace(…)`; not `Other::PROPERTIES`)?
+fn calls_on_constant(e: &Expr, name: &str, own: &str) -> bool {
+    if let ExprNode::Send { recv: Some(r), .. } = &*e.node
+        && let ExprNode::Const { path } = &*r.node
+        && path.last().is_some_and(|p| p.as_str() == name)
+        && (path.len() == 1 || path[path.len() - 2].as_str() == own)
+    {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |child| found = found || calls_on_constant(child, name, own));
+    found
+}
+
+/// Does a method body call one that changes the constant `name` on it (`PROPERTIES.replace(…)` in a `configure` the
+/// body may run before the `attr_reader`)?
+fn mutates_constant(e: &Expr, name: &str) -> bool {
+    if let ExprNode::Send { recv: Some(r), method, .. } = &*e.node
+        && let ExprNode::Const { path } = &*r.node
+        && path.last().is_some_and(|p| p.as_str() == name)
+        && (method.as_str().ends_with('!') || matches!(method.as_str(), "<<" | "push" | "append" | "concat" | "replace" | "unshift" | "prepend" | "insert" | "clear" | "delete" | "delete_at" | "delete_if" | "keep_if" | "pop" | "shift" | "fill" | "[]="))
+    {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |child| found = found || mutates_constant(child, name));
+    found
 }
