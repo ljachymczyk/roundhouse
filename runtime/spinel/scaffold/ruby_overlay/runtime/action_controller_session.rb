@@ -1,10 +1,11 @@
 # frozen_string_literal: true
+require "json"
 # CRuby overlay session codec (`from_cookie` / `to_cookie`). CSRF
 # minting lives in `runtime/ruby/action_controller/authenticity_token.rb`.
 #
-# Storage model: cookie-carried, stateless — the whole session rides
-# in a `_session` cookie as url-encoded `k=v&k2=v2` pairs. HMAC signing
-# of that cookie is `runtime/signed_cookies.rb` on the dispatch path.
+# The dispatchers no longer write this encoding: the session cookie is
+# Rails' encrypted JSON (`runtime/cookie_store.rb`). `to_cookie` stays
+# for callers that want a flat, deterministic text of a session.
 module ActionDispatch
   class Session
     # Decode a `_session` cookie value into a Session. Tolerates a
@@ -18,16 +19,24 @@ module ActionDispatch
         next if eq.nil?
         k = CgiIo.url_decode(pair[0, eq])
         v = CgiIo.url_decode(pair[(eq + 1)..].to_s)
-        data[k] = v unless k.empty?
+        data[k] = Session.json_value(v) unless k.empty?
       end
       Session.new(data)
+    end
+
+    # Not a 500 for a cookie of the earlier shape, whose values were their `to_s`: that text is the value.
+    def self.json_value(text)
+      JSON.parse(text)
+    rescue JSON::ParserError
+      text
     end
 
     # Inverse of from_cookie. Deterministic (insertion order), so
     # dispatch can compare inbound-vs-outbound encodings to decide
     # whether a Set-Cookie is needed at all.
+    # Not `v.to_s`: Rails' cookie store keeps each value as JSON, so Devise's `[[id], salt]` reads back as an Array.
     def to_cookie
-      to_h.map { |k, v| "#{CgiIo.url_encode(k)}=#{CgiIo.url_encode(v.to_s)}" }.join("&")
+      to_h.map { |k, v| "#{CgiIo.url_encode(k)}=#{CgiIo.url_encode(JSON.generate(v))}" }.join("&")
     end
   end
 end

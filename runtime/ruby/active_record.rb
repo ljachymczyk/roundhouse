@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 require_relative "active_record/errors"
 require_relative "active_record/connection_not_established"
+require_relative "active_record/stale_object_error"
 require_relative "active_record/encryption_errors"
 require_relative "active_record/connection_pool"
 require_relative "active_record/registry"
@@ -9,6 +10,8 @@ require_relative "active_record/base"
 # (`connection`/`transaction`); loading it first would define an empty
 # Base the real one then clobbers.
 require_relative "active_record/connection"
+# Rails' db:migrate / db:prepare (Migrations.all, Schema.statements).
+require_relative "active_record/migrator"
 # Signed ids (`record.signed_id` / `Model.find_signed`) — like
 # connection.rb a reopen-tier file the strict targets do not stage: it
 # calls into ActionController::MessageVerifier, whose PBKDF2/HMAC

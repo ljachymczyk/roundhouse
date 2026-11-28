@@ -9,6 +9,8 @@ require_relative "action_controller/instance_config"
 # `ActionController::API`, the base an API app's ApplicationController
 # names: Base under the API name.
 require_relative "action_controller/api"
+# `ActionController::Metal` and the modules a Metal subclass includes back.
+require_relative "action_controller/metal"
 # Per-request context statics (Current.request / .controller) + the
 # controller's `request` accessor — a reopen file outside the strict-
 # target tables (base.rb transpiles everywhere; a Request-typed field
@@ -48,6 +50,9 @@ require_relative "action_controller/conditional_get"
 # 7.0+ set), filled onto the buffered response after the action so an
 # action header wins. Both wire paths call `commit_default_headers!`.
 require_relative "action_controller/default_headers"
+# `view_context` for a plain object outside a request (`ApplicationController.new.view_context.asset_url`).
+# Ruby-family only, as the file above.
+require_relative "action_controller/view_context"
 # The error `Params.require_key` raises; travels with its consumer for
 # the same reason message_digest does.
 require_relative "action_controller/parameter_missing"
