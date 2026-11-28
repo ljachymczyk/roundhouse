@@ -117,6 +117,10 @@ got = [r.settings[:theme], r.settings["theme"], Widget.find(Widget.create!(title
 raise "store: #{got.inspect}" unless got == ["dark", "dark", {}]
 stored = Widget.connection.select_value("SELECT settings FROM widgets WHERE id = #{w.id}")
 raise "stored: #{stored.inspect}" unless stored == "{\"theme\":\"dark\"}"
+r.settings[:country] = "Denmark"
+r.save!
+changed = [r.settings["country"], Widget.find(w.id).settings[:country], Widget.find(w.id).settings[:theme]]
+raise "in place: #{changed.inspect}" unless changed == ["Denmark", "Denmark", "dark"]
 "##,
         )
         .assert_passes();

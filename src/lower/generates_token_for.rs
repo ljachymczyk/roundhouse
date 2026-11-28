@@ -128,11 +128,21 @@ fn superseded(body: &[ModelBodyItem], span: Span) -> bool {
         .filter_map(|item| {
             let ModelBodyItem::Unknown { expr, .. } = item else { return None };
             let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { return None };
-            if method.as_str() != "generates_token_for" {
+            if method.as_str() != "generates_token_for" || args.is_empty() {
                 return None;
             }
+            // Not one whose arguments compute: Rails evaluates them as the class loads, before the later one
+            // replaces it (`expires_in: ENV.fetch("TTL").to_i` raises there).
+            let literal = args[1..].iter().all(|a| match &*a.node {
+                ExprNode::Hash { entries, .. } => entries.iter().all(|(k, v)| {
+                    matches!(&*k.node, ExprNode::Lit { .. }) && (matches!(&*v.node, ExprNode::Lit { .. }) || literal_seconds(v).is_some())
+                }),
+                _ => false,
+            });
             match args.first().map(|a| &*a.node) {
-                Some(ExprNode::Lit { value: Literal::Sym { value } }) => Some((expr.span, value)),
+                Some(ExprNode::Lit { value: Literal::Sym { value } }) if literal => Some((expr.span, value)),
+                // A later declaration still replaces it, so it stays in the list to be found as one.
+                Some(ExprNode::Lit { value: Literal::Sym { value } }) => Some((Span::synthetic(), value)),
                 _ => None,
             }
         })

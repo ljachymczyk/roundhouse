@@ -23,14 +23,70 @@ module RoundhouseJsonColumn
     ActiveSupport::JSON.encode_without_escape(value)
   end
 
-  # `store :col, coder: JSON`: Rails' `IndifferentCoder`, whose Hash reads by a Symbol too and stands in for nil.
-  def self.load_store(serialized)
+  # `store :col, coder: JSON`: Rails' `IndifferentCoder`, whose Hash reads by a Symbol too and stands in for nil. Each
+  # read decodes the stored text, so a change made in place (`record.settings[:k] = v`, Rails' store idiom) is written
+  # back through the record's writer; a change to a Hash nested inside it is not.
+  def self.load_store(serialized, owner = nil, writer = nil)
     decoded = serialized.nil? || serialized.empty? ? nil : JSON.parse(serialized)
-    decoded.is_a?(Hash) ? ActiveSupport::HashWithIndifferentAccess.new(decoded) : ActiveSupport::HashWithIndifferentAccess.new
+    store = Store.new(decoded.is_a?(Hash) ? decoded : {})
+    store.bind(owner, writer)
   end
 
   def self.dump_store(value)
-    hash = value.is_a?(Hash) ? ActiveSupport::HashWithIndifferentAccess.new(value) : ActiveSupport::HashWithIndifferentAccess.new
+    hash = value.respond_to?(:to_hash) ? ActiveSupport::HashWithIndifferentAccess.new(value.to_hash) : ActiveSupport::HashWithIndifferentAccess.new
     ActiveSupport::JSON.encode_without_escape(hash)
+  end
+
+  class Store < ActiveSupport::HashWithIndifferentAccess
+    def bind(owner, writer)
+      @owner = owner
+      @writer = writer
+      self
+    end
+
+    def []=(key, value)
+      super
+      write_back
+      value
+    end
+
+    def store(key, value)
+      self[key] = value
+    end
+
+    def delete(key)
+      removed = super
+      write_back
+      removed
+    end
+
+    def update(*others, &block)
+      super
+      write_back
+      self
+    end
+
+    # Not Hash's: the indifferent `update` converts the keys.
+    def merge!(*others, &block)
+      update(*others, &block)
+    end
+
+    def replace(other)
+      super
+      write_back
+      self
+    end
+
+    def clear
+      super
+      write_back
+      self
+    end
+
+    private
+
+    def write_back
+      @owner.public_send(@writer, self) if @owner && @writer
+    end
   end
 end

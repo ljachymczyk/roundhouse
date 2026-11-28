@@ -11,7 +11,7 @@
 //! invariant 6).
 //!
 //! Every receiverless call (and `self.x = …` setting) left here is an
-//! error now, unless it is
+//! error now ([`unclaimed_calls`] lists them), unless it is
 //! - claimed: a pass lowers exactly that shape ([`claimed`] names the
 //!   pass for each entry and asks it by span where it declines some
 //!   forms), or
@@ -28,6 +28,10 @@ use crate::dialect::Model;
 use crate::expr::{ExprNode, Literal};
 use crate::schema::Schema;
 use crate::span::Span;
+
+/// The `attribute` types whose writer casts as ActiveModel's: `:boolean` inline on every target, the others in the
+/// Ruby family's writers (`emit::ruby::library`); `project::report_attribute_casts` refuses those elsewhere.
+pub(crate) const ATTRIBUTE_CASTS: &[&str] = &["boolean", "string", "integer", "float", "decimal", "datetime"];
 
 /// One unclaimed class-body statement.
 pub(crate) struct Unclaimed {
@@ -277,33 +281,34 @@ pub(crate) fn unclaimed_calls(model: &Model, schema: &Schema) -> Vec<Unclaimed> 
                         && schema.tables.get(&model.table.0).is_some_and(|t| t.columns.iter().any(|c| c.name == *decl.name)))
                     && !super::markers::default_beside_source_writer(&model.body, args)
                 {
-                    // Over a column of another type, the column's cast,
-                    // reader and storage are kept
-                    // (`markers::attribute_matches_column`): reported.
                     let attr = decl.name;
-                    if let Some(ty) = decl.ty
-                        && !model.enums.contains_key(attr)
-                        && let Some(col) = schema
-                            .tables
-                            .get(&model.table.0)
-                            .and_then(|t| t.columns.iter().find(|c| c.name == *attr))
-                        && !super::markers::attribute_matches_column(ty.as_str(), col)
-                    {
-                        let mut d = Diagnostic::unsupported(
-                            expr.span,
-                            None,
-                            name,
-                            format!(
-                                "`attribute :{attr}, :{ty}` over a {}{} column on `{}`: the column's type is kept (its reader and storage don't follow the declared type)",
-                               super::column_type_word(&col.col_type),
-                                if col.array { " array" } else { "" },
-                                model.name.0.as_str()
-                            ),
-                        );
-                        d.severity = Severity::Warning;
-                        crate::emit::diagnostics::push(d);
+                    let column = schema.tables.get(&model.table.0).and_then(|t| t.columns.iter().find(|c| c.name == *attr));
+                    match (decl.ty, column) {
+                        // Over a column of another type, the column's cast, reader and storage are kept
+                        // (`markers::attribute_matches_column`).
+                        (Some(ty), Some(col)) if !model.enums.contains_key(attr) && !super::markers::attribute_matches_column(ty.as_str(), col) => {
+                            out.push(Unclaimed {
+                                span: expr.span,
+                                name: name.to_string(),
+                                reason: Some(format!(
+                                    "`attribute :{attr}, :{ty}` over a {}{} column: the column's type is kept (its reader and storage don't follow the declared type)",
+                                    super::column_type_word(&col.col_type),
+                                    if col.array { " array" } else { "" },
+                                )),
+                            });
+                            continue;
+                        }
+                        // A type the synthesized writer does not cast (an app's registered type) would assign verbatim.
+                        (Some(ty), None) if !ATTRIBUTE_CASTS.contains(&ty.as_str()) => {
+                            out.push(Unclaimed {
+                                span: expr.span,
+                                name: name.to_string(),
+                                reason: Some(format!("no writer casts `:{ty}`, so the value would be kept as assigned")),
+                            });
+                            continue;
+                        }
+                        _ => continue,
                     }
-                    continue;
                 }
             }
         }
@@ -471,17 +476,19 @@ mod tests {
 
     #[test]
     fn an_attachment_option_that_is_not_lowered_is_unclaimed() {
-        let hash = |key: &str| {
+        let hash = |key: &str, value: &str| {
             Expr::new(
                 Span::synthetic(),
-                ExprNode::Hash { entries: vec![(sym(key), sym("x"))], kwargs: true },
+                ExprNode::Hash { entries: vec![(sym(key), sym(value))], kwargs: true },
             )
         };
-        let m = model(vec![
-            send("has_one_attached", vec![sym("avatar"), hash("dependent")]),
-            send("has_one_attached", vec![sym("cover"), hash("service")]),
-        ]);
-        assert_eq!(names(&m), ["has_one_attached"]);
+        let claimed = model(vec![send("has_one_attached", vec![sym("avatar"), hash("dependent", "purge")])]);
+        assert!(names(&claimed).is_empty());
+        // A `service:`, and a `dependent:` policy the destroy hook does not write.
+        for (key, value) in [("service", "mirror"), ("dependent", "destroy")] {
+            let declined = model(vec![send("has_one_attached", vec![sym("cover"), hash(key, value)])]);
+            assert_eq!(names(&declined), ["has_one_attached"], "{key}: {value}");
+        }
     }
 
     #[test]

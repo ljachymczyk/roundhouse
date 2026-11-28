@@ -240,7 +240,7 @@ fn collect_belongs_to(model: &Model) -> Vec<LoweredAssocRef> {
 /// so the unclaimed-statement report names it instead of it vanishing.
 pub(crate) fn claims_broadcasts_to(args: &[Expr]) -> bool {
     let stream_ok = match args.first().map(|a| &*a.node) {
-        Some(ExprNode::Lambda { extra_params, .. }) => extra_params.is_empty(),
+        Some(ExprNode::Lambda { extra_params, rest_param, .. }) => extra_params.is_empty() && rest_param.is_none(),
         Some(ExprNode::Lit { value: Literal::Str { .. } }) => true,
         _ => false,
     };

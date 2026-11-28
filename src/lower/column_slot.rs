@@ -246,7 +246,13 @@ impl<'a> ColumnSlot<'a> {
             Expr::new(Span::synthetic(), ExprNode::Ivar { name: self.storage_name() }),
             super::model_to_library::ty_of_column_slot(self.col),
         );
-        json_column(Span::synthetic(), if self.store { "load_store" } else { "load" }, vec![stored], Ty::Untyped)
+        if !self.store {
+            return json_column(Span::synthetic(), "load", vec![stored], Ty::Untyped);
+        }
+        // The record and its writer: a change made in place on the Hash is written back, as Rails' store keeps it.
+        let owner = Expr::new(Span::synthetic(), ExprNode::SelfRef);
+        let writer = Expr::new(Span::synthetic(), ExprNode::Lit { value: crate::expr::Literal::Str { value: format!("{}=", self.col.name.as_str()) } });
+        json_column(Span::synthetic(), "load_store", vec![stored, owner, writer], Ty::Untyped)
     }
 }
 

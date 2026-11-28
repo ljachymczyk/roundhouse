@@ -2026,8 +2026,14 @@ impl Run<'_> {
             ExprNode::OpAssign { target: LValue::Attr { recv, name }, op: crate::expr::OpAssignOp::BitOr | crate::expr::OpAssignOp::Add, .. }
                 if matches!(&*recv.node, ExprNode::SelfRef) =>
             {
+                // Not inside another class's `instance_eval`: replayed here it would change the caller's attribute.
+                if self.target.is_some() {
+                    return Err(format!("it changes `{}` on another class", name.as_str()));
+                }
                 let mut substituted = self.substitute(st, env, &HashSet::default())?;
                 self.class_attrs.remove(name);
+                // A later write is no longer the declaration's default: it runs after this one.
+                self.unset_cattrs.remove(name);
                 substituted.decisions |= crate::expr::REPLAYED_CLASS_BODY;
                 self.out.push(substituted);
                 Ok(false)

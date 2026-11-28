@@ -650,15 +650,32 @@ fn macro_attrs(model: &Model, macro_name: &str) -> Vec<(Span, Symbol)> {
 /// expands any named declaration, but `service:` or `strict_loading:`
 /// change what Rails does and are not read, so those forms are not claimed.
 pub(crate) fn claims(expr: &Expr) -> bool {
-    let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { return false };
+    let ExprNode::Send { recv: None, method, args, block, .. } = &*expr.node else { return false };
     matches!(method.as_str(), "has_one_attached" | "has_many_attached")
         && matches!(args.first().map(|a| &*a.node), Some(ExprNode::Lit { value: Literal::Sym { .. } }))
         && args[1..].iter().all(|a| match &*a.node {
-            ExprNode::Hash { entries, .. } => entries.iter().all(|(k, _)| {
+            // Only the policies `attached_dependent` writes: another value would be purged later all the same.
+            ExprNode::Hash { entries, .. } => entries.iter().all(|(k, v)| {
                 matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "dependent")
+                    && matches!(&*v.node,
+                        ExprNode::Lit { value: Literal::Sym { value } } if matches!(value.as_str(), "purge" | "purge_later"))
+                        | matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { value: false } })
             }),
             _ => false,
         })
+        && block.as_ref().is_none_or(|b| method.as_str() == "has_one_attached" && every_variant_lowers(b))
+}
+
+/// A `has_one_attached` block whose every statement is a variant `attached_variations` reads: one it leaves out
+/// would be missing from the output.
+fn every_variant_lowers(block: &Expr) -> bool {
+    let ExprNode::Lambda { extra_params, params, body, .. } = &*block.node else { return false };
+    let (true, Some(attachable)) = (extra_params.is_empty(), params.first()) else { return false };
+    let stmts: Vec<&Expr> = match &*body.node {
+        ExprNode::Seq { exprs } => exprs.iter().collect(),
+        _ => vec![body],
+    };
+    stmts.iter().all(|stmt| variation_decl(stmt, attachable).is_some())
 }
 
 /// One `attachable.variant :name, resize_to_limit: [w, h], format: :f`
@@ -836,6 +853,7 @@ pub(crate) fn push_attached_methods(methods: &mut Vec<MethodDef>, model: &Model)
 /// `false` (neither). `None` for a value Rails doesn't define, which
 /// keeps the default rather than guessing.
 fn attached_dependent(model: &Model, attr: &Symbol) -> Option<&'static str> {
+    let mut found = None;
     for item in &model.body {
         let ModelBodyItem::Unknown { expr, .. } = item else { continue };
         let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
@@ -848,6 +866,7 @@ fn attached_dependent(model: &Model, attr: &Symbol) -> Option<&'static str> {
         if value.as_str() != attr.as_str() {
             continue;
         }
+        found = Some("purge_later");
         for arg in &args[1..] {
             let ExprNode::Hash { entries, .. } = &*arg.node else { continue };
             for (k, v) in entries {
@@ -855,7 +874,7 @@ fn attached_dependent(model: &Model, attr: &Symbol) -> Option<&'static str> {
                 if key.as_str() != "dependent" {
                     continue;
                 }
-                return match &*v.node {
+                found = match &*v.node {
                     ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "purge" => Some("purge"),
                     ExprNode::Lit { value: Literal::Bool { value: false } } => Some(""),
                     _ => Some("purge_later"),
@@ -863,7 +882,8 @@ fn attached_dependent(model: &Model, attr: &Symbol) -> Option<&'static str> {
             }
         }
     }
-    Some("purge_later")
+    // The last declaration's, as Rails redefines the attachment each time.
+    found.or(Some("purge_later"))
 }
 
 /// ```ruby
