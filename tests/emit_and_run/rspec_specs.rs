@@ -271,6 +271,57 @@ fn after_hooks_run_after_the_example() {
     assert!(format!("{}{}", run.stdout, run.stderr).contains("after hook ran"), "{}\n{}", run.stdout, run.stderr);
 }
 
+// rspec-mocks read as Mocha chains. Ruby lane only: on Spinel, a stub
+// that returns a value from an app method is not served yet.
+const MOCKS_SPEC: &str = r#"require "rails_helper"
+
+RSpec.describe Article, type: :model do
+  it "stubs and expects messages" do
+    allow(Article).to receive(:count).and_return(42)
+    expect(Article.count).to eq(42)
+    expect(Article).to receive(:find_by).with(title: "Wanted").and_return(nil)
+    expect(Article.find_by(title: "Wanted")).to be_nil
+    expect(Article).not_to receive(:destroy_all)
+    thing = double("thing", name: "Named")
+    expect(thing.name).to eq("Named")
+    allow_any_instance_of(Article).to receive(:valid?).and_return(false)
+    expect(Article.new(title: "T", body: "A body that is long enough.").valid?).to eq(false)
+  end
+end
+"#;
+
+#[test]
+fn rspec_mocks_run_as_mocha_on_ruby() {
+    let run = app(SPEC).write("spec/models/article_mocks_spec.rb", MOCKS_SPEC).run_test("test/models/models_article_mocks_spec_test.rb");
+    run.assert_passes();
+    // An unmet expectation and an unexpected call fail the test.
+    for (find, replace) in [
+        ("expect(Article.find_by(title: \"Wanted\")).to be_nil", "expect(Article.find_by(title: \"Other\")).to be_nil"),
+        ("expect(thing.name).to eq(\"Named\")", "Article.destroy_all\n    expect(thing.name).to eq(\"Named\")"),
+    ] {
+        let run = app(SPEC)
+            .write("spec/models/article_mocks_spec.rb", &MOCKS_SPEC.replacen(find, replace, 1))
+            .run_test("test/models/models_article_mocks_spec_test.rb");
+        assert!(run.errors.is_empty(), "{replace}: {:?}", run.errors);
+        assert!(!run.program_succeeded(), "`{replace}` passed:\n{}\n{}", run.stdout, run.stderr);
+    }
+}
+
+// A spec whose only Mocha call is a `double` still gets Mocha's helper wiring.
+#[test]
+fn a_double_only_spec_runs_on_ruby() {
+    let spec = r#"require "rails_helper"
+
+RSpec.describe Article, type: :model do
+  it "answers through a double" do
+    thing = double("thing", name: "Named")
+    expect(thing.name).to eq("Named")
+  end
+end
+"#;
+    app(SPEC).write("spec/models/article_double_spec.rb", spec).run_test("test/models/models_article_double_spec_test.rb").assert_passes();
+}
+
 // The point of the lane: the same examples run inside the Spinel build.
 #[test]
 #[ignore = "requires spin and spinel on PATH plus SQLite development libraries"]
