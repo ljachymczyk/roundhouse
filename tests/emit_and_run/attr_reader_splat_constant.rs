@@ -56,3 +56,22 @@ puts "attr splat passed"
     );
     run.assert_passes();
 }
+
+/// The body changing its own constant through its qualified name before the splat: Ruby reads the changed list.
+#[test]
+fn a_constant_its_body_replaces_by_qualified_name_is_read_as_changed() {
+    let probe = PROBE.replace("  PROPERTIES = %i[queue_name status].freeze\n", "  PROPERTIES = %i[queue_name]\n  Probe::PROPERTIES.replace(%i[queue_name status])\n");
+    let run = emit_and_run::real_blog()
+        .edit("config/routes.rb", "  root \"articles#index\"\n", "  root \"articles#index\"\n  get \"/probe\", to: \"probes#index\"\n")
+        .write("lib/probe.rb", &probe)
+        .write("app/controllers/probes_controller.rb", "class ProbesController < ApplicationController\n  def index\n    render plain: Probe.new.label\n  end\nend\n")
+        .run_ruby(
+            r##"response = Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/probe", "QUERY_STRING" => "", "rack.input" => StringIO.new(""))
+text = +""
+response[2].each { |part| text << part }
+raise "probe: #{response[0]} #{text.inspect}" unless response[0] == 200 && text == "default pending"
+puts "qualified replace passed"
+"##,
+        );
+    run.assert_passes();
+}

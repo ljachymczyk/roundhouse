@@ -564,8 +564,12 @@ impl<'a> Gems<'a> {
             e.node.for_each_child(&mut |child| walk(child, name, out));
         }
         let mut out = Vec::new();
+        // (an instance of `c` runs its ancestors' writes, and one of a subclass the subclass's too)
         let entries: Vec<&&LibraryClass> = match c {
-            Some(c) => self.entries.get(c).into_iter().flatten().collect(),
+            Some(c) => {
+                let up = self.ancestors(c);
+                self.entries.iter().filter(|(k, _)| up.contains(k) || self.ancestors(k).iter().any(|a| a == c)).flat_map(|(_, v)| v).collect()
+            }
             None => self.entries.values().flatten().collect(),
         };
         for entry in entries {
@@ -1639,6 +1643,14 @@ fn elems_names(e: &Expr, gems: Option<&Gems<'_>>, context: Option<(&str, bool, &
             if owner != c && calls_on_self(body) {
                 return None;
             }
+            // Nor a method a subclass of the body's class overrides: self there may be that subclass's instance.
+            let overridden = gems.entries.iter().any(|(k, entries)| {
+                k != c && gems.ancestors_on(k, side).iter().any(|a| a == c)
+                    && entries.iter().any(|e| e.methods.iter().any(|m| m.name == *method && (m.receiver == MethodReceiver::Class) == side))
+            });
+            if overridden {
+                return None;
+            }
             // In the defining class's context (a constant it names is its own), and every value it may return.
             elems_names_returned(body, Some(gems), Some((owner.as_str(), side, "")), depth - 1)
         }
@@ -2222,7 +2234,7 @@ mod tests {
     /// store each other are read to a bound, not until the stack runs out.
     #[test]
     fn a_constant_initializer_reads_class_side_and_cyclic_memos_stop() {
-        let reach = |table: &str| {
+        let reach_from = |table: &str, made: &str| {
             let app = spinel_app(
                 &[("kit (1.0)", &[])],
                 &[
@@ -2233,13 +2245,22 @@ mod tests {
                 &[(
                     "app/models/article.rb",
                     "class Article < ApplicationRecord\n",
-                    "class Article < ApplicationRecord\n  def checked(other)\n    Kit::Hidden\n    Kit::Table.new.same?(other)\n  end\n\n",
+                    &format!("class Article < ApplicationRecord\n  def checked(other)\n    Kit::Hidden\n    {made}.new.same?(other)\n  end\n\n"),
                 )],
             );
             reached(&app).methods.contains(&method("Kit::Hidden", false, "secret"))
         };
+        let reach = |table: &str| reach_from(table, "Kit::Table");
         assert!(reach(
             "module Kit\n  class Table\n    def self.names = [:secret]\n    def names = [:size]\n    NAMES = names\n\n    def same?(other)\n      NAMES.all? { |n| other.public_send(n) }\n    end\n  end\nend\n",
+        ));
+        // A memo's existing value a parent's write stored, and a list a subclass's override answers.
+        assert!(reach(
+            "module Kit\n  class Base\n    def initialize\n      @filters = [:secret]\n    end\n  end\n\n  class Table < Base\n    def filters\n      @filters ||= [:size]\n    end\n\n    def same?(other)\n      filters.all? { |n| other.public_send(n) }\n    end\n  end\nend\n",
+        ));
+        assert!(reach_from(
+            "module Kit\n  class Table\n    def filters = picked\n    def picked = [:size]\n\n    def same?(other)\n      filters.all? { |n| other.public_send(n) }\n    end\n  end\n\n  class Wide < Table\n    def picked = [:secret]\n  end\nend\n",
+            "Kit::Wide",
         ));
         assert!(reach(
             "module Kit\n  class Table\n    def filters\n      @filters ||= (@fallback ||= [:size])\n    end\n\n    def fallback\n      @fallback ||= (@filters ||= [:secret])\n    end\n\n    def same?(other)\n      filters.all? { |n| other.public_send(n) }\n    end\n  end\nend\n",

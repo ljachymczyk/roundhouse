@@ -4698,7 +4698,8 @@ fn walk_decl_body_with_visibility<'pr>(
                                     // Nor read off its value where the body changes it (`PROPERTIES.replace(…)`).
                                     let held = splat.expression().and_then(|e| e.as_constant_read_node()).and_then(|c| {
                                         let name = constant_id_str(&c.name()).to_string();
-                                        if out.unknown_calls.iter().any(|e| calls_on_constant(e, &name))
+                                        let own = owner.0.as_str().rsplit("::").next().unwrap_or_default().to_string();
+                                        if out.unknown_calls.iter().any(|e| calls_on_constant(e, &name, &own))
                                             || out.methods.iter().any(|m| mutates_constant(&m.body, &name))
                                         {
                                             return None;
@@ -9108,18 +9109,18 @@ fn literal_symbols(e: &Expr) -> Option<Vec<Symbol>> {
     }
 }
 
-/// Does `e` call a method on the body's own constant `name`, unqualified (a class body's `PROPERTIES.replace(…)`;
-/// not `Other::PROPERTIES`)?
-fn calls_on_constant(e: &Expr, name: &str) -> bool {
+/// Does `e` call a method on the body's own constant `name`, bare or qualified by the class's own name `own` (a class
+/// body's `PROPERTIES.replace(…)` or `Probe::PROPERTIES.replace(…)`; not `Other::PROPERTIES`)?
+fn calls_on_constant(e: &Expr, name: &str, own: &str) -> bool {
     if let ExprNode::Send { recv: Some(r), .. } = &*e.node
         && let ExprNode::Const { path } = &*r.node
-        && path.len() == 1
-        && path[0].as_str() == name
+        && path.last().is_some_and(|p| p.as_str() == name)
+        && (path.len() == 1 || path[path.len() - 2].as_str() == own)
     {
         return true;
     }
     let mut found = false;
-    e.node.for_each_child(&mut |child| found = found || calls_on_constant(child, name));
+    e.node.for_each_child(&mut |child| found = found || calls_on_constant(child, name, own));
     found
 }
 

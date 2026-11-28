@@ -3,13 +3,13 @@
 //! `require 'tzinfo'`; the emitted files load in name order, so `AZone` loaded ahead of the classes `Registry.all`
 //! reaches (a class method, the `new` it makes and the `initialize` its parent's `super` runs) and raised NameError.
 //! So do the defaults the call leaves to run: an optional one ahead of a required one the call fills, and the
-//! ancestor's that a `super()` passes nothing for.
+//! ancestor's that a `super()` passes nothing for, even after a call that gave them all.
 
 use super::emit_and_run;
 
 const ZONE: &str = r#"module AZone
   NAMES = Registry.all.map { |n| n.upcase }
-  TOTAL = Registry.value(7)
+  TOTAL = Registry.value(5, 7) + Registry.value(7)
   PICKED = ChildPick.pick(1)
 end
 "#;
@@ -88,7 +88,7 @@ fn what_a_load_time_call_reaches_is_loaded_first() {
 raise "GET /probe answered #{response[0]}" unless response[0] == 200
 text = +""
 response[2].each { |part| text << part }
-raise "probe: #{text.inspect}" unless text == "UTC,JST:37:41"
+raise "probe: #{text.inspect}" unless text == "UTC,JST:49:41"
 puts "load-time callee passed"
 "##,
     );
@@ -103,7 +103,7 @@ fn what_a_load_time_call_reaches_is_loaded_first_on_spinel() {
 controller.request_method = "GET"
 controller.params = {}
 controller.process_action(:index)
-raise "probe: #{controller.body}" unless controller.body == "UTC,JST:37:41"
+raise "probe: #{controller.body}" unless controller.body == "UTC,JST:49:41"
 puts "load-time callee passed"
 "##,
     );
