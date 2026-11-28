@@ -1433,11 +1433,18 @@ formats that need X.509 chains raise `AttestationStatementVerificationError`,
 which is what the gem answers for them without root certificates; a
 browser asked for the default `attestation: "none"` sends none.
 
-Still not carried: an initializer's `WebAuthn.configure do |config| ... end`.
-The initializer ledger reports each statement in it as unconsumed, and
-the emitted program runs with the gem's default relying party: the
-request options have no `rpId`, and `verify` raises the gem's
-`RuntimeError` "Unspecified expected origin" (not a `WebAuthn::Error`).
+The package is pinned: spin's manifest `ref` takes a tag or branch only,
+so the tree also writes a `spin.lock` naming the package's commit, and
+spin checks what it fetches against it.
+
+An initializer's `WebAuthn.configure do |config| ... end` is run at boot
+as written (`ingest::boot_program`, listed in `gems::BOOT_CONFIGURED`):
+the real gem's configuration on Ruby and JRuby, the package's on Spinel.
+Without it the program would run with the gem's default relying party,
+whose `verify` raises "Unspecified expected origin". Not yet: `config`
+inside the block is untyped (the gem catalog types no block parameter),
+so a setting the package lacks fails when Spinel compiles the tree, not
+at `check`.
 
 ### `ActionCable.server` exists; the registry did not say so
 

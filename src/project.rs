@@ -15045,7 +15045,7 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
     // signatures checked by spinel's openssl package. Manifest below.
     let needs_webauthn = files
         .iter()
-        .any(|(p, c)| p.starts_with("app/") && p.ends_with(".rb") && names_constant(c, "WebAuthn"));
+        .any(|(p, c)| (p.starts_with("app/") || p.starts_with("test/")) && p.ends_with(".rb") && names_constant(c, "WebAuthn"));
     if needs_webauthn {
         let facade = files
             .iter_mut()
@@ -17827,7 +17827,7 @@ mod tests {
         let facade = get(&with, "runtime/webauthn_facade.rb");
         assert!(facade.contains("require \"webauthn\""), "{facade}");
         assert!(!facade.contains("module WebAuthn"), "{facade}");
-        assert!(!with.iter().any(|(p, _)| p == "sig/runtime/webauthn_facade.rbs"), "sidecar must drop");
+        assert!(!with.iter().any(|(p, _)| p == "runtime/webauthn_facade.rbs" || p == "sig/runtime/webauthn_facade.rbs"), "sidecar must drop");
         let manifest = get(&with, "spin.toml");
         let lines: Vec<&str> = manifest.lines().map(str::trim).collect();
         let header = lines.iter().position(|l| *l == "[dependencies]").unwrap_or_else(|| panic!("{manifest}"));

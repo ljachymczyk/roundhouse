@@ -111,7 +111,11 @@ pub(super) fn build<V: Vfs + ?Sized>(
             let start = node.location().start_offset() as u32;
             // `Devise.setup do |config| … end` of a gem compiled from source: its `setup` is `yield self`, so the
             // block's statements are writes on the module, run where the initializer runs them.
-            if !engine && let Some((starts, exprs)) = yielded_self_setup(&node, app, &file_name, &wanted) {
+            // Not past the class-body read check below: a constant the block assigns would run after app/ reads it.
+            if !engine
+                && !written_constants(&node).iter().any(|name| class_body_reads.contains(name))
+                && let Some((starts, exprs)) = yielded_self_setup(&node, app, &file_name, &wanted)
+            {
                 app.boot_program.extend(exprs);
                 taken.extend(starts.into_iter().map(|inner| (path.clone(), inner)));
                 continue;
