@@ -1004,8 +1004,9 @@ fn rewrite(
         // Not `send` on a receiver of unknown class: a native build resolves that name to any class defining its own
         // `send` (the Spinel tree's `Faye::WebSocket#send`); `__send__` is Kernel's alone, as Ruby's `send` is here.
         // Nor a String argument: `ws.send("hello")` on a socket is the socket's own `send`, which a Symbol never reaches.
-        let untyped = recv.as_ref().is_some_and(|r| matches!(r.ty, None | Some(Ty::Var { .. }) | Some(Ty::Untyped)));
-        if method.as_str() == "send" && untyped && matches!(&*target.node, ExprNode::Lit { value: Literal::Sym { .. } })
+        // A typed receiver too: the native build may not keep its class (fugit's `@t.send(:wday_in_month)` on an EoTime).
+        let kernels = recv.as_ref().is_some_and(|r| r.ty.as_ref().is_none_or(|ty| kernel_send_receiver(registry, ty)));
+        if method.as_str() == "send" && kernels && matches!(&*target.node, ExprNode::Lit { value: Literal::Sym { .. } })
             && let ExprNode::Send { method, .. } = &mut *e.node
         {
             *method = Symbol::from("__send__");
@@ -1298,6 +1299,71 @@ pub(crate) fn method_return_via_registry(
         }
     }
     None
+}
+
+fn kernel_send_receiver(registry: &HashMap<ClassId, ClassInfo>, ty: &Ty) -> bool {
+    match ty {
+        Ty::Var { .. } | Ty::Untyped => true,
+        // Not one side by the receiver's shape: a class value types as its instance (`self` in a class method,
+        // `k = Relay`), and a constant may hold an instance (`RELAY = Channel.new`).
+        Ty::Class { id, .. } => !defines_own_send(registry, id, false) && !defines_own_send(registry, id, true),
+        // Not a union as a whole: each of its classes may define its own `send`, so every member is checked.
+        Ty::Union { variants } => variants.iter().all(|v| kernel_send_receiver(registry, v)),
+        Ty::SelfInstance | Ty::Record { .. } => false,
+        // Not every builtin value: an app may reopen its class with a `send` of its own.
+        Ty::Bool => ["TrueClass", "FalseClass"].iter().all(|name| !defines_own_send(registry, &ClassId(Symbol::from(*name)), false)),
+        ty => builtin_class(ty).is_none_or(|name| !defines_own_send(registry, &ClassId(Symbol::from(name)), false)),
+    }
+}
+
+fn builtin_class(ty: &Ty) -> Option<&'static str> {
+    Some(match ty {
+        Ty::Int => "Integer",
+        Ty::Float => "Float",
+        Ty::Str => "String",
+        Ty::Sym => "Symbol",
+        Ty::Date => "Date",
+        Ty::Time => "Time",
+        Ty::Nil => "NilClass",
+        Ty::Array { .. } | Ty::Tuple { .. } => "Array",
+        Ty::Hash { .. } => "Hash",
+        Ty::Fn(_) => "Proc",
+        _ => return None,
+    })
+}
+
+/// `class_side`: the receiver is the class itself (a constant), whose `send` is a singleton one or an extension's.
+fn defines_own_send(registry: &HashMap<ClassId, ClassInfo>, class: &ClassId, class_side: bool) -> bool {
+    defines_own(registry, class, "send", class_side)
+}
+
+/// Whether `class` (or what it inherits or includes, short of Object and Kernel) defines its own `name`.
+pub(crate) fn defines_own(registry: &HashMap<ClassId, ClassInfo>, class: &ClassId, name: &str, class_side: bool) -> bool {
+    let send = Symbol::from(name);
+    let mut seen: BTreeSet<ClassId> = BTreeSet::new();
+    let mut stack = vec![class.clone()];
+    while let Some(cid) = stack.pop() {
+        if matches!(cid.0.as_str(), "Object" | "Kernel" | "BasicObject" | "Module" | "Class") || !seen.insert(cid.clone()) {
+            continue;
+        }
+        let Some(cls) = registry.get(&cid) else { continue };
+        if class_side {
+            if cls.class_methods.contains_key(&send) || cls.class_side_hook_methods.contains(&send) || cls.unknown_class_side_hook {
+                return true;
+            }
+            if cls.class_method_extensions.iter().chain(&cls.hook_extensions).any(|m| defines_own(registry, m, name, false)) {
+                return true;
+            }
+        } else if cls.instance_methods.contains_key(&send) {
+            return true;
+        } else {
+            stack.extend(cls.includes.iter().cloned());
+        }
+        if let Some(p) = &cls.parent {
+            stack.push(p.clone());
+        }
+    }
+    false
 }
 
 /// The class the arms dispatch on, when the receiver types to one.

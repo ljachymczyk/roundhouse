@@ -9919,6 +9919,28 @@ fn emit_library_class_decl_inner(
     let resolve_all = |e: &Expr, load_time: bool| -> BTreeSet<String> {
         let mut paths: BTreeSet<Vec<String>> = BTreeSet::new();
         walk_const_paths(e, &mut paths);
+        // Not only what the value names: a class method it calls as the file loads runs then, and what that names
+        // must be loaded too (et-orbi's `ZONES_OLSON = TZInfo::Timezone.all…` reaches TZInfo::DataSource, which Ruby
+        // has loaded by et-orbi's `require 'tzinfo'`).
+        if load_time {
+            let mut reached: BTreeSet<Vec<String>> = BTreeSet::new();
+            walk_load_time_callee_paths(e, None, classes, &mut BTreeSet::new(), &mut reached, 6);
+            // Not only what the walk reads: a call it reaches into another gem compiled from source runs that gem's
+            // code through receivers the walk cannot type, and Ruby has loaded that whole gem by then (et-orbi's
+            // `require 'tzinfo'`), so its every class is loaded first. Not the class's own gem: its files load in
+            // the order its own requires give (Devise's strategies register with Warden as they load).
+            let own = source_gem_dir(app, lc);
+            let gems: BTreeSet<String> = reached.iter()
+                .filter_map(|path| classes.iter().find(|c| c.name.0.as_str() == path.join("::")))
+                .chain(callee_receivers(e, classes))
+                .filter_map(|c| source_gem_dir(app, c))
+                .filter(|g| own.as_ref() != Some(g))
+                .collect();
+            for c in classes.iter().filter(|c| source_gem_dir(app, c).is_some_and(|g| gems.contains(&g))) {
+                reached.insert(c.name.0.as_str().split("::").map(str::to_string).collect());
+            }
+            paths.extend(reached);
+        }
         paths.iter().filter_map(|p| resolve(p, load_time)).collect()
     };
     // Initializers and eager constants share the source's load-time order,
@@ -12472,6 +12494,158 @@ pub(super) fn walk_const_paths(e: &Expr, out: &mut BTreeSet<Vec<String>>) {
 /// expression calls it right there (`(-> { … }).call`). A block a call
 /// runs now (`map`, `each`) is walked, as `partition_deferred_constants`
 /// reads it.
+/// The constants the methods `e` calls name, as they run: `K.m(…)` on a class of `classes` walks `K.m` (`K.new` its
+/// `initialize`), and a receiverless call in a method the same class's method of the name on that side, to `depth`
+/// calls deep.
+fn walk_load_time_callee_paths(
+    e: &Expr,
+    current: Option<(&LibraryClass, MethodReceiver)>,
+    classes: &[LibraryClass],
+    visited: &mut BTreeSet<String>,
+    out: &mut BTreeSet<Vec<String>>,
+    depth: u8,
+) {
+    if depth == 0 {
+        return;
+    }
+    if let ExprNode::Send { recv, method, args, .. } = &*e.node {
+        // (a `**opts` binds no positional: Ruby 3 keeps keywords apart)
+        let given = args.iter().filter(|a| !matches!(&*a.node, ExprNode::Hash { .. } | ExprNode::Splat { .. } | ExprNode::KeywordSplat { .. })).count();
+        let splat = args.iter().any(|a| matches!(&*a.node, ExprNode::Splat { .. }));
+        let target: Option<(&LibraryClass, MethodReceiver)> = match recv.as_ref().map(|r| &*r.node) {
+            Some(ExprNode::Const { path }) => {
+                let name = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
+                let suffix = format!("::{name}");
+                classes.iter().find(|c| c.name.0.as_str() == name)
+                    .or_else(|| classes.iter().find(|c| c.name.0.as_str().ends_with(&suffix)))
+                    .map(|c| (c, MethodReceiver::Class))
+            }
+            None | Some(ExprNode::SelfRef) => current,
+            _ => None,
+        };
+        if let Some((class, side)) = target {
+            // `new` runs `initialize` on the instance it makes, unless the class or an ancestor defines its own `new`.
+            let own_new = |c: &LibraryClass| c.methods.iter().any(|m| m.name.as_str() == "new" && m.receiver == MethodReceiver::Class);
+            let mut chain = Some(class);
+            let mut steps = 0;
+            let mut defines_new = false;
+            let mut new_supers = false;
+            while let Some(c) = chain.filter(|_| steps < 32) {
+                if own_new(c) {
+                    defines_new = true;
+                    new_supers = c.methods.iter().any(|m| m.name.as_str() == "new" && m.receiver == MethodReceiver::Class && contains_super(&m.body));
+                    break;
+                }
+                steps += 1;
+                chain = c.parent.as_ref().and_then(|p| classes.iter().find(|k| k.name == *p));
+            }
+            let (called, on) = if method.as_str() == "new" && side == MethodReceiver::Class && !defines_new {
+                ("initialize", MethodReceiver::Instance)
+            } else {
+                (method.as_str(), side)
+            };
+            walk_load_time_method(class, called, on, if splat { 0 } else { given }, classes, visited, out, depth);
+            // (a `new` whose `super` reaches Class#new runs `initialize` too)
+            if method.as_str() == "new" && side == MethodReceiver::Class && new_supers {
+                walk_load_time_method(class, "initialize", MethodReceiver::Instance, 0, classes, visited, out, depth);
+            }
+        }
+    }
+
+    // Not into a closure: stored, it runs later (one called now is the callee's own walk's).
+    if matches!(&*e.node, ExprNode::Lambda { .. }) {
+        return;
+    }
+    e.node.for_each_child(&mut |child| walk_load_time_callee_paths(child, current, classes, visited, out, depth));
+}
+
+/// The source gem a class was compiled from (`tzinfo-2.0.6`), by its file's path under `source_gems/`.
+fn source_gem_dir(app: &App, c: &LibraryClass) -> Option<String> {
+    let file = std::iter::once(c.parent_span.file)
+        .chain(c.constants.iter().map(|(_, value)| value.span.file))
+        .chain(c.methods.iter().map(|m| m.body.span.file))
+        .find(|file| file.0 != 0)?;
+    let path = app.source_path(file)?;
+    let (_, rest) = path.split_once("source_gems/")?;
+    Some(rest.split('/').next()?.to_string())
+}
+
+/// The classes of `classes` a call in `e` names as its receiver (`TZInfo::Timezone.all`).
+fn callee_receivers<'c>(e: &Expr, classes: &'c [LibraryClass]) -> Vec<&'c LibraryClass> {
+    let mut out = Vec::new();
+    fn walk<'c>(e: &Expr, classes: &'c [LibraryClass], out: &mut Vec<&'c LibraryClass>) {
+        if let ExprNode::Send { recv: Some(r), .. } = &*e.node
+            && let ExprNode::Const { path } = &*r.node
+        {
+            let name = path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("::");
+            if let Some(c) = classes.iter().find(|c| c.name.0.as_str() == name) {
+                out.push(c);
+            }
+        }
+        e.node.for_each_child(&mut |child| walk(child, classes, out));
+    }
+    walk(e, classes, &mut out);
+    out
+}
+
+/// `called` on `side` of `class` as Ruby finds it, the class's own or the nearest ancestor's, walked as it runs; a
+/// `super` in it the next ancestor's of the name, too.
+fn walk_load_time_method(
+    class: &LibraryClass,
+    called: &str,
+    on: MethodReceiver,
+    given: usize,
+    classes: &[LibraryClass],
+    visited: &mut BTreeSet<String>,
+    out: &mut BTreeSet<Vec<String>>,
+    depth: u8,
+) {
+    let mut owner = Some(class);
+    let mut steps = 0;
+    let mut given = given;
+    while let Some(c) = owner {
+        let defs: Vec<&MethodDef> = c.methods.iter().filter(|m| m.name.as_str() == called && m.receiver == on).collect();
+        if !defs.is_empty() {
+            // The receiver's class too: an inherited method's receiverless calls reach each receiver's overrides.
+            // (and the count it is given, fewer arguments running more defaults, and the depth left: a shallower visit
+            // stops before calls a deeper one follows)
+            let key = format!("{}>{}{}{called}/{given}/{depth}", class.name.0.as_str(), c.name.0.as_str(), if on == MethodReceiver::Class { "." } else { "#" });
+            if !visited.insert(key) {
+                return;
+            }
+            let mut supers: Option<usize> = None;
+            for m in defs {
+                // Its parameters' defaults run when a call leaves them out (not a positional one the call gives: Ruby
+                // fills the required ones first); a closure it only stores runs later.
+                let positional = |p: &&crate::dialect::Param| !p.keyword && !p.rest && !p.from_keyword && !p.from_kwrest;
+                let required = m.params.iter().filter(positional).filter(|p| p.default.is_none()).count();
+                let defaults: Vec<&Expr> = m.params.iter().filter(positional).filter(|p| p.default.is_some()).enumerate()
+                    .filter(|(i, _)| required + *i >= given).filter_map(|(_, p)| p.default.as_ref())
+                    .chain(m.params.iter().filter(|p| !positional(p)).filter_map(|p| p.default.as_ref()))
+                    .collect();
+                for e in std::iter::once(&m.body).chain(defaults) {
+                    walk_load_time_const_paths(e, out);
+                    // Not the defining class as self: the receiver's, whose methods a receiverless call reaches first.
+                    walk_load_time_callee_paths(e, Some((class, on)), classes, visited, out, depth - 1);
+                }
+                // (a bare `super` forwards every positional the method binds, its defaults' too)
+                let bound = if m.params.iter().any(|p| p.rest) { given } else { given.max(m.params.iter().filter(positional).count()) };
+                if let Some(n) = super_given(&m.body, bound) {
+                    supers = Some(supers.map_or(n, |s| s.min(n)));
+                }
+            }
+            // The ancestor's defaults are the ones its `super` leaves out: `super()` gives none, a bare one forwards.
+            let Some(n) = supers else { return };
+            given = n;
+        }
+        steps += 1;
+        if steps > 32 {
+            return;
+        }
+        owner = c.parent.as_ref().and_then(|p| classes.iter().find(|k| k.name == *p));
+    }
+}
+
 fn walk_load_time_const_paths(e: &Expr, out: &mut BTreeSet<Vec<String>>) {
     /// The body of a stored closure literal.
     fn stored_body(e: &Expr) -> Option<&Expr> {
@@ -14739,6 +14913,27 @@ fn contains_yield_or_block(expr: &Expr) -> bool {
 }
 
 /// Any `super` in `expr`, at any depth.
+/// The fewest positional arguments a `super` in `expr` hands its ancestor, a bare one forwarding `given`; `None`
+/// when it calls none.
+fn super_given(expr: &Expr, given: usize) -> Option<usize> {
+    let own = match &*expr.node {
+        ExprNode::Super { args: None } => Some(given),
+        ExprNode::Super { args: Some(args) } => Some(if args.iter().any(|a| matches!(&*a.node, ExprNode::Splat { .. })) {
+            0
+        } else {
+            args.iter().filter(|a| !matches!(&*a.node, ExprNode::Hash { .. } | ExprNode::KeywordSplat { .. })).count()
+        }),
+        _ => None,
+    };
+    let mut fewest = own;
+    expr.node.for_each_child(&mut |child| {
+        if let Some(n) = super_given(child, given) {
+            fewest = Some(fewest.map_or(n, |f| f.min(n)));
+        }
+    });
+    fewest
+}
+
 fn contains_super(expr: &Expr) -> bool {
     if matches!(&*expr.node, ExprNode::Super { .. }) {
         return true;

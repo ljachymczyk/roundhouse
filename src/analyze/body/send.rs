@@ -1351,6 +1351,52 @@ impl<'a> BodyTyper<'a> {
         false
     }
 
+    /// The return types of `method` as the strict subclasses of `of` define it, each its own first definition below
+    /// `of`; empty when none does.
+    fn descendant_instance_answers(&self, of: &ClassId, method: &Symbol) -> Vec<Ty> {
+        let classes = self.classes();
+        let below = |id: &ClassId| {
+            let mut seen = crate::det::HashSet::default();
+            let mut current = classes.get(id).and_then(|c| c.parent.clone());
+            while let Some(p) = current {
+                if &p == of {
+                    return true;
+                }
+                if !seen.insert(p.clone()) {
+                    break;
+                }
+                current = classes.get(&p).and_then(|c| c.parent.clone());
+            }
+            false
+        };
+        let mut out: Vec<Ty> = Vec::new();
+        for (id, cls) in classes.iter().filter(|(id, _)| below(id)) {
+            // Not a subclass whose answer comes from a module it mixes in: dispatch reads it in an order this does not.
+            if !cls.instance_methods.contains_key(method) && cls.includes.iter().any(|m| self.lookup_in_module(m, method).is_some()) {
+                return Vec::new();
+            }
+            // Nor one whose `method_missing` answers it: that answer is not among the typed ones.
+            let missing = Symbol::from("method_missing");
+            if !cls.instance_methods.contains_key(method)
+                && (cls.instance_methods.contains_key(&missing) || cls.includes.iter().any(|m| self.lookup_in_module(m, &missing).is_some()))
+            {
+                return Vec::new();
+            }
+            if let Some(ty) = cls.instance_methods.get(method) {
+                let ty = unwrap_fn_ret(&ty.subst_self(&Ty::Class { id: id.clone(), args: Vec::new().into() }));
+                // Not an answer bounded by the typed ones where one is untyped: it may be declared so, or not typed
+                // yet (an earlier round's, which a later round answers).
+                if matches!(ty, Ty::Untyped | Ty::Var { .. }) {
+                    return Vec::new();
+                }
+                if !out.contains(&ty) {
+                    out.push(ty);
+                }
+            }
+        }
+        out
+    }
+
     /// Does `of` or an ancestor define `method` class-side (a scope, a
     /// `def self.…`, a runtime-declared class method)?
     pub(super) fn class_side_defines(&self, of: &ClassId, method: &Symbol) -> bool {
@@ -2492,6 +2538,17 @@ impl<'a> BodyTyper<'a> {
                         };
                     }
                     current_id = cls.parent.as_ref();
+                }
+                // Not unanswered where `self`'s class lacks the method but its subclasses define it: self is an
+                // instance of one of them where the call runs (parslet's `Parser#try` calls `root`, which each parser
+                // defines), and a plain instance raises there. Only for self: a value typed as the class is an
+                // instance of it (`URI::Generic` has no `request_uri`).
+                // Not over a `method_missing` the class has: a plain instance's call answers that.
+                if instance_receiver && IMPLICIT_SELF.with(|f| f.get()) && method_missing_ty.is_none() && !kernel_class_side && !class_dynamic_finder && !unknown_named_ancestor {
+                    let below = self.descendant_instance_answers(id, method);
+                    if !below.is_empty() {
+                        return below.into_iter().fold(Ty::Bottom, crate::analyze::body::union_of);
+                    }
                 }
                 // Rails synthesizes the same per-column finders on the model
                 // class as on its relations. Keep source definitions above
@@ -4803,6 +4860,19 @@ pub(crate) const ENUMERABLE_METHODS: &[&str] = &[
     "min_by", "minmax", "none?", "one?", "partition", "reduce", "reject", "reverse_each", "select", "sort", "sort_by",
     "sum", "take", "take_while", "tally", "to_a", "uniq", "zip",
 ];
+
+thread_local! {
+    /// Set while a receiverless or `self.` call dispatches (`implicit_self_dispatch`).
+    static IMPLICIT_SELF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `f` with the dispatch it runs marked as a call on self.
+pub(super) fn implicit_self_dispatch<T>(on_self: bool, f: impl FnOnce() -> T) -> T {
+    let before = IMPLICIT_SELF.with(|c| c.replace(on_self));
+    let out = f();
+    IMPLICIT_SELF.with(|c| c.set(before));
+    out
+}
 
 fn unwrap_fn_ret(ty: &Ty) -> Ty {
     match ty {
