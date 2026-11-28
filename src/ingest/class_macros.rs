@@ -108,7 +108,7 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile], mention
         }
         let macros: HashSet<Symbol> = table
             .keys()
-            .filter(|name| (hooks.contains_key(*name) && !own_names.contains(*name)) || reaches_definition(name, &table, 0))
+            .filter(|name| (hooks.contains_key(*name) && !own_names.contains(*name)) || reaches_definition(name, &table, 0) || reaches_class_body_effect(name, &table, 0))
             .cloned()
             .collect();
         if macros.is_empty() {
@@ -145,6 +145,7 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile], mention
         let mut reserved: Option<HashSet<Symbol>> = None;
         let mut expansions: HashMap<usize, Vec<ModelBodyItem>> = HashMap::default();
         let mut defaults: indexmap::IndexMap<Symbol, Expr> = indexmap::IndexMap::new();
+        let mut refused: Vec<usize> = Vec::new();
         let mut extended: HashSet<ClassId> = HashSet::default();
         let mut included: Vec<String> = app.load_hook_class_macros.iter().map(|id| id.0.as_str().to_string()).collect();
         for id in ancestors.iter().chain(std::iter::once(&model.name)) {
@@ -238,13 +239,24 @@ pub(crate) fn expand_class_macros(app: &mut App, sources: &[SourceFile], mention
                     expansions.insert(index, items);
                 }
                 Err(why) => {
+                    refused.push(index);
                     super::prism::push(crate::diagnostic::Diagnostic::unsupported(
                         expr.span,
                         None,
                         "class macro",
-                        format!("`{}` defines methods this call does not expand ({why}), so they are missing", method.as_str()),
+                        if reaches_definition(method, &table, 0) {
+                            format!("`{}` defines methods this call does not expand ({why}), so they are missing", method.as_str())
+                        } else {
+                            format!("`{}` declares on the class what this call does not expand ({why}), so its effect is missing", method.as_str())
+                        },
                     ));
                 }
+            }
+        }
+        for index in refused {
+            if let ModelBodyItem::Unknown { expr, .. } = &app.models[model_index].body[index] {
+                let span = expr.span;
+                app.models[model_index].refused_class_macros.push(span);
             }
         }
         if expansions.is_empty() {
@@ -1215,6 +1227,25 @@ fn reaches_definition(name: &Symbol, table: &HashMap<Symbol, MethodDef>, depth: 
     found
 }
 
+/// A class method that declares on its caller (solid_queue's `assumes_attributes_from_job`: a `before_create`
+/// and a class attribute write), which Rails runs where the model's body calls it.
+fn reaches_class_body_effect(name: &Symbol, table: &HashMap<Symbol, MethodDef>, depth: usize) -> bool {
+    if depth > MAX_DEPTH {
+        return false;
+    }
+    let Some(def) = table.get(name) else { return false };
+    let mut found = false;
+    visit(&def.body, &mut |e| match &*e.node {
+        ExprNode::Send { recv, method, .. } if recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) => {
+            found |= (recv.is_none() && CLASS_BODY_DECLARATIONS.contains(&method.as_str()))
+                || (method != name && table.contains_key(method) && reaches_class_body_effect(method, table, depth + 1));
+        }
+        ExprNode::OpAssign { target: LValue::Attr { recv, .. }, .. } => found |= matches!(&*recv.node, ExprNode::SelfRef),
+        _ => {}
+    });
+    found
+}
+
 fn class_evals_a_string(e: &Expr) -> bool {
     matches!(&*e.node, ExprNode::Send { args, block: None, .. } if args.first().is_some_and(|a| matches!(&*a.node, ExprNode::Lit { value: Literal::Str { .. } } | ExprNode::StringInterp { .. })))
 }
@@ -1987,6 +2018,22 @@ impl Run<'_> {
             // `steps << …` where `steps` is the class's `@steps ||= []`: its state, through its reader, in the calling class's body.
             ExprNode::Send { recv: Some(r), block: None, .. } if self.reads_class_state(r) => {
                 let mut substituted = self.substitute(st, env, &HashSet::default())?;
+                substituted.decisions |= crate::expr::REPLAYED_CLASS_BODY;
+                self.out.push(substituted);
+                Ok(false)
+            }
+            // `self.x |= names`: run in the calling class's body, where the reader answers what the class inherits.
+            ExprNode::OpAssign { target: LValue::Attr { recv, name }, op: crate::expr::OpAssignOp::BitOr | crate::expr::OpAssignOp::Add, .. }
+                if matches!(&*recv.node, ExprNode::SelfRef) =>
+            {
+                // Not inside another class's `instance_eval`: replayed here it would change the caller's attribute.
+                if self.target.is_some() {
+                    return Err(format!("it changes `{}` on another class", name.as_str()));
+                }
+                let mut substituted = self.substitute(st, env, &HashSet::default())?;
+                self.class_attrs.remove(name);
+                // A later write is no longer the declaration's default: it runs after this one.
+                self.unset_cattrs.remove(name);
                 substituted.decisions |= crate::expr::REPLAYED_CLASS_BODY;
                 self.out.push(substituted);
                 Ok(false)

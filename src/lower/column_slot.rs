@@ -96,6 +96,8 @@ impl Logical {
 pub struct ColumnSlot<'a> {
     col: &'a Column,
     codec: Option<Codec>,
+    /// A JSON column a `store` declares, read and written through Rails' indifferent coder.
+    store: bool,
 }
 
 impl<'a> ColumnSlot<'a> {
@@ -103,7 +105,8 @@ impl<'a> ColumnSlot<'a> {
     /// accessors, so a `json`/`jsonb` type there is not this codec.
     pub fn classify(col: &'a Column, model: &Model) -> Self {
         let codec = codec_for(&col.col_type, is_generic_json(col, model));
-        Self { col, codec }
+        let store = matches!(codec, Some(Codec::Json)) && super::serialize::json_store_columns(model).contains(&col.name);
+        Self { col, codec, store }
     }
 
     pub fn is_temporal(&self) -> bool {
@@ -154,7 +157,8 @@ impl<'a> ColumnSlot<'a> {
     /// text. An interval entry is the duration Rails casts into the hash.
     pub fn attributes_read(&self) -> Option<Expr> {
         match self.codec? {
-            Codec::Json => Some(self.json_load()),
+            // Not the record's held store Hash: `attributes` is the baseline dirty tracking compares against.
+            Codec::Json => Some(self.json_load_detached()),
             Codec::Temporal { logical } if logical.attributes_read_logical() => {
                 Some(self.temporal_reader(logical))
             }
@@ -209,7 +213,8 @@ impl<'a> ColumnSlot<'a> {
         if !self.is_json() {
             return None;
         }
-        Some(json_column(value.span, "dump", vec![value], super::model_to_library::ty_of_column_slot(self.col)))
+        let dump = if self.store { "dump_store" } else { "dump" };
+        Some(json_column(value.span, dump, vec![value], super::model_to_library::ty_of_column_slot(self.col)))
     }
 
     /// Method hydration calls. JSON skips `dump`. A temporal column
@@ -237,12 +242,29 @@ impl<'a> ColumnSlot<'a> {
         active_support(Span::synthetic(), logical.parse(), vec![ivar], ret)
     }
 
+    fn json_load_detached(&self) -> Expr {
+        if !self.store {
+            return self.json_load();
+        }
+        let stored = with_ty(
+            Expr::new(Span::synthetic(), ExprNode::Ivar { name: self.storage_name() }),
+            super::model_to_library::ty_of_column_slot(self.col),
+        );
+        json_column(Span::synthetic(), "load_store", vec![stored], Ty::Untyped)
+    }
+
     fn json_load(&self) -> Expr {
         let stored = with_ty(
             Expr::new(Span::synthetic(), ExprNode::Ivar { name: self.storage_name() }),
             super::model_to_library::ty_of_column_slot(self.col),
         );
-        json_column(Span::synthetic(), "load", vec![stored], Ty::Untyped)
+        if !self.store {
+            return json_column(Span::synthetic(), "load", vec![stored], Ty::Untyped);
+        }
+        // The record and its writer: a change made in place on the Hash is written back, as Rails' store keeps it.
+        let owner = Expr::new(Span::synthetic(), ExprNode::SelfRef);
+        let writer = Expr::new(Span::synthetic(), ExprNode::Lit { value: crate::expr::Literal::Str { value: format!("{}=", self.col.name.as_str()) } });
+        json_column(Span::synthetic(), "load_store", vec![stored, owner, writer], Ty::Untyped)
     }
 }
 

@@ -22,4 +22,14 @@ module RoundhouseJsonColumn
     return nil if value.nil?
     ActiveSupport::JSON.encode_without_escape(value)
   end
+
+  # Not Rails' indifferent Hash: this runtime has none, so its keys stay Strings and check refuses `store` here.
+  def self.load_store(serialized, owner = nil, writer = nil)
+    decoded = serialized.nil? || serialized.empty? ? nil : JSON.parse(serialized)
+    decoded.is_a?(Hash) ? decoded : {}
+  end
+
+  def self.dump_store(value)
+    ActiveSupport::JSON.encode_without_escape(value.is_a?(Hash) ? value : {})
+  end
 end

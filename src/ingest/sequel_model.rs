@@ -101,6 +101,7 @@ pub fn ingest_sequel_model(
         sti_subclass_names: Vec::new(),
         mixin_sends: Vec::new(),
         select_aliases: Vec::new(),
+        refused_class_macros: Vec::new(),
         i18n: Default::default(),
         span: Span {
             file: super::sources::file_id(file),

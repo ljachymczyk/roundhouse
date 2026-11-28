@@ -1333,6 +1333,14 @@ fn diagnose_head(app: &App) -> Vec<Diagnostic> {
     }));
     out.extend(overridden_synthesized_accessors(app));
     out.extend(runtime_defined_surfaces(app));
+    // Model class-body statements no pass lowers: their effect would be
+    // dropped from the output, so each is an error, not an emit warning.
+    let mut reported: crate::det::HashSet<crate::span::Span> =
+        out.iter().filter(|d| d.severity == crate::diagnostic::Severity::Error).map(|d| d.span).collect();
+    // Not by a synthetic span: unrelated calls share it.
+    out.extend(
+        crate::lower::model_to_library::unclaimed::diagnostics(app).into_iter().filter(|d| d.span.is_synthetic() || reported.insert(d.span)),
+    );
     // A filter's return value is Rails' to discard (`around_action
     // :switch_locale` → `I18n.with_locale(locale, &action)`): nothing
     // escapes from its tail, so an `untyped` there is not a gradual

@@ -2382,6 +2382,55 @@ fn report_array_columns(app: &App, target: BuildTarget) {
 /// ActionController::Base, and only the Ruby family's runtime issues and
 /// verifies the token (`runtime/ruby/action_controller/authenticity_token.rb`).
 /// Elsewhere the check passes every request, so the gap is named once.
+/// `store :col, coder: JSON` reads its Hash by a Symbol as well, through the ruby overlay's
+/// HashWithIndifferentAccess; the other runtimes have none, so a Symbol key would read nothing.
+fn report_json_store(app: &App, target: BuildTarget) {
+    // Not Blog's: it writes the app's own Rails source, whose store is Rails'.
+    if matches!(target, BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Blog) {
+        return;
+    }
+    for model in &app.models {
+        for decl in crate::lower::serialize::serialize_decls(model).into_iter().filter(|d| d.store) {
+            crate::emit::diagnostics::report_unsupported(
+                decl.span,
+                target.as_str(),
+                "store",
+                "this target's runtime has no HashWithIndifferentAccess, so the stored Hash would not answer a Symbol key",
+            );
+        }
+    }
+}
+
+/// `attribute :x, :integer` (and `:string`, `:float`, `:decimal`, `:datetime`) casts in the Ruby family's writers
+/// (`emit::ruby::library`); a strict target's synthesized writer casts only `:boolean`, and would keep the value as
+/// assigned.
+fn report_attribute_casts(app: &App, target: BuildTarget) {
+    if matches!(target, BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel | BuildTarget::Blog) {
+        return;
+    }
+    for model in &app.models {
+        for item in &model.body {
+            let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+            let crate::expr::ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+            if method.as_str() != "attribute" {
+                continue;
+            }
+            let Some(decl) = crate::lower::model_to_library::markers::attribute_api_decl(args) else { continue };
+            let Some(ty) = decl.ty else { continue };
+            let over_column = app.schema.tables.get(&model.table.0).is_some_and(|t| t.columns.iter().any(|c| c.name == *decl.name));
+            if over_column || ty.as_str() == "boolean" || !crate::lower::model_to_library::unclaimed::ATTRIBUTE_CASTS.contains(&ty.as_str()) {
+                continue;
+            }
+            crate::emit::diagnostics::report_unsupported(
+                expr.span,
+                target.as_str(),
+                "attribute",
+                &format!("this target's writer for `attribute :{}, :{ty}` does not cast, so it keeps the value as assigned", decl.name),
+            );
+        }
+    }
+}
+
 fn report_forgery_protection(app: &App, target: BuildTarget) {
     if matches!(target, BuildTarget::Blog | BuildTarget::Roda | BuildTarget::Futamura | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel) {
         return;
@@ -3924,6 +3973,8 @@ fn target_files_inner(
     report_sqlite_index_predicates(app);
     report_array_columns(app, target);
     report_forgery_protection(app, target);
+    report_json_store(app, target);
+    report_attribute_casts(app, target);
     report_native_ruby_syntax(app, target);
     report_self_bindings(app, target);
     report_ruby_only_sends(app, target);

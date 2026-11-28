@@ -27,6 +27,11 @@ fn app(files: &[(&str, &str)]) -> emit_and_run::Overlay {
 }
 
 fn compare(files: &[(&str, &str)], script: &str) {
+    compare_reporting(files, script, None);
+}
+
+/// `compare` where an inherited class method of a DSL's name answers the call, which the output drops and `check` reports.
+fn compare_reporting(files: &[(&str, &str)], script: &str, dropped: Option<&str>) {
     // Scheduling has no application config dependency: use standalone AR,
     // with its default settings, rather than a Rails application/load_defaults.
     let oracle = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle.rb");
@@ -66,7 +71,10 @@ ActiveRecord::Schema.verbose = false
         );
     }
     let run = app(files).run_ruby(script);
-    run.assert_passes();
+    match dropped {
+        None => run.assert_passes(),
+        Some(dropped) => run.assert_runs_reporting(dropped),
+    }
     if output.status.success() {
         assert_eq!(
             run.stdout.trim(),
@@ -75,6 +83,8 @@ ActiveRecord::Schema.verbose = false
         );
     }
 }
+
+const DROPPED_VALIDATE: &str = "`validate` in the body of `Item` is not modelled";
 
 const VALIDITY_SCRIPT: &str = r#"record = Item.new(name: "", code: "", enabled: true)
 puts record.valid?
@@ -246,12 +256,13 @@ fn class_method_ownership_respects_ancestors_concerns_and_definition_order() {
         "class Parent < ApplicationRecord\n  self.abstract_class = true\n  {override_method}\nend\n"
     );
     let child = format!("class Item < Parent\n  {callback}\nend\n");
-    compare(
+    compare_reporting(
         &[
             ("app/models/parent.rb", &parent),
             ("app/models/item.rb", &child),
         ],
         VALIDITY_SCRIPT,
+        Some(DROPPED_VALIDATE),
     );
     let late = format!("class Item < ApplicationRecord\n  {callback}\n  {override_method}\nend\n");
     compare(&[("app/models/item.rb", &late)], VALIDITY_SCRIPT);

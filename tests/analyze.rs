@@ -4702,7 +4702,11 @@ fn a_token_purpose_the_lowering_cannot_expand_declines_the_model() {
         ),
         (
             "app/models/superseded.rb",
-            "class Superseded < ApplicationRecord\n  generates_token_for :share, expires_at: Time.now\n  generates_token_for :share\nend\n",
+            "class Superseded < ApplicationRecord\n  generates_token_for :share, expires_in: 0.minutes\n  generates_token_for :share\nend\n",
+        ),
+        (
+            "app/models/computed.rb",
+            "class Computed < ApplicationRecord\n  generates_token_for :share, expires_in: ENV.fetch(\"TTL\").to_i.minutes\n  generates_token_for :share\nend\n",
         ),
         (
             "db/schema.rb",
@@ -4716,14 +4720,23 @@ fn a_token_purpose_the_lowering_cannot_expand_declines_the_model() {
   create_table "supersededs", force: :cascade do |t|
     t.string "name"
   end
+  create_table "computeds", force: :cascade do |t|
+    t.string "name"
+  end
 end
 "#,
         ),
     ]);
     let errors = errors_of(&app);
-    assert_eq!(errors.len(), 2, "the two declined models' finders error; got {errors:?}");
-    assert!(errors.iter().any(|e| e.contains("Redeclared")), "got {errors:?}");
-    assert!(errors.iter().any(|e| e.contains("Quoted")), "got {errors:?}");
+    let declarations: Vec<_> = errors.iter().filter(|e| e.contains("`generates_token_for` in the body of")).collect();
+    assert_eq!(errors.len() - declarations.len(), 2, "the two declined models' finders error; got {errors:?}");
+    assert!(errors.iter().any(|e| e.contains("Redeclared") && !declarations.contains(&e)), "got {errors:?}");
+    assert!(errors.iter().any(|e| e.contains("Quoted") && !declarations.contains(&e)), "got {errors:?}");
+    // Each declaration of a declined model is dropped. Superseded's first is replaced, as in Rails; Computed's is
+    // replaced too, but Rails evaluates its expiry as the class loads, and the output does not.
+    assert_eq!(declarations.len(), 5, "got {errors:?}");
+    assert!(!declarations.iter().any(|e| e.contains("Superseded")), "got {errors:?}");
+    assert!(declarations.iter().any(|e| e.contains("Computed")), "got {errors:?}");
 }
 
 /// `ProductMailer.with(product:, subscriber:)` makes `params[:subscriber]`

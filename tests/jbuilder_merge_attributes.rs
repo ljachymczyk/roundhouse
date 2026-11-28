@@ -128,5 +128,5 @@ raise "ignored_columns #{refused.inspect}" unless refused.to_s.include?("merge! 
 puts "ALL OK"
 "##,
         )
-        .assert_passes();
+        .assert_runs_reporting("`ignored_columns=` in the body of `Widget`");
 }

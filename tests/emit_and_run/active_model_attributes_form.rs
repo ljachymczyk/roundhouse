@@ -172,7 +172,8 @@ fn column_app() -> emit_and_run::Overlay {
 #[test]
 fn an_attribute_over_a_column_of_another_type_keeps_the_column() {
     let run = column_app().run_ruby(COLUMN_SCRIPT);
-    run.assert_passes();
+    // Rails' declared type replaces the column's everywhere; here only the column's is kept, so check reports it.
+    run.assert_runs_reporting("`attribute` in the body of `Article` is not modelled");
     assert!(run.stdout.contains("attribute over column passed"), "{}", run.stdout);
 }
 
@@ -237,7 +238,7 @@ fn an_attribute_over_an_array_column_keeps_the_array() {
             "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy\n  attribute :tag_ids, :integer\n",
         )
         .run_ruby(ARRAY_COLUMN_SCRIPT);
-    run.assert_passes();
+    run.assert_runs_reporting("`attribute` in the body of `Article` is not modelled");
     assert!(run.stdout.contains("attribute over array column passed"), "{}", run.stdout);
 }
 
@@ -412,7 +413,7 @@ fn reported_default(decl: &str) -> Vec<String> {
     let _ = std::fs::remove_dir_all(&root);
     String::from_utf8_lossy(&out.stderr)
         .lines()
-        .filter(|l| l.contains("attribute not supported") && l.contains("not lowered"))
+        .filter(|l| l.contains("attribute not supported") && l.contains("is not modelled"))
         .map(str::to_string)
         .collect()
 }

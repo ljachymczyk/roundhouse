@@ -30,6 +30,20 @@ fn lower(
     roundhouse::emit::diagnostics::scope(|| lower_model_to_library_class(model, &app.schema))
 }
 
+fn unclaimed(declaration: &str) -> Vec<roundhouse::diagnostic::Diagnostic> {
+    let model = format!("class Message < ApplicationRecord\n{declaration}\nend\n");
+    let tree = [
+        ("db/schema.rb", "ActiveRecord::Schema.define(version: 1) do\n  create_table :messages do |t|\n    t.string :title\n  end\nend\n"),
+        ("app/models/message.rb", model.as_str()),
+    ]
+    .into_iter()
+    .map(|(path, source)| (std::path::PathBuf::from(path), source.as_bytes().to_vec()))
+    .collect();
+    let app = ingest_app_from_tree(tree).expect("ingest tree");
+    let model = app.models.iter().find(|m| m.name.0.as_str() == "Message").expect("Message model");
+    roundhouse::lower::model_to_library::unclaimed::model_diagnostics(model, &app.schema)
+}
+
 #[test]
 fn supported_omitted_type_declarations_generate_accessors_and_are_claimed() {
     let (class, diagnostics) = lower("  attribute :raw\n  attribute :files, default: -> { [] }\n");
@@ -78,11 +92,11 @@ fn unsupported_omitted_type_defaults_remain_reported() {
         "  attribute :files, default: -> { [] }\n  def files=(value)\n    super(value)\n  end",
         "  attribute :title, default: -> { \"untitled\" }",
     ] {
-        let (_, diagnostics) = lower(declaration);
+        let (_, lowering) = lower(declaration);
+        let diagnostics = [lowering, unclaimed(declaration)].concat();
         assert!(
-            diagnostics
-                .iter()
-                .any(|d| d.message.contains("attribute") && d.message.contains("not lowered")),
+            diagnostics.iter().any(|d| d.message.contains("`attribute` in the body of `Message` is not modelled")
+                && d.severity == roundhouse::diagnostic::Severity::Error),
             "{declaration}: {diagnostics:?}"
         );
     }
