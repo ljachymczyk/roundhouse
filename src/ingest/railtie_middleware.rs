@@ -192,20 +192,22 @@ pub(super) fn read<V: Vfs + ?Sized>(vfs: &V, dir: &Path, gem_libs: &[PathBuf]) -
     let mut defines = None;
     for u in application_uses(vfs, dir) {
         // Not the gems' classes first and then the app's: Ruby tries each lexical candidate against every loaded class.
-        let defines = defines.get_or_insert_with(|| {
+        let (defines, assigned) = defines.get_or_insert_with(|| {
             let mut files = Vec::new();
             rb_files(vfs, &dir.join("lib"), &mut files);
             rb_files(vfs, &dir.join("app"), &mut files);
             let mut defines = defined_constants(vfs, &files);
             defines.extend(every_gem_defines.iter().cloned());
-            defines
+            files.push(dir.join("config/application.rb"));
+            files.extend(every_lib_file.iter().cloned());
+            (defines, assigned_constants(vfs, &files))
         });
         // Not stacked: a class neither a source gem nor the app defines (`Rack::Deflater`) stays the ledger's warning, as before.
         if let Some(class) = resolve(&u, defines) {
             application_taken.push(u.span.start);
             let namespaced = || {
                 u.block_constants.iter().find_map(|name| {
-                    u.lexical.iter().map(|cref| format!("{cref}::{name}")).find(|found| defines.contains(found)).map(|found| (name, found))
+                    u.lexical.iter().map(|cref| format!("{cref}::{name}")).find(|found| defines.contains(found) || assigned.contains(found)).map(|found| (name, found))
                 })
             };
             if u.outermost && let Some((name, found)) = namespaced() {
@@ -755,6 +757,46 @@ fn defined_constants<V: Vfs + ?Sized>(vfs: &V, files: &[PathBuf]) -> HashSet<Str
         }
     }
     defined
+}
+
+/// The constants these files assign at the top or in a class or module body: `module Blog; FEATURE = "app"; end` gives
+/// `Blog::FEATURE`, and a top-level `Blog::FEATURE = "app"` gives it too.
+fn assigned_constants<V: Vfs + ?Sized>(vfs: &V, files: &[PathBuf]) -> HashSet<String> {
+    let mut assigned = HashSet::default();
+    let mut read_body = |scope: &[String], body: Node<'_>| {
+        for stmt in flatten_statements(body) {
+            let written: Option<Vec<String>> = if let Some(write) = stmt.as_constant_write_node() {
+                Some(scope.iter().cloned().chain(std::iter::once(constant_id_str(&write.name()).to_string())).collect())
+            } else if let Some(write) = stmt.as_constant_path_write_node() {
+                let target = write.target();
+                constant_path_of(&target.as_node()).map(|path| if constant_path_is_rooted(&target) { path } else { scope.iter().cloned().chain(path).collect() })
+            } else {
+                None
+            };
+            if let Some(path) = written {
+                assigned.insert(path.join("::"));
+            }
+        }
+    };
+    for file in files {
+        let Ok(bytes) = vfs.read(file) else { continue };
+        let parsed = super::prism::parse_silent(&bytes);
+        let root = parsed.node();
+        if let Some(program) = root.as_program_node() {
+            read_body(&[], program.statements().as_node());
+        }
+        for (scope, _, class) in find_all_classes_with_nesting(&root) {
+            if let (Some(path), Some(body)) = (class_name_path(&class), class.body()) {
+                read_body(&scope.iter().cloned().chain(path).collect::<Vec<_>>(), body);
+            }
+        }
+        for (scope, module) in find_all_module_declarations_with_scope(&root) {
+            if let (Some(path), Some(body)) = (module_name_path(&module), module.body()) {
+                read_body(&scope.iter().cloned().chain(path).collect::<Vec<_>>(), body);
+            }
+        }
+    }
+    assigned
 }
 
 fn rb_files<V: Vfs + ?Sized>(vfs: &V, dir: &Path, out: &mut Vec<PathBuf>) {
@@ -1325,6 +1367,23 @@ mod tests {
         let refused: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
         assert_eq!(refused.len(), 1, "{refused:?}");
         assert!(refused[0].contains("reads `Settings` as `Blog::Settings`"), "{refused:?}");
+    }
+
+    /// A constant assigned in the app's namespace is looked up there as well: refused like a class or module of it.
+    #[test]
+    fn an_insertion_at_0_whose_block_reads_an_assigned_namespaced_constant_is_refused() {
+        let application = "module Blog\n  FEATURE = \"app\"\n\n  class Application < Rails::Application\n    config.middleware.insert_before(0, Gate) { |m| m.mode = FEATURE }\n    config.middleware.insert_before(0, Probe) { |m| m.mode = LIMIT }\n    config.middleware.insert_before(0, Other) { |m| m.mode = Blog::FEATURE }\n  end\nend\n";
+        let classes = "class Gate\nend\nclass Probe\nend\nclass Other\nend\nmodule Blog\n  class Application\n    LIMIT = 5\n  end\nend\n";
+        let map = [("/app/config/application.rb", application), ("/app/lib/gate.rb", classes)]
+            .iter()
+            .map(|(path, text)| (PathBuf::from(path), text.as_bytes().to_vec()))
+            .collect();
+        let super::Stack { outermost, diags, .. } = super::read(&MapVfs::new(map), std::path::Path::new("/app"), &[]);
+        assert_eq!(outermost, ["Other"]);
+        let refused: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        assert!(refused.iter().any(|m| m.contains("reads `FEATURE` as `Blog::FEATURE`")), "{refused:?}");
+        assert!(refused.iter().any(|m| m.contains("reads `LIMIT` as `Blog::Application::LIMIT`")), "{refused:?}");
     }
 
     /// A forwarded block (`&configure`) is not text the stack can copy, so the class is not stacked without it.
