@@ -12592,7 +12592,7 @@ fn apply_test_gem_wiring(files: &mut Vec<(String, String)>) {
     // every understood `stub_request` chain to the slot by the time this
     // scan runs, so on the ruby family the slot's delegate is what reaches
     // the gem — and that is the demand.
-    const TEST_GEMS: [(Marker, &str, &str); 7] = [
+    const TEST_GEMS: [(Marker, &str, &str); 6] = [
         (Marker::AnyText(&["WebMock.", "WebMock::", "HttpStub."]), "webmock", "webmock/minitest"),
         // `MochaBridge.` is the lowering's own spelling of a chain it hands
         // back to the gem (`lower::mocha`), and the paren-less forms are
@@ -12614,7 +12614,6 @@ fn apply_test_gem_wiring(files: &mut Vec<(String, String)>) {
         (Marker::Constant("Retryable"), "retryable", "retryable"),
         (Marker::Constant("JWT"), "jwt", "jwt"),
         (Marker::Constant("RestClient"), "rest-client", "rest-client"),
-        (Marker::Constant("WebAuthn"), "webauthn", "webauthn"),
     ];
 
     let mut needed: Vec<(&str, &str)> = Vec::new();
