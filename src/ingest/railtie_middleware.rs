@@ -494,9 +494,11 @@ fn read_class_body_use(stmt: &Node<'_>, file: crate::span::FileId, lexical: &[St
         ));
         return;
     };
-    let block_constants = block.as_ref().and_then(|b| b.body()).map(|body| {
+    let block_constants = block.as_ref().map(|b| {
         let mut bare = BareConstants(Vec::new());
-        ruby_prism::Visit::visit(&mut bare, &body);
+        for copied in [b.parameters(), b.body()].into_iter().flatten() {
+            ruby_prism::Visit::visit(&mut bare, &copied);
+        }
         bare.0
     });
     // Braces, not `do … end`: nested in the stack's `A.new(B.new(app) { … })`, a `do` would bind to `A.new`.
@@ -1332,6 +1334,25 @@ mod tests {
         let super::Stack { outermost, diags, .. } = super::read(&MapVfs::new(map), std::path::Path::new("/app"), &[]);
         assert!(outermost.is_empty(), "{outermost:?}");
         assert!(diags.iter().any(|d| d.message.contains("reads the constant `Gate` without a leading `::`")), "{diags:?}");
+    }
+
+    /// The stack copies the block's parameters with its body, so a constant in a parameter default is read the same way:
+    /// refused unless rooted.
+    #[test]
+    fn an_insertion_at_0_whose_block_parameter_default_reads_a_constant_that_is_not_rooted_is_refused() {
+        let application = "module Blog\n  class Application < Rails::Application\n    config.middleware.insert_before(0, Optional) { |m, mode = Settings| m.mode = mode }\n    config.middleware.insert_before(0, Keyword) { |m, mode: Settings| m.mode = mode }\n    config.middleware.insert_before(0, Rooted) { |m, mode = ::Settings| m.mode = mode }\n  end\nend\n";
+        let classes = "class Settings\nend\nclass Optional\nend\nclass Keyword\nend\nclass Rooted\nend\n";
+        let map = [("/app/config/application.rb", application), ("/app/lib/gate.rb", classes)]
+            .iter()
+            .map(|(path, text)| (PathBuf::from(path), text.as_bytes().to_vec()))
+            .collect();
+        let super::Stack { outermost, blocks, diags, .. } = super::read(&MapVfs::new(map), std::path::Path::new("/app"), &[]);
+        assert_eq!(outermost, ["Rooted"]);
+        assert!(blocks.get("Rooted").is_some_and(|b| b.contains("mode = ::Settings")), "{blocks:?}");
+        let refused: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        assert!(refused.iter().all(|m| m.contains("reads the constant `Settings` without a leading `::`")), "{refused:?}");
+        assert!(refused.iter().any(|m| m.contains("insert_before 0, Optional")) && refused.iter().any(|m| m.contains("insert_before 0, Keyword")), "{refused:?}");
     }
 
     /// A forwarded block (`&configure`) is not text the stack can copy, so the class is not stacked without it.
