@@ -672,6 +672,10 @@ impl AppMethods {
             ExprNode::Var { name, .. } => {
                 let body = self.body.as_ref()?;
                 let assigned = find_var_assignment(body, name)?;
+                // Not one read back from itself (`x = x`), which would never end.
+                if matches!(&*assigned.node, ExprNode::Var { name: n, .. } if n == name) {
+                    return None;
+                }
                 self.class_of_head(&assigned)
             }
             // `Klass.new(...)` and the finders that answer an instance.
@@ -720,22 +724,22 @@ fn find_let_value(body: &Expr) -> Option<Expr> {
 }
 
 /// The value the first `name = …` in `body` assigns, if any.
+/// The value of the only `name = …` in `body`: with two, which one reaches the stub depends on the flow, so none.
 fn find_var_assignment(body: &Expr, name: &Symbol) -> Option<Expr> {
-    let mut found: Option<Expr> = None;
-    fn walk(e: &Expr, name: &Symbol, found: &mut Option<Expr>) {
-        if found.is_some() {
-            return;
-        }
-        if let ExprNode::Assign { target: LValue::Var { name: n, .. }, value } = &*e.node {
-            if n == name {
-                *found = Some(value.clone());
-                return;
-            }
+    let mut found: Vec<Expr> = Vec::new();
+    fn walk(e: &Expr, name: &Symbol, found: &mut Vec<Expr>) {
+        match &*e.node {
+            ExprNode::Assign { target: LValue::Var { name: n, .. }, value } if n == name => found.push(value.clone()),
+            ExprNode::OpAssign { target: LValue::Var { name: n, .. }, value, .. } if n == name => found.push(value.clone()),
+            _ => {}
         }
         e.node.for_each_child(&mut |c| walk(c, name, found));
     }
     walk(body, name, &mut found);
-    found
+    match found.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
+    }
 }
 
 /// The value the last `@name = …` in `body` assigns, if any.
@@ -1517,11 +1521,22 @@ fn guard_answer_slots(app: &mut App, slots: &BTreeMap<(String, String, bool), An
         );
         let name = format!("{class}{}{method}", if *class_side { "." } else { "#" });
         let message = with_ty(str_lit(sp(), &format!("unexpected invocation: {name}")), Ty::Str);
+        let error_class = ClassId(Symbol::from("MochaUnexpectedInvocation"));
+        let error = with_ty(
+            Expr::new(sp(), ExprNode::Send {
+                recv: Some(Expr::new(sp(), ExprNode::Const { path: vec![Symbol::from("MochaUnexpectedInvocation")] })),
+                method: Symbol::from("new"),
+                args: vec![message],
+                block: None,
+                parenthesized: true,
+            }),
+            Ty::Class { id: error_class, args: vec![].into() },
+        );
         let refuse = Expr::new(
             sp(),
             ExprNode::If {
                 cond: var("__mocha_unmatched", Ty::Bool),
-                then_branch: Expr::new(sp(), ExprNode::Raise { value: message }),
+                then_branch: Expr::new(sp(), ExprNode::Raise { value: error }),
                 else_branch: nil_lit(),
             },
         );
@@ -1773,7 +1788,8 @@ fn count_of(op: &Op) -> Option<Expr> {
         ("never", []) => Some(int_lit(Span_of(op), 0)),
         ("once", []) => Some(int_lit(Span_of(op), 1)),
         ("twice", []) => Some(int_lit(Span_of(op), 2)),
-        ("times", [n]) => Some(n.clone()),
+        // Not a Range (`times(1..2)`): the slot counts one exact number.
+        ("times", [n]) if matches!(&*n.node, ExprNode::Lit { value: Literal::Int { .. } }) => Some(n.clone()),
         _ => None,
     }
 }

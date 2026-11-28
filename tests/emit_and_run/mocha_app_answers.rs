@@ -65,6 +65,18 @@ class GreeterTest < ActiveSupport::TestCase
     Greeter.current
   end
 
+  test "a local assigned twice still answers its stub" do
+    g = Greeter.new("first")
+    g = Greeter.new("second")
+    g.stubs(:name).returns("stubbed")
+    assert_equal "stubbed", g.name
+  end
+
+  test "a range of calls is met" do
+    Greeter.expects(:current).times(1..2).returns(Greeter.new("r"))
+    Greeter.current
+  end
+
   test "a stub from an earlier test is gone" do
     assert_equal "real", Greeter.current.name
   end
@@ -90,6 +102,8 @@ fn app_method_answers_fail_where_mocha_does() {
         ("    Greeter.current\n    Greeter.current\n", "    Greeter.current\n"),
         ("assert_equal \"hi bob\", greeter.greet(\"bob\")", "greeter.greet(\"zed\")"),
         ("assert_equal \"y\", other.name", "assert_equal \"stubbed\", other.name"),
+        // An app's own `rescue` does not swallow the unexpected invocation, as it does not swallow Mocha's.
+        ("assert_equal \"hi bob\", greeter.greet(\"bob\")", "begin\n      greeter.greet(\"zed\")\n    rescue StandardError\n      nil\n    end"),
     ] {
         let run = app(&TEST.replacen(find, replace, 1)).run_test("test/models/greeter_test.rb");
         assert!(run.errors.is_empty(), "{replace}: {:?}", run.errors);

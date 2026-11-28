@@ -21,6 +21,11 @@
 # the test helper also clears the registry in setup and verifies every
 # filed expectation in teardown — the same moment, and the same failure,
 # as `mocha_verify`.
+# What a guard raises for a call no live stub admits. Not a StandardError: like Mocha's own expectation error, an app's
+# `rescue StandardError` must not swallow it and let the test pass.
+class MochaUnexpectedInvocation < Exception
+end
+
 class MochaStub
   def initialize(name, expected)
     @name = name

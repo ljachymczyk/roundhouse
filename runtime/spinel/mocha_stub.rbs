@@ -1,4 +1,7 @@
 # Typing contract for runtime/spinel/mocha_stub.rb — see its header.
+class MochaUnexpectedInvocation < Exception
+end
+
 class MochaStub
   def initialize: (String name, Integer expected) -> void
   def self.stub: (String name) -> MochaStub
