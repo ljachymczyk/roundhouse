@@ -12589,8 +12589,9 @@ fn walk_load_time_method(
         let defs: Vec<&MethodDef> = c.methods.iter().filter(|m| m.name.as_str() == called && m.receiver == on).collect();
         if !defs.is_empty() {
             // The receiver's class too: an inherited method's receiverless calls reach each receiver's overrides.
-            // (and the count it is given: fewer arguments run more defaults)
-            let key = format!("{}>{}{}{called}/{given}", class.name.0.as_str(), c.name.0.as_str(), if on == MethodReceiver::Class { "." } else { "#" });
+            // (and the count it is given, fewer arguments running more defaults, and the depth left: a shallower visit
+            // stops before calls a deeper one follows)
+            let key = format!("{}>{}{}{called}/{given}/{depth}", class.name.0.as_str(), c.name.0.as_str(), if on == MethodReceiver::Class { "." } else { "#" });
             if !visited.insert(key) {
                 return;
             }

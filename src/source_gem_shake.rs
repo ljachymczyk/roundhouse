@@ -554,7 +554,7 @@ impl<'a> Gems<'a> {
     }
 
     /// The values `@name` is assigned in class `c`'s methods.
-    fn ivar_writes(&self, c: Option<&str>, name: &str) -> Vec<&'a Expr> {
+    fn ivar_writes<'s>(&'s self, c: Option<&str>, name: &str) -> Vec<(&'s str, bool, &'a Expr)> {
         fn walk<'e>(e: &'e Expr, name: &str, out: &mut Vec<&'e Expr>) {
             match &*e.node {
                 ExprNode::Assign { target: crate::expr::LValue::Ivar { name: n }, value }
@@ -565,16 +565,20 @@ impl<'a> Gems<'a> {
         }
         let mut out = Vec::new();
         // (an instance of `c` runs its ancestors' writes, and one of a subclass the subclass's too)
-        let entries: Vec<&&LibraryClass> = match c {
+        let entries: Vec<(&'s str, &&'a LibraryClass)> = match c {
             Some(c) => {
                 let up = self.ancestors(c);
-                self.entries.iter().filter(|(k, _)| up.contains(k) || self.ancestors(k).iter().any(|a| a == c)).flat_map(|(_, v)| v).collect()
+                self.entries.iter().filter(|(k, _)| up.contains(k) || self.ancestors(k).iter().any(|a| a == c))
+                    .flat_map(|(k, v)| v.iter().map(move |e| (k.as_str(), e))).collect()
             }
-            None => self.entries.values().flatten().collect(),
+            None => self.entries.iter().flat_map(|(k, v)| v.iter().map(move |e| (k.as_str(), e))).collect(),
         };
-        for entry in entries {
+        // Each write with the class and side it is written in: its value's constants are that class's.
+        for (owner, entry) in entries {
             for m in &entry.methods {
-                walk(&m.body, name, &mut out);
+                let mut found = Vec::new();
+                walk(&m.body, name, &mut found);
+                out.extend(found.into_iter().map(|v| (owner, m.receiver == MethodReceiver::Class, v)));
             }
         }
         out
@@ -1604,10 +1608,10 @@ fn elems_names(e: &Expr, gems: Option<&Gems<'_>>, context: Option<(&str, bool, &
             let mut names = elems_names(value, gems, context, depth)?;
             let gems = gems?;
             // (every gem class's writes of the name where the body's class is not known, a root's walk)
-            for other in gems.ivar_writes(context.map(|c| c.0), name.as_str()) {
+            for (owner, side, other) in gems.ivar_writes(context.map(|c| c.0), name.as_str()) {
                 if !std::ptr::eq(other, value) {
                     // (one level spent per write followed: two memos that store each other cycle)
-                    names.extend(elems_names(other, Some(gems), context, depth.checked_sub(1)?)?);
+                    names.extend(elems_names(other, Some(gems), Some((owner, side, "")), depth.checked_sub(1)?)?);
                 }
             }
             Some(names)
@@ -1749,7 +1753,9 @@ fn bind_locals(e: &Expr, gems: Option<&Gems<'_>>, context: Option<(&str, bool, &
                 // (not with a parameter default, which runs in the block and may write a local the body reads)
                 && extra_params.iter().all(|p| p.default.is_none()) =>
         {
-            let names = elems_names(r, gems, context, 2);
+            // Not the receiver's elements where a gem reopens Array with its own iterator of the name.
+            let reopened = gems.is_some_and(|g| g.entries.get("Array").into_iter().flatten().any(|c| c.methods.iter().any(|m| m.name == *method)));
+            let names = if reopened { None } else { elems_names(r, gems, context, 2) };
             bind(first.as_str(), names);
             for p in params.iter().skip(1).chain(extra_params.iter().map(|p| &p.name)).chain(block_param.iter()) {
                 bind(p.as_str(), None);
@@ -2253,6 +2259,10 @@ mod tests {
         let reach = |table: &str| reach_from(table, "Kit::Table");
         assert!(reach(
             "module Kit\n  class Table\n    def self.names = [:secret]\n    def names = [:size]\n    NAMES = names\n\n    def same?(other)\n      NAMES.all? { |n| other.public_send(n) }\n    end\n  end\nend\n",
+        ));
+        // A parent's write of the memo reads its constant in the parent.
+        assert!(reach(
+            "module Kit\n  class Base\n    FILTERS = [:secret]\n\n    def initialize\n      @filters = FILTERS\n    end\n  end\n\n  class Table < Base\n    FILTERS = [:size]\n\n    def filters\n      @filters ||= [:size]\n    end\n\n    def same?(other)\n      filters.all? { |n| other.public_send(n) }\n    end\n  end\nend\n",
         ));
         // A memo's existing value a parent's write stored, and a list a subclass's override answers.
         assert!(reach(
