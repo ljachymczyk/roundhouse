@@ -33,6 +33,13 @@ use super::util::{
     find_all_module_declarations_with_scope, flatten_statements, module_name_path, walk_calls,
 };
 
+/// The bare constants an `insert_before 0` block may read and still mean at the top level what they mean in the app's
+/// namespace, where the stack copies the block: Rails, ENV and Ruby's core classes.
+const TOP_LEVEL_CONSTANTS: &[&str] = &[
+    "Rails", "ENV", "Object", "Kernel", "Comparable", "String", "Symbol", "Integer", "Float", "Array", "Hash", "Range",
+    "Regexp", "Time", "Proc", "Struct", "Math", "File", "Dir", "IO", "StandardError", "ArgumentError", "RuntimeError",
+];
+
 /// A `use(K)` as written, before `K` is resolved where the Railtie's body names it.
 struct Use {
     path: Vec<String>,
@@ -192,30 +199,34 @@ pub(super) fn read<V: Vfs + ?Sized>(vfs: &V, dir: &Path, gem_libs: &[PathBuf]) -
     let mut defines = None;
     for u in application_uses(vfs, dir) {
         // Not the gems' classes first and then the app's: Ruby tries each lexical candidate against every loaded class.
-        let (defines, assigned) = defines.get_or_insert_with(|| {
+        let defines = defines.get_or_insert_with(|| {
             let mut files = Vec::new();
             rb_files(vfs, &dir.join("lib"), &mut files);
             rb_files(vfs, &dir.join("app"), &mut files);
             let mut defines = defined_constants(vfs, &files);
             defines.extend(every_gem_defines.iter().cloned());
-            files.push(dir.join("config/application.rb"));
-            files.extend(every_lib_file.iter().cloned());
-            (defines, assigned_constants(vfs, &files))
+            defines
         });
         // Not stacked: a class neither a source gem nor the app defines (`Rack::Deflater`) stays the ledger's warning, as before.
         if let Some(class) = resolve(&u, defines) {
             application_taken.push(u.span.start);
-            let namespaced = || {
-                u.block_constants.iter().find_map(|name| {
-                    u.lexical.iter().map(|cref| format!("{cref}::{name}")).find(|found| defines.contains(found) || assigned.contains(found)).map(|found| (name, found))
+            // Not only the constants known in the namespace: a `const_set` or a conditional assignment is not read, so only a
+            // name proven top-level is left to the top-level lookup.
+            let unproven = || {
+                u.block_constants.iter().find(|name| {
+                    let in_namespace = u.lexical.iter().any(|cref| defines.contains(&format!("{cref}::{name}")));
+                    let top_level = TOP_LEVEL_CONSTANTS.contains(&name.as_str())
+                        || defines.contains(name.as_str())
+                        || u.lexical.iter().any(|cref| cref.split("::").next() == Some(name.as_str()));
+                    in_namespace || !top_level
                 })
             };
-            if u.outermost && let Some((name, found)) = namespaced() {
+            if u.outermost && let Some(name) = unproven() {
                 diags.push(Diagnostic::unsupported(
                     u.span,
                     None,
                     "railtie middleware",
-                    format!("the block of `insert_before 0, {class}` reads `{name}` as `{found}`: the emitted stack copies the block to the top level, where `{name}` is not looked up in the app's namespace"),
+                    format!("the block of `insert_before 0, {class}` reads the bare constant `{name}`, which Ruby looks up in the app's namespace first: the emitted stack copies the block to the top level, so it is stacked only when written rooted (`::{name}`) or as a qualified path"),
                 ));
             } else if u.outermost {
                 // A later `insert_before 0` goes in front of an earlier one.
@@ -757,46 +768,6 @@ fn defined_constants<V: Vfs + ?Sized>(vfs: &V, files: &[PathBuf]) -> HashSet<Str
         }
     }
     defined
-}
-
-/// The constants these files assign at the top or in a class or module body: `module Blog; FEATURE = "app"; end` gives
-/// `Blog::FEATURE`, and a top-level `Blog::FEATURE = "app"` gives it too.
-fn assigned_constants<V: Vfs + ?Sized>(vfs: &V, files: &[PathBuf]) -> HashSet<String> {
-    let mut assigned = HashSet::default();
-    let mut read_body = |scope: &[String], body: Node<'_>| {
-        for stmt in flatten_statements(body) {
-            let written: Option<Vec<String>> = if let Some(write) = stmt.as_constant_write_node() {
-                Some(scope.iter().cloned().chain(std::iter::once(constant_id_str(&write.name()).to_string())).collect())
-            } else if let Some(write) = stmt.as_constant_path_write_node() {
-                let target = write.target();
-                constant_path_of(&target.as_node()).map(|path| if constant_path_is_rooted(&target) { path } else { scope.iter().cloned().chain(path).collect() })
-            } else {
-                None
-            };
-            if let Some(path) = written {
-                assigned.insert(path.join("::"));
-            }
-        }
-    };
-    for file in files {
-        let Ok(bytes) = vfs.read(file) else { continue };
-        let parsed = super::prism::parse_silent(&bytes);
-        let root = parsed.node();
-        if let Some(program) = root.as_program_node() {
-            read_body(&[], program.statements().as_node());
-        }
-        for (scope, _, class) in find_all_classes_with_nesting(&root) {
-            if let (Some(path), Some(body)) = (class_name_path(&class), class.body()) {
-                read_body(&scope.iter().cloned().chain(path).collect::<Vec<_>>(), body);
-            }
-        }
-        for (scope, module) in find_all_module_declarations_with_scope(&root) {
-            if let (Some(path), Some(body)) = (module_name_path(&module), module.body()) {
-                read_body(&scope.iter().cloned().chain(path).collect::<Vec<_>>(), body);
-            }
-        }
-    }
-    assigned
 }
 
 fn rb_files<V: Vfs + ?Sized>(vfs: &V, dir: &Path, out: &mut Vec<PathBuf>) {
@@ -1366,24 +1337,28 @@ mod tests {
         assert!(!blocks.contains_key("Gate"), "{blocks:?}");
         let refused: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
         assert_eq!(refused.len(), 1, "{refused:?}");
-        assert!(refused[0].contains("reads `Settings` as `Blog::Settings`"), "{refused:?}");
+        assert!(refused[0].contains("reads the bare constant `Settings`"), "{refused:?}");
     }
 
-    /// A constant assigned in the app's namespace is looked up there as well: refused like a class or module of it.
+    /// A bare constant is stacked only when it is proven top-level (a top-level class or module the reader knows, the app's
+    /// own namespace module, Rails, ENV or a Ruby core class): a constant assigned in the namespace, directly, under a
+    /// condition or by `const_set`, is refused, and a rooted or qualified constant is stacked.
     #[test]
-    fn an_insertion_at_0_whose_block_reads_an_assigned_namespaced_constant_is_refused() {
-        let application = "module Blog\n  FEATURE = \"app\"\n\n  class Application < Rails::Application\n    config.middleware.insert_before(0, Gate) { |m| m.mode = FEATURE }\n    config.middleware.insert_before(0, Probe) { |m| m.mode = LIMIT }\n    config.middleware.insert_before(0, Other) { |m| m.mode = Blog::FEATURE }\n  end\nend\n";
-        let classes = "class Gate\nend\nclass Probe\nend\nclass Other\nend\nmodule Blog\n  class Application\n    LIMIT = 5\n  end\nend\n";
-        let map = [("/app/config/application.rb", application), ("/app/lib/gate.rb", classes)]
+    fn an_insertion_at_0_whose_block_reads_a_bare_constant_not_proven_top_level_is_refused() {
+        let application = "module Blog\n  FEATURE = \"app\"\n  MODE = \"on\" if ENV[\"MODE\"]\n\n  class Application < Rails::Application\n    config.middleware.insert_before(0, Direct) { |m| m.mode = FEATURE }\n    config.middleware.insert_before(0, Conditional) { |m| m.mode = MODE }\n    config.middleware.insert_before(0, Dynamic) { |m| m.mode = DYNAMIC }\n    config.middleware.insert_before(0, Known) { |m| m.peer = Gate; m.env = ENV[\"RACK_ENV\"] }\n    config.middleware.insert_before(0, Rooted) { |m| m.mode = ::FEATURE }\n    config.middleware.insert_before(0, Qualified) { |m| m.mode = Blog::FEATURE }\n  end\nend\n";
+        let classes = "class Direct\nend\nclass Conditional\nend\nclass Dynamic\nend\nclass Known\nend\nclass Rooted\nend\nclass Qualified\nend\nclass Gate\nend\n";
+        let dynamic = "Blog.const_set(:DYNAMIC, \"app\")\n";
+        let map = [("/app/config/application.rb", application), ("/app/lib/gate.rb", classes), ("/app/lib/dynamic.rb", dynamic)]
             .iter()
             .map(|(path, text)| (PathBuf::from(path), text.as_bytes().to_vec()))
             .collect();
         let super::Stack { outermost, diags, .. } = super::read(&MapVfs::new(map), std::path::Path::new("/app"), &[]);
-        assert_eq!(outermost, ["Other"]);
+        assert_eq!(outermost, ["Qualified", "Rooted", "Known"]);
         let refused: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
-        assert_eq!(refused.len(), 2, "{refused:?}");
-        assert!(refused.iter().any(|m| m.contains("reads `FEATURE` as `Blog::FEATURE`")), "{refused:?}");
-        assert!(refused.iter().any(|m| m.contains("reads `LIMIT` as `Blog::Application::LIMIT`")), "{refused:?}");
+        assert_eq!(refused.len(), 3, "{refused:?}");
+        for name in ["FEATURE", "MODE", "DYNAMIC"] {
+            assert!(refused.iter().any(|m| m.contains(&format!("reads the bare constant `{name}`")) && m.contains(&format!("`::{name}`"))), "{refused:?}");
+        }
     }
 
     /// A forwarded block (`&configure`) is not text the stack can copy, so the class is not stacked without it.
