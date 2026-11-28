@@ -15045,7 +15045,7 @@ fn spin_shape(files: Vec<(String, String)>) -> Result<Vec<(String, String)>, Str
     // signatures checked by spinel's openssl package. Manifest below.
     let needs_webauthn = files
         .iter()
-        .any(|(p, c)| (p.starts_with("app/") || p.starts_with("test/")) && p.ends_with(".rb") && names_constant(c, "WebAuthn"));
+        .any(|(p, c)| (p.starts_with("app/") || p.starts_with("test/") || p.starts_with("config/")) && p.ends_with(".rb") && names_constant(c, "WebAuthn"));
     if needs_webauthn {
         let facade = files
             .iter_mut()
@@ -17850,6 +17850,18 @@ mod tests {
             assert!(get(&without, "runtime/webauthn_facade.rb").contains("module WebAuthn"), "{model}");
             assert!(!get(&without, "spin.toml").contains("webauthn"), "{model}");
             assert!(!without.iter().any(|(p, _)| p == "spin.lock"), "{model}");
+        }
+        // The boot program's carried `WebAuthn.configure` and a test's own reference are uses too: the façade would raise.
+        for (path, text) in [
+            ("config/initializers.rb", "WebAuthn.configure do |config|\n  config.rp_id = \"example.com\"\nend\n"),
+            ("test/models/credential_test.rb", "class CredentialTest < Minitest::Test\n  def test_id\n    assert WebAuthn.generate_user_id\n  end\nend\n"),
+        ] {
+            let mut used = tree("class Credential\nend\n");
+            used.push((path.to_string(), text.to_string()));
+            let used = spin_shape(used).unwrap();
+            assert!(get(&used, "runtime/webauthn_facade.rb").contains("require \"webauthn\""), "{path}");
+            assert!(get(&used, "spin.toml").contains("spinel-webauthn"), "{path}");
+            assert!(used.iter().any(|(p, _)| p == "spin.lock"), "{path}");
         }
     }
 
