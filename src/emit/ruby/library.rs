@@ -12584,6 +12584,7 @@ fn walk_load_time_method(
 ) {
     let mut owner = Some(class);
     let mut steps = 0;
+    let mut given = given;
     while let Some(c) = owner {
         let defs: Vec<&MethodDef> = c.methods.iter().filter(|m| m.name.as_str() == called && m.receiver == on).collect();
         if !defs.is_empty() {
@@ -12592,24 +12593,28 @@ fn walk_load_time_method(
             if !visited.insert(key) {
                 return;
             }
-            let mut supers = false;
+            let mut supers: Option<usize> = None;
             for m in defs {
-                // Its parameters' defaults run when a call leaves them out (not a positional one the call gives); a
-                // closure it only stores runs later.
-                let defaults: Vec<&Expr> = m.params.iter().filter(|p| !p.keyword).enumerate()
-                    .filter(|(i, _)| *i >= given).filter_map(|(_, p)| p.default.as_ref())
-                    .chain(m.params.iter().filter(|p| p.keyword).filter_map(|p| p.default.as_ref()))
+                // Its parameters' defaults run when a call leaves them out (not a positional one the call gives: Ruby
+                // fills the required ones first); a closure it only stores runs later.
+                let positional = |p: &&crate::dialect::Param| !p.keyword && !p.rest && !p.from_keyword && !p.from_kwrest;
+                let required = m.params.iter().filter(positional).filter(|p| p.default.is_none()).count();
+                let defaults: Vec<&Expr> = m.params.iter().filter(positional).filter(|p| p.default.is_some()).enumerate()
+                    .filter(|(i, _)| required + *i >= given).filter_map(|(_, p)| p.default.as_ref())
+                    .chain(m.params.iter().filter(|p| !positional(p)).filter_map(|p| p.default.as_ref()))
                     .collect();
                 for e in std::iter::once(&m.body).chain(defaults) {
                     walk_load_time_const_paths(e, out);
                     // Not the defining class as self: the receiver's, whose methods a receiverless call reaches first.
                     walk_load_time_callee_paths(e, Some((class, on)), classes, visited, out, depth - 1);
                 }
-                supers |= contains_super(&m.body);
+                if let Some(n) = super_given(&m.body, given) {
+                    supers = Some(supers.map_or(n, |s| s.min(n)));
+                }
             }
-            if !supers {
-                return;
-            }
+            // The ancestor's defaults are the ones its `super` leaves out: `super()` gives none, a bare one forwards.
+            let Some(n) = supers else { return };
+            given = n;
         }
         steps += 1;
         if steps > 32 {
@@ -14886,6 +14891,27 @@ fn contains_yield_or_block(expr: &Expr) -> bool {
 }
 
 /// Any `super` in `expr`, at any depth.
+/// The fewest positional arguments a `super` in `expr` hands its ancestor, a bare one forwarding `given`; `None`
+/// when it calls none.
+fn super_given(expr: &Expr, given: usize) -> Option<usize> {
+    let own = match &*expr.node {
+        ExprNode::Super { args: None } => Some(given),
+        ExprNode::Super { args: Some(args) } => Some(if args.iter().any(|a| matches!(&*a.node, ExprNode::Splat { .. })) {
+            0
+        } else {
+            args.iter().filter(|a| !matches!(&*a.node, ExprNode::Hash { .. } | ExprNode::KeywordSplat { .. })).count()
+        }),
+        _ => None,
+    };
+    let mut fewest = own;
+    expr.node.for_each_child(&mut |child| {
+        if let Some(n) = super_given(child, given) {
+            fewest = Some(fewest.map_or(n, |f| f.min(n)));
+        }
+    });
+    fewest
+}
+
 fn contains_super(expr: &Expr) -> bool {
     if matches!(&*expr.node, ExprNode::Super { .. }) {
         return true;

@@ -1558,6 +1558,10 @@ fn elems_names(e: &Expr, gems: Option<&Gems<'_>>, context: Option<(&str, bool, &
         ExprNode::Send { recv: Some(r), method, .. }
             if matches!(method.as_str(), "select" | "filter" | "reject" | "sort" | "uniq" | "compact" | "to_a" | "freeze" | "dup" | "reverse") =>
         {
+            // Not the builtin's elements where a gem reopens Array with its own of the name.
+            if gems.is_some_and(|g| g.entries.get("Array").into_iter().flatten().any(|c| c.methods.iter().any(|m| m.name == *method))) {
+                return None;
+            }
             elems_names(r, gems, context, depth)
         }
         ExprNode::Const { path } => {
@@ -1583,8 +1587,8 @@ fn elems_names(e: &Expr, gems: Option<&Gems<'_>>, context: Option<(&str, bool, &
             if values.is_empty() || gems.const_mutated(&leaf) {
                 return None;
             }
-            // (in the defining class's context: a constant its value names is that class's)
-            let defining = owner_name.as_deref().map(|o| (o, false, ""));
+            // (in the defining class body's context: a constant its value names is that class's, a call its class method)
+            let defining = owner_name.as_deref().map(|o| (o, true, ""));
             values.into_iter().try_fold(Vec::new(), |mut all, v| {
                 all.extend(elems_names(v, Some(gems), defining.or(context), depth)?);
                 Some(all)
@@ -1598,7 +1602,8 @@ fn elems_names(e: &Expr, gems: Option<&Gems<'_>>, context: Option<(&str, bool, &
             // (every gem class's writes of the name where the body's class is not known, a root's walk)
             for other in gems.ivar_writes(context.map(|c| c.0), name.as_str()) {
                 if !std::ptr::eq(other, value) {
-                    names.extend(elems_names(other, Some(gems), context, depth)?);
+                    // (one level spent per write followed: two memos that store each other cycle)
+                    names.extend(elems_names(other, Some(gems), context, depth.checked_sub(1)?)?);
                 }
             }
             Some(names)
@@ -2211,6 +2216,34 @@ mod tests {
         assert!(reached.methods.contains(&("Kit::Table".to_string(), false, "same?".to_string())));
         assert!(reached.classes.contains("Kit::Hidden"));
         assert!(!reached.methods.contains(&("Kit::Hidden".to_string(), false, "secret".to_string())), "a name the list does not hold: {:?}", reached.methods);
+    }
+
+    /// A constant's initializer runs in its class body, where a receiverless call is the class method; two memos that
+    /// store each other are read to a bound, not until the stack runs out.
+    #[test]
+    fn a_constant_initializer_reads_class_side_and_cyclic_memos_stop() {
+        let reach = |table: &str| {
+            let app = spinel_app(
+                &[("kit (1.0)", &[])],
+                &[
+                    ("kit-1.0/lib/kit.rb", "require \"kit/table\"\nrequire \"kit/hidden\"\n"),
+                    ("kit-1.0/lib/kit/table.rb", table),
+                    ("kit-1.0/lib/kit/hidden.rb", "module Kit\n  class Hidden\n    def secret\n      1\n    end\n  end\nend\n"),
+                ],
+                &[(
+                    "app/models/article.rb",
+                    "class Article < ApplicationRecord\n",
+                    "class Article < ApplicationRecord\n  def checked(other)\n    Kit::Hidden\n    Kit::Table.new.same?(other)\n  end\n\n",
+                )],
+            );
+            reached(&app).methods.contains(&method("Kit::Hidden", false, "secret"))
+        };
+        assert!(reach(
+            "module Kit\n  class Table\n    def self.names = [:secret]\n    def names = [:size]\n    NAMES = names\n\n    def same?(other)\n      NAMES.all? { |n| other.public_send(n) }\n    end\n  end\nend\n",
+        ));
+        assert!(reach(
+            "module Kit\n  class Table\n    def filters\n      @filters ||= (@fallback ||= [:size])\n    end\n\n    def fallback\n      @fallback ||= (@filters ||= [:secret])\n    end\n\n    def same?(other)\n      filters.all? { |n| other.public_send(n) }\n    end\n  end\nend\n",
+        ));
     }
 
     fn method(owner: &str, class_side: bool, name: &str) -> MethodKey {

@@ -1351,8 +1351,6 @@ impl<'a> BodyTyper<'a> {
         false
     }
 
-    /// Does `of` or an ancestor define `method` class-side (a scope, a
-    /// `def self.…`, a runtime-declared class method)?
     /// The return types of `method` as the strict subclasses of `of` define it, each its own first definition below
     /// `of`; empty when none does.
     fn descendant_instance_answers(&self, of: &ClassId, method: &Symbol) -> Vec<Ty> {
@@ -1377,6 +1375,13 @@ impl<'a> BodyTyper<'a> {
             if !cls.instance_methods.contains_key(method) && cls.includes.iter().any(|m| self.lookup_in_module(m, method).is_some()) {
                 return Vec::new();
             }
+            // Nor one whose `method_missing` answers it: that answer is not among the typed ones.
+            let missing = Symbol::from("method_missing");
+            if !cls.instance_methods.contains_key(method)
+                && (cls.instance_methods.contains_key(&missing) || cls.includes.iter().any(|m| self.lookup_in_module(m, &missing).is_some()))
+            {
+                return Vec::new();
+            }
             if let Some(ty) = cls.instance_methods.get(method) {
                 let ty = unwrap_fn_ret(&ty.subst_self(&Ty::Class { id: id.clone(), args: Vec::new().into() }));
                 // Not an answer bounded by the typed ones where one is untyped: it may be declared so, or not typed
@@ -1392,6 +1397,8 @@ impl<'a> BodyTyper<'a> {
         out
     }
 
+    /// Does `of` or an ancestor define `method` class-side (a scope, a
+    /// `def self.…`, a runtime-declared class method)?
     pub(super) fn class_side_defines(&self, of: &ClassId, method: &Symbol) -> bool {
         let mut current = Some(of.clone());
         for _ in 0..32 {

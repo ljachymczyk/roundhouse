@@ -116,3 +116,31 @@ puts "own try passed"
     ));
     run.assert_passes();
 }
+
+/// A subclass that answers `root` through its `method_missing` is not bounded by the subclasses' typed answers: its
+/// String takes ActiveSupport's `try`, which answers nil for a name the String lacks.
+#[test]
+fn a_subclass_s_method_missing_keeps_active_support_s_try() {
+    let probe = PROBE.replace("  # (untyped)\n", "").replace("  # (picked)\n", "  def missing\n    MissingGrammar.new.run(\"word\").inspect\n  end\n").replace(
+        "class Plain\n",
+        "class MissingGrammar < Grammar\n  def method_missing(name, *args)\n    \"missing\"\n  end\n\n  def respond_to_missing?(name, include_private = false)\n    true\n  end\nend\n\nclass Plain\n",
+    );
+    let run = emit_and_run::real_blog()
+        .edit("config/routes.rb", "  root \"articles#index\"\n", "  root \"articles#index\"\n  get \"/probe\", to: \"probes#index\"\n")
+        .write("lib/probe.rb", &probe)
+        .write(
+            "app/controllers/probes_controller.rb",
+            "class ProbesController < ApplicationController\n  def index\n    probe = Probe.new(\"\")\n    render plain: probe.grammar + \" \" + probe.missing\n  end\nend\n",
+        )
+        .run_ruby(
+            r##"response = Main.run_rack("REQUEST_METHOD" => "GET", "PATH_INFO" => "/probe", "QUERY_STRING" => "", "rack.input" => StringIO.new(""))
+text = +""
+response[2].each { |part| text << part }
+raise "probe: #{response[0]} #{text.inspect}" unless response[0] == 200 && text == "word! nil"
+puts "method_missing try passed"
+"##,
+        );
+    run.assert_passes();
+    let grammar = std::fs::read_to_string(run.emitted.join("app/models/grammar.rb")).expect("emitted grammar");
+    assert!(grammar.contains("public_send(source"), "{grammar}");
+}
