@@ -5053,6 +5053,22 @@ raise "replay" unless Passkeys.sign_in(client.get(challenge: challenge, sign_cou
     assert!(gemfile.contains("gem \"webauthn\""), "Gemfile does not declare webauthn:\n{gemfile}");
 }
 
+/// An app that names WebAuthn only in its initializer still loads the gem:
+/// the boot program is the app's code, so the Gemfile declares webauthn and
+/// the carried `WebAuthn.configure` runs against it.
+#[test]
+fn webauthn_named_only_by_the_initializer_loads_the_gem_on_ruby() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "config/initializers/webauthn.rb",
+            "WebAuthn.configure do |config|\n  config.allowed_origins = [\"https://example.com\"]\n  config.rp_id = \"example.com\"\nend\n",
+        )
+        .run_ruby(r#"raise WebAuthn.configuration.rp_id.inspect unless WebAuthn.configuration.rp_id == "example.com""#);
+    run.assert_passes();
+    let gemfile = std::fs::read_to_string(run.emitted.join("Gemfile")).expect("Gemfile");
+    assert!(gemfile.contains("gem \"webauthn\""), "Gemfile does not declare webauthn:\n{gemfile}");
+}
+
 /// WebAuthn compiles clean on Ruby, JRuby and Spinel. Spinel's tree swaps
 /// the raising façade for the spinel-webauthn package and declares it in
 /// the manifest; each other target refuses each reference.

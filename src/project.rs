@@ -12592,7 +12592,7 @@ fn apply_test_gem_wiring(files: &mut Vec<(String, String)>) {
     // every understood `stub_request` chain to the slot by the time this
     // scan runs, so on the ruby family the slot's delegate is what reaches
     // the gem — and that is the demand.
-    const TEST_GEMS: [(Marker, &str, &str); 6] = [
+    const TEST_GEMS: [(Marker, &str, &str); 7] = [
         (Marker::AnyText(&["WebMock.", "WebMock::", "HttpStub."]), "webmock", "webmock/minitest"),
         // `MochaBridge.` is the lowering's own spelling of a chain it hands
         // back to the gem (`lower::mocha`), and the paren-less forms are
@@ -12614,6 +12614,7 @@ fn apply_test_gem_wiring(files: &mut Vec<(String, String)>) {
         (Marker::Constant("Retryable"), "retryable", "retryable"),
         (Marker::Constant("JWT"), "jwt", "jwt"),
         (Marker::Constant("RestClient"), "rest-client", "rest-client"),
+        (Marker::Constant("WebAuthn"), "webauthn", "webauthn"),
     ];
 
     let mut needed: Vec<(&str, &str)> = Vec::new();
@@ -13103,8 +13104,9 @@ fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, app: &App) -> Res
     // façade lists all nine), and a scan that saw those would declare
     // every gem for every app — the same self-fulfilling wiring the
     // test table had to exclude `test_helper.rb` to avoid.
+    // `config/initializers.rb` is the app's boot program, not the runtime: a gem it calls (`WebAuthn.configure`) is one the app loads.
     let app_body_has = |found: &dyn Fn(&str) -> bool| {
-        files.iter().any(|(p, c)| p.starts_with("app/") && p.ends_with(".rb") && found(c))
+        files.iter().any(|(p, c)| (p.starts_with("app/") || p == "config/initializers.rb") && p.ends_with(".rb") && found(c))
     };
     let mut needed: Vec<&str> = Vec::new();
     for (marker, gem) in compiler_runtime_gems() {
