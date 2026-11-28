@@ -670,7 +670,7 @@ pub(crate) fn claims(expr: &Expr) -> bool {
 /// would be missing from the output.
 fn every_variant_lowers(block: &Expr) -> bool {
     let ExprNode::Lambda { extra_params, params, body, .. } = &*block.node else { return false };
-    let (true, Some(attachable)) = (extra_params.is_empty(), params.first()) else { return false };
+    let (true, [attachable]) = (extra_params.is_empty(), params.as_slice()) else { return false };
     let stmts: Vec<&Expr> = match &*body.node {
         ExprNode::Seq { exprs } => exprs.iter().collect(),
         _ => vec![body],

@@ -157,7 +157,8 @@ impl<'a> ColumnSlot<'a> {
     /// text. An interval entry is the duration Rails casts into the hash.
     pub fn attributes_read(&self) -> Option<Expr> {
         match self.codec? {
-            Codec::Json => Some(self.json_load()),
+            // Not the record's held store Hash: `attributes` is the baseline dirty tracking compares against.
+            Codec::Json => Some(self.json_load_detached()),
             Codec::Temporal { logical } if logical.attributes_read_logical() => {
                 Some(self.temporal_reader(logical))
             }
@@ -239,6 +240,17 @@ impl<'a> ColumnSlot<'a> {
         );
         let ret = Ty::Union { variants: vec![logical.ty(), Ty::Nil].into() };
         active_support(Span::synthetic(), logical.parse(), vec![ivar], ret)
+    }
+
+    fn json_load_detached(&self) -> Expr {
+        if !self.store {
+            return self.json_load();
+        }
+        let stored = with_ty(
+            Expr::new(Span::synthetic(), ExprNode::Ivar { name: self.storage_name() }),
+            super::model_to_library::ty_of_column_slot(self.col),
+        );
+        json_column(Span::synthetic(), "load_store", vec![stored], Ty::Untyped)
     }
 
     fn json_load(&self) -> Expr {

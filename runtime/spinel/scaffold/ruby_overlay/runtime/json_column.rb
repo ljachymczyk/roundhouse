@@ -23,13 +23,19 @@ module RoundhouseJsonColumn
     ActiveSupport::JSON.encode_without_escape(value)
   end
 
-  # `store :col, coder: JSON`: Rails' `IndifferentCoder`, whose Hash reads by a Symbol too and stands in for nil. Each
-  # read decodes the stored text, so a change made in place (`record.settings[:k] = v`, Rails' store idiom) is written
-  # back through the record's writer; a change to a Hash nested inside it is not.
+  # `store :col, coder: JSON`: Rails' `IndifferentCoder`, whose Hash reads by a Symbol too and stands in for nil. As
+  # Rails keeps one Hash per attribute value, a record's reads answer the same Hash while the stored text is the one it
+  # came from; a change made in place on it, or on a Hash nested in it, is written back through the record's writer.
   def self.load_store(serialized, owner = nil, writer = nil)
+    if owner && writer
+      held = owner.instance_variable_get(store_slot(writer))
+      return held[1] if held && held[0] == serialized
+    end
     decoded = serialized.nil? || serialized.empty? ? nil : JSON.parse(serialized)
     store = Store.new(decoded.is_a?(Hash) ? decoded : {})
-    store.bind(owner, writer)
+    store.bind(owner, writer, store)
+    owner.instance_variable_set(store_slot(writer), [serialized, store]) if owner && writer
+    store
   end
 
   def self.dump_store(value)
@@ -37,10 +43,21 @@ module RoundhouseJsonColumn
     ActiveSupport::JSON.encode_without_escape(hash)
   end
 
+  # Not an attribute of the record's: a name no column or method can take.
+  def self.store_slot(writer)
+    :"@__roundhouse_store_#{writer.delete_suffix("=")}"
+  end
+
+  def self.remember(owner, writer, store)
+    owner.instance_variable_set(store_slot(writer), [dump_store(store), store])
+  end
+
   class Store < ActiveSupport::HashWithIndifferentAccess
-    def bind(owner, writer)
+    def bind(owner, writer, root)
       @owner = owner
       @writer = writer
+      @root = root
+      each_value { |value| bind_nested(value) }
       self
     end
 
@@ -85,8 +102,24 @@ module RoundhouseJsonColumn
 
     private
 
+    def convert_value(value)
+      converted = super
+      bind_nested(converted)
+      converted
+    end
+
+    def bind_nested(value)
+      case value
+      when Store then value.bind(@owner, @writer, @root || self)
+      when Array then value.each { |item| bind_nested(item) }
+      end
+    end
+
     def write_back
-      @owner.public_send(@writer, self) if @owner && @writer
+      return unless @owner && @writer
+      root = @root || self
+      @owner.public_send(@writer, root)
+      RoundhouseJsonColumn.remember(@owner, @writer, root)
     end
   end
 end

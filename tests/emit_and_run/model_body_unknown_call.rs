@@ -121,6 +121,17 @@ r.settings[:country] = "Denmark"
 r.save!
 changed = [r.settings["country"], Widget.find(w.id).settings[:country], Widget.find(w.id).settings[:theme]]
 raise "in place: #{changed.inspect}" unless changed == ["Denmark", "Denmark", "dark"]
+h = Widget.find(w.id)
+first = h.settings
+second = h.settings
+first[:a] = 1
+second[:b] = 2
+h.settings[:nested] = { "x" => 1 }
+h.settings[:nested][:y] = 2
+h.save!
+kept = Widget.find(w.id).settings
+handles = [first.equal?(second), kept[:a], kept[:b], kept[:nested]]
+raise "handles: #{handles.inspect}" unless handles == [true, 1, 2, { "x" => 1, "y" => 2 }]
 "##,
         )
         .assert_passes();
