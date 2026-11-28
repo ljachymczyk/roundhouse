@@ -1373,16 +1373,18 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     for parser in ["URI::RFC2396_Parser", "URI::RFC3986_Parser"] {
         register_stdlib_class(classes, parser, &[], &[("escape", Ty::Str), ("unescape", Ty::Str)]);
     }
-    // A guard narrows the gradual parse result to this ancestry. Every
-    // component can be nil: relative/opaque URIs omit components, and
-    // public writers can clear even HTTP's default port and path.
+    // A guard narrows the gradual parse result to this ancestry, and `URI(x)` (Kernel#URI) answers it. Every
+    // component can be nil: relative/opaque URIs omit components, and public writers can clear even HTTP's
+    // default port and path. Only readers spinel's `packages/uri` defines too are listed, so a typed call has a
+    // runtime behind it on every lane that accepts it.
     let uri_string = || Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() };
+    let uri_int = || Ty::Union { variants: vec![Ty::Int, Ty::Nil].into() };
     register_stdlib_class(classes, "URI::Generic", &[], &[
-        ("scheme", uri_string()), ("host", uri_string()),
-        ("port", Ty::Union { variants: vec![Ty::Int, Ty::Nil].into() }),
+        ("scheme", uri_string()), ("host", uri_string()), ("hostname", uri_string()),
+        ("port", uri_int()), ("default_port", uri_int()),
         ("path", uri_string()), ("query", uri_string()), ("fragment", uri_string()),
         ("userinfo", uri_string()), ("user", uri_string()), ("password", uri_string()),
-        ("to_s", Ty::Str),
+        ("to_s", Ty::Str), ("==", Ty::Bool),
     ]);
     register_stdlib_class(classes, "URI::HTTP", &[], &[("request_uri", uri_string())]);
     register_stdlib_class(classes, "URI::HTTPS", &[], &[]);
