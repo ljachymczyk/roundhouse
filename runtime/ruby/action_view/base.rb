@@ -19,15 +19,31 @@ module ActionView
     # Rails' AssetUrlHelper#asset_path for a view context no request made (`ApplicationController.new.view_context`):
     # the source as the asset pipeline names it, `skip_pipeline:` leaving it under public/, then the `host:` option as the
     # asset host. `config.asset_host` and a `%d` host are not read.
-    def asset_path(source, skip_pipeline: false, host: nil, protocol: nil)
-      path = asset_path_with(source, skip_pipeline, host, protocol)
+    def asset_path(source, options = nil, skip_pipeline: false, host: nil, protocol: nil)
+      skip = options.nil? ? skip_pipeline : options[:skip_pipeline] == true
+      at = options.nil? ? host : asset_option_string(options, :host)
+      asked = options.nil? ? protocol : asset_option_protocol(options)
+      path = asset_path_with(source, skip, at, asked)
       path
     end
 
     # Rails' asset_url: asset_path asked for the request's protocol, which a context with no request does not have.
-    def asset_url(source, skip_pipeline: false, host: nil)
-      url = asset_path_with(source, skip_pipeline, host, :request)
+    def asset_url(source, options = nil, skip_pipeline: false, host: nil)
+      skip = options.nil? ? skip_pipeline : options[:skip_pipeline] == true
+      at = options.nil? ? host : asset_option_string(options, :host)
+      url = asset_path_with(source, skip, at, :request)
       url
+    end
+
+    # Rails' positional options Hash (`asset_url(src, { host: cdn })`), read by key.
+    def asset_option_string(options, key)
+      value = options[key]
+      value.is_a?(String) ? value : nil
+    end
+
+    def asset_option_protocol(options)
+      value = options[:protocol]
+      value.is_a?(String) || value.is_a?(Symbol) ? value : nil
     end
 
     def asset_path_with(source, skip_pipeline, host, protocol)
@@ -62,7 +78,7 @@ module ActionView
       prefixed = "#{prefix}#{host.delete_suffix("/")}"
       prefixed
     end
-    private :asset_path_with, :asset_host
+    private :asset_path_with, :asset_host, :asset_option_string, :asset_option_protocol
   end
 end
 

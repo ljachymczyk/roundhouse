@@ -45,7 +45,7 @@ fn a_controllers_view_context_answers_asset_url_and_path() {
         .run_ruby(
         r#"
 view = ApplicationController.new.view_context
-puts view.asset_url("logo.png")
+puts view.asset_url("logo.png", {})
 puts view.asset_url("logo.png?v=2#top")
 puts view.asset_path("logo.png", host: "cdn.example.com/cdn")
 puts view.asset_url("logo.png", host: "https://cdn.example.com")
@@ -59,6 +59,7 @@ rescue ArgumentError => e
   puts e.message
 end
 puts view.asset_path("logo.png", host: "cdn.example.com", protocol: "https")
+puts view.asset_path("logo.png", { host: "cdn.example.com", protocol: "https" })
 begin
   view.asset_url("logo.png", host: "cdn.example.com")
 rescue NoMethodError => e
@@ -79,6 +80,7 @@ end
             "/raw.png",
             "\"\"",
             "nil is not a valid asset source",
+            "https://cdn.example.com/assets/logo.png",
             "https://cdn.example.com/assets/logo.png",
             "undefined method 'protocol' for nil",
         ],
