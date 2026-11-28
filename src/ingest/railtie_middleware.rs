@@ -33,13 +33,6 @@ use super::util::{
     find_all_module_declarations_with_scope, flatten_statements, module_name_path, walk_calls,
 };
 
-/// The bare constants an `insert_before 0` block may read and still mean at the top level what they mean in the app's
-/// namespace, where the stack copies the block: Rails, ENV and Ruby's core classes.
-const TOP_LEVEL_CONSTANTS: &[&str] = &[
-    "Rails", "ENV", "Object", "Kernel", "Comparable", "String", "Symbol", "Integer", "Float", "Array", "Hash", "Range",
-    "Regexp", "Time", "Proc", "Struct", "Math", "File", "Dir", "IO", "StandardError", "ArgumentError", "RuntimeError",
-];
-
 /// A `use(K)` as written, before `K` is resolved where the Railtie's body names it.
 struct Use {
     path: Vec<String>,
@@ -55,7 +48,8 @@ struct Use {
     at_load: bool,
     /// `insert_before 0`: in front of all of Rails' own middleware, not after it.
     outermost: bool,
-    /// The constants its block reads without a scope (`Settings` in `Settings.mode`), which Ruby looks up in `lexical` first.
+    /// The constants its block reads without a leading `::` (`Settings` in `Settings.mode`, `Blog` in `Blog::FEATURE`), which
+    /// Ruby looks up in `lexical` first.
     block_constants: Vec<String>,
     /// Where on the stack it goes.
     front: Place,
@@ -210,23 +204,12 @@ pub(super) fn read<V: Vfs + ?Sized>(vfs: &V, dir: &Path, gem_libs: &[PathBuf]) -
         // Not stacked: a class neither a source gem nor the app defines (`Rack::Deflater`) stays the ledger's warning, as before.
         if let Some(class) = resolve(&u, defines) {
             application_taken.push(u.span.start);
-            // Not only the constants known in the namespace: a `const_set` or a conditional assignment is not read, so only a
-            // name proven top-level is left to the top-level lookup.
-            let unproven = || {
-                u.block_constants.iter().find(|name| {
-                    let in_namespace = u.lexical.iter().any(|cref| defines.contains(&format!("{cref}::{name}")));
-                    let top_level = TOP_LEVEL_CONSTANTS.contains(&name.as_str())
-                        || defines.contains(name.as_str())
-                        || u.lexical.iter().any(|cref| cref.split("::").next() == Some(name.as_str()));
-                    in_namespace || !top_level
-                })
-            };
-            if u.outermost && let Some(name) = unproven() {
+            if u.outermost && let Some(name) = u.block_constants.first() {
                 diags.push(Diagnostic::unsupported(
                     u.span,
                     None,
                     "railtie middleware",
-                    format!("the block of `insert_before 0, {class}` reads the bare constant `{name}`, which Ruby looks up in the app's namespace first: the emitted stack copies the block to the top level, so it is stacked only when written rooted (`::{name}`) or as a qualified path"),
+                    format!("the block of `insert_before 0, {class}` reads the constant `{name}` without a leading `::`: Ruby looks it up in the Application's lexical scope first, and the emitted stack copies the block to the top level, so the block is stacked only when every constant it reads is rooted (`::{name}`)"),
                 ));
             } else if u.outermost {
                 // A later `insert_before 0` goes in front of an earlier one.
@@ -525,7 +508,7 @@ fn read_class_body_use(stmt: &Node<'_>, file: crate::span::FileId, lexical: &[St
     uses.push(Use { path, rooted, lexical: lexical.to_vec(), span, ordered: false, block, at_load: true, outermost, block_constants: block_constants.unwrap_or_default(), front: Place::End });
 }
 
-/// The constants a block reads without a scope, in reading order: `Settings` in `Settings.mode` and in `Settings::Mode`.
+/// The constants a block reads without a leading `::`, in reading order: `Settings` in `Settings.mode` and in `Settings::Mode`.
 struct BareConstants(Vec<String>);
 
 impl<'pr> ruby_prism::Visit<'pr> for BareConstants {
@@ -1320,45 +1303,35 @@ mod tests {
         assert!(reported.iter().any(|m| m.contains("`Gate` is stacked twice with different construction blocks")), "{reported:?}");
     }
 
-    /// The stack copies an `insert_before 0` block to the top level, so a block that reads a constant from the app's
-    /// namespace is refused rather than emitted where that constant is not found. The `use` stack is left as it is.
+    /// The stack copies an `insert_before 0` block to the top level, and a constant read without a leading `::` can mean
+    /// another constant in the Application's lexical scope (a shadow, a `const_set`, a conditional assignment), so such a
+    /// block is refused, inside a module or not; a block whose constants are all rooted, or that reads none, is stacked.
+    /// The `use` stack is left as it is.
     #[test]
-    fn an_insertion_at_0_whose_block_reads_a_namespaced_constant_is_refused() {
-        let application = "module Blog\n  class Application < Rails::Application\n    config.middleware.insert_before(0, Gate) { |gate| gate.mode = Settings.mode }\n    config.middleware.insert_before(0, Probe) { |probe| probe.mode = Blog::Settings.mode }\n    config.middleware.use(Other) { |other| other.mode = Settings.mode }\n  end\nend\n";
-        let classes = "class Gate\nend\nclass Probe\nend\nclass Other\nend\nmodule Blog\n  class Settings\n  end\nend\n";
-        let map = [("/app/config/application.rb", application), ("/app/lib/gate.rb", classes)]
-            .iter()
-            .map(|(path, text)| (PathBuf::from(path), text.as_bytes().to_vec()))
-            .collect();
-        let super::Stack { classes, outermost, blocks, diags, .. } =
-            super::read(&MapVfs::new(map), std::path::Path::new("/app"), &[]);
-        assert_eq!(outermost, ["Probe"]);
-        assert_eq!(classes, ["Other"]);
-        assert!(!blocks.contains_key("Gate"), "{blocks:?}");
-        let refused: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
-        assert_eq!(refused.len(), 1, "{refused:?}");
-        assert!(refused[0].contains("reads the bare constant `Settings`"), "{refused:?}");
-    }
-
-    /// A bare constant is stacked only when it is proven top-level (a top-level class or module the reader knows, the app's
-    /// own namespace module, Rails, ENV or a Ruby core class): a constant assigned in the namespace, directly, under a
-    /// condition or by `const_set`, is refused, and a rooted or qualified constant is stacked.
-    #[test]
-    fn an_insertion_at_0_whose_block_reads_a_bare_constant_not_proven_top_level_is_refused() {
-        let application = "module Blog\n  FEATURE = \"app\"\n  MODE = \"on\" if ENV[\"MODE\"]\n\n  class Application < Rails::Application\n    config.middleware.insert_before(0, Direct) { |m| m.mode = FEATURE }\n    config.middleware.insert_before(0, Conditional) { |m| m.mode = MODE }\n    config.middleware.insert_before(0, Dynamic) { |m| m.mode = DYNAMIC }\n    config.middleware.insert_before(0, Known) { |m| m.peer = Gate; m.env = ENV[\"RACK_ENV\"] }\n    config.middleware.insert_before(0, Rooted) { |m| m.mode = ::FEATURE }\n    config.middleware.insert_before(0, Qualified) { |m| m.mode = Blog::FEATURE }\n  end\nend\n";
-        let classes = "class Direct\nend\nclass Conditional\nend\nclass Dynamic\nend\nclass Known\nend\nclass Rooted\nend\nclass Qualified\nend\nclass Gate\nend\n";
+    fn an_insertion_at_0_whose_block_reads_a_constant_that_is_not_rooted_is_refused() {
+        let application = "module Blog\n  Settings = \"app\"\n  FEATURE = \"app\"\n  MODE = \"on\" if ENV[\"MODE\"]\n\n  class Application < Rails::Application\n    config.middleware.insert_before(0, Shadowed) { |m| m.mode = Settings }\n    config.middleware.insert_before(0, Direct) { |m| m.mode = FEATURE }\n    config.middleware.insert_before(0, Conditional) { |m| m.mode = MODE }\n    config.middleware.insert_before(0, Dynamic) { |m| m.mode = DYNAMIC }\n    config.middleware.insert_before(0, Qualified) { |m| m.mode = Blog::FEATURE }\n    config.middleware.insert_before(0, RootedName) { |m| m.mode = ::Settings }\n    config.middleware.insert_before(0, RootedPath) { |m| m.mode = ::Blog::FEATURE }\n    config.middleware.insert_before(0, Plain) { |m| m.mode = \"on\" }\n    config.middleware.use(Other) { |m| m.mode = Settings }\n  end\nend\n";
+        let classes = "class Settings\nend\nclass Shadowed\nend\nclass Direct\nend\nclass Conditional\nend\nclass Dynamic\nend\nclass Qualified\nend\nclass RootedName\nend\nclass RootedPath\nend\nclass Plain\nend\nclass Other\nend\n";
         let dynamic = "Blog.const_set(:DYNAMIC, \"app\")\n";
         let map = [("/app/config/application.rb", application), ("/app/lib/gate.rb", classes), ("/app/lib/dynamic.rb", dynamic)]
             .iter()
             .map(|(path, text)| (PathBuf::from(path), text.as_bytes().to_vec()))
             .collect();
-        let super::Stack { outermost, diags, .. } = super::read(&MapVfs::new(map), std::path::Path::new("/app"), &[]);
-        assert_eq!(outermost, ["Qualified", "Rooted", "Known"]);
+        let super::Stack { classes, outermost, diags, .. } = super::read(&MapVfs::new(map), std::path::Path::new("/app"), &[]);
+        assert_eq!(outermost, ["Plain", "RootedPath", "RootedName"]);
+        assert_eq!(classes, ["Other"]);
         let refused: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
-        assert_eq!(refused.len(), 3, "{refused:?}");
-        for name in ["FEATURE", "MODE", "DYNAMIC"] {
-            assert!(refused.iter().any(|m| m.contains(&format!("reads the bare constant `{name}`")) && m.contains(&format!("`::{name}`"))), "{refused:?}");
+        assert_eq!(refused.len(), 5, "{refused:?}");
+        for name in ["Settings", "FEATURE", "MODE", "DYNAMIC", "Blog"] {
+            assert!(refused.iter().any(|m| m.contains(&format!("reads the constant `{name}` without a leading `::`"))), "{refused:?}");
         }
+        let top_level = "class Application < Rails::Application\n  config.middleware.insert_before(0, Gate) { |m| m.peer = Gate }\nend\n";
+        let map = [("/app/config/application.rb", top_level), ("/app/lib/gate.rb", "class Gate\nend\n")]
+            .iter()
+            .map(|(path, text)| (PathBuf::from(path), text.as_bytes().to_vec()))
+            .collect();
+        let super::Stack { outermost, diags, .. } = super::read(&MapVfs::new(map), std::path::Path::new("/app"), &[]);
+        assert!(outermost.is_empty(), "{outermost:?}");
+        assert!(diags.iter().any(|d| d.message.contains("reads the constant `Gate` without a leading `::`")), "{diags:?}");
     }
 
     /// A forwarded block (`&configure`) is not text the stack can copy, so the class is not stacked without it.
