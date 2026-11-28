@@ -1788,8 +1788,8 @@ fn count_of(op: &Op) -> Option<Expr> {
         ("never", []) => Some(int_lit(Span_of(op), 0)),
         ("once", []) => Some(int_lit(Span_of(op), 1)),
         ("twice", []) => Some(int_lit(Span_of(op), 2)),
-        // Not a Range (`times(1..2)`): the slot counts one exact number.
-        ("times", [n]) if matches!(&*n.node, ExprNode::Lit { value: Literal::Int { .. } }) => Some(n.clone()),
+        // Not a Range (`times(1..2)`): the slot counts one exact number, which an Integer expression still is.
+        ("times", [n]) if !matches!(&*n.node, ExprNode::Range { .. }) => Some(n.clone()),
         _ => None,
     }
 }

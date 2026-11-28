@@ -72,11 +72,6 @@ class GreeterTest < ActiveSupport::TestCase
     assert_equal "stubbed", g.name
   end
 
-  test "a range of calls is met" do
-    Greeter.expects(:current).times(1..2).returns(Greeter.new("r"))
-    Greeter.current
-  end
-
   test "a stub from an earlier test is gone" do
     assert_equal "real", Greeter.current.name
   end
@@ -92,6 +87,25 @@ fn app(test: &str) -> emit_and_run::Overlay {
 #[test]
 fn app_method_answers_run_on_ruby() {
     app(TEST).run_test("test/models/greeter_test.rb").assert_passes();
+}
+
+// A Range count stays on the bridge, the gem's on the Ruby family (Spinel's bridge raises, so not in `TEST`).
+#[test]
+fn a_range_count_runs_on_ruby() {
+    let test = r#"require "test_helper"
+
+class GreeterRangeTest < ActiveSupport::TestCase
+  test "a range of calls is met" do
+    Greeter.expects(:current).times(1..2).returns(Greeter.new("r"))
+    Greeter.current
+  end
+end
+"#;
+    emit_and_run::real_blog()
+        .write("app/models/greeter.rb", GREETER)
+        .write("test/models/greeter_range_test.rb", test)
+        .run_test("test/models/greeter_range_test.rb")
+        .assert_passes();
 }
 
 // Each of these must fail: an expectation met once instead of twice, a
