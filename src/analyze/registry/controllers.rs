@@ -537,6 +537,11 @@ pub(in crate::analyze) fn register(
     // value is the RHS, which need not have a concrete type yet. Register
     // the surface without claiming that every assigned value is a String.
     app_ctrl.instance_methods.insert(Symbol::from("content_type="), Ty::Untyped);
+    // `ApplicationController.new.view_context` (runtime/ruby/action_controller/view_context.rb, the Ruby family's):
+    // the view context whose asset helpers a plain object asks outside a request.
+    let view_context = Ty::Class { id: ClassId(Symbol::from("ActionView::Base")), args: vec![].into() };
+    app_ctrl.instance_methods.insert(Symbol::from("view_context"), view_context.clone());
+    app_ctrl.class_methods.insert(Symbol::from("view_context"), view_context);
     // The response surface the shared runtime's Base defines on the
     // controller itself: `self.response_body = body` (campfire's
     // MessagesController / CachedResponses) and `media_type`.

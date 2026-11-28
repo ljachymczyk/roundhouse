@@ -1,0 +1,5 @@
+module ActionController
+  class Base
+    def view_context: () -> ActionView::Base
+  end
+end

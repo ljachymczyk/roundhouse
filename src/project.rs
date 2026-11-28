@@ -2768,7 +2768,7 @@ fn report_ruby_only_sends(app: &App, target: BuildTarget) {
             || app.library_classes.iter().any(|class| class.methods.iter().any(|method| method.name.as_str() == name))
             || app.controllers.iter().any(|controller| controller.actions().any(|action| action.name.as_str() == name))
     };
-    let kernel: Vec<&str> = ["Rational", "Integer", "Float", "throw", "catch", "update_attribute", "attribute_in_database", "create_or_find_by", "create_or_find_by!", "cache_page", "expire_page", "page_cache_directory"]
+    let kernel: Vec<&str> = ["Rational", "Integer", "Float", "throw", "catch", "update_attribute", "attribute_in_database", "create_or_find_by", "create_or_find_by!", "cache_page", "expire_page", "page_cache_directory", "view_context"]
         .into_iter()
         .filter(|name| !defines(name))
         .collect();
@@ -2840,6 +2840,8 @@ fn report_ruby_only_sends(app: &App, target: BuildTarget) {
                 // The page cache is runtime/spinel/action_controller_page_caching.rb, which only the ruby family and spinel load.
                 (_, "cache_page") if kernel.contains(&"cache_page") => Some("ActionController::Caching::Pages#cache_page"),
                 (_, "expire_page") if kernel.contains(&"expire_page") => Some("ActionController::Caching::Pages#expire_page"),
+                // runtime/ruby/action_controller/view_context.rb, which only the ruby family and spinel load.
+                (_, "view_context") if kernel.contains(&"view_context") => Some("ActionController::Base#view_context"),
                 (_, "page_cache_directory") if kernel.contains(&"page_cache_directory") => {
                     Some("ActionController::Caching::Pages#page_cache_directory")
                 }
