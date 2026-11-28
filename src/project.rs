@@ -12326,7 +12326,8 @@ fn apply_test_gem_wiring(files: &mut Vec<(String, String)>) {
         // back to the gem (`lower::mocha`), and the paren-less forms are
         // campfire's `@membership.user.expects :reset_remote_connections`.
         (
-            Marker::AnyText(&[".stubs(", ".expects(", ".stubs ", ".expects ", ".any_instance", "MochaBridge."]),
+            // ` stub(` is an rspec `double` read as Mocha's `stub`, a spec's only Mocha call when it stubs nothing else.
+            Marker::AnyText(&[".stubs(", ".expects(", ".stubs ", ".expects ", ".any_instance", "MochaBridge.", " stub(", "(stub("]),
             "mocha",
             "mocha/api",
         ),

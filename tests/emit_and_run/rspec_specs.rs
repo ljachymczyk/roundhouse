@@ -307,6 +307,21 @@ fn rspec_mocks_run_as_mocha_on_ruby() {
     }
 }
 
+// A spec whose only Mocha call is a `double` still gets Mocha's helper wiring.
+#[test]
+fn a_double_only_spec_runs_on_ruby() {
+    let spec = r#"require "rails_helper"
+
+RSpec.describe Article, type: :model do
+  it "answers through a double" do
+    thing = double("thing", name: "Named")
+    expect(thing.name).to eq("Named")
+  end
+end
+"#;
+    app(SPEC).write("spec/models/article_double_spec.rb", spec).run_test("test/models/models_article_double_spec_test.rb").assert_passes();
+}
+
 // The point of the lane: the same examples run inside the Spinel build.
 #[test]
 #[ignore = "requires spin and spinel on PATH plus SQLite development libraries"]

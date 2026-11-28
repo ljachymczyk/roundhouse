@@ -1662,6 +1662,10 @@ fn mock_expectation(
         }
         match q_name {
             "with" => chain = send(Some(chain), "with", mocha_arguments(args)?, span),
+            // Not on an expectation with several values: rspec then expects a call per value, Mocha one.
+            "and_return" if !allow && args.len() > 1 => {
+                return Err("`and_return` with several values on an expectation (rspec expects a call for each)".into());
+            }
             "and_return" if !args.is_empty() => chain = send(Some(chain), "returns", args, span),
             "and_raise" if (1..=2).contains(&args.len()) => chain = send(Some(chain), "raises", args, span),
             "and_yield" => chain = send(Some(chain), "yields", args, span),
@@ -2891,6 +2895,8 @@ end
         let ExprNode::Send { args, .. } = &*tms[0].tests[0].body.node else { panic!() };
         assert!(args.is_empty());
         assert!(refused("allow(Article).to receive(:find).with(Article)").contains("==="));
+        assert!(refused("expect(Article).to receive(:count).and_return(1, 2)").contains("several values"));
+        assert_eq!(chain_of("allow(Article).to receive(:count).and_return(1, 2)"), ["stubs", "returns"]);
         // rspec compares a Hash's values and an Array's elements with `===` as well.
         for nested in ["title: /x/", "[1..3]", "{ kind: [Article] }"] {
             assert!(refused(&format!("allow(Article).to receive(:find).with({nested})")).contains("inside a `with` argument"), "{nested}");

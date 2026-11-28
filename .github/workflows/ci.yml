@@ -594,6 +594,8 @@ jobs:
       - name: Install gems used by emitted Ruby and Campfire harness tests
         run: |
           gem install --no-document rails-html-sanitizer sqlite3 bcrypt rack ruby-vips markly faraday faraday-multipart faraday-retry retryable jwt rest-client elastic-apm
+          # mocha: an emitted RSpec suite's rspec-mocks chains run through it (tests/emit_and_run/rspec_specs.rs).
+          gem install --no-document mocha
           # The Rails the fixture locks (see generate-fixture), whole: the native Rails controls need
           # actionpack, actionview, actioncable and railties too, and skip without them.
           gem install --no-document rails -v 8.1.4
