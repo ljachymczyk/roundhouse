@@ -1739,6 +1739,13 @@ fn mocha_argument(arg: Expr) -> Result<Expr, String> {
         ExprNode::Const { .. } | ExprNode::Lit { value: Literal::Regex { .. } } | ExprNode::Range { .. } => {
             Err("a constant, Regexp or Range as a `with` argument (rspec matches it with `===`, Mocha with `==`)".into())
         }
+        // rspec's `values_match?` compares a Hash's values and an Array's elements with `===` too.
+        ExprNode::Hash { entries, .. } if entries.iter().any(|(_, v)| matched_by_case_equality(v)) => {
+            Err("a constant, Regexp or Range inside a `with` argument (rspec matches it with `===`, Mocha with `==`)".into())
+        }
+        ExprNode::Array { elements, .. } if elements.iter().any(matched_by_case_equality) => {
+            Err("a constant, Regexp or Range inside a `with` argument (rspec matches it with `===`, Mocha with `==`)".into())
+        }
         ExprNode::Send { recv: None, method, args, block: None, .. } => {
             let rename = match method.as_str() {
                 "anything" | "instance_of" | "kind_of" => method.as_str(),
@@ -1754,6 +1761,15 @@ fn mocha_argument(arg: Expr) -> Result<Expr, String> {
             Ok(send(None, rename, args, arg.span))
         }
         _ => Ok(arg),
+    }
+}
+
+fn matched_by_case_equality(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Const { .. } | ExprNode::Lit { value: Literal::Regex { .. } } | ExprNode::Range { .. } => true,
+        ExprNode::Hash { entries, .. } => entries.iter().any(|(_, v)| matched_by_case_equality(v)),
+        ExprNode::Array { elements, .. } => elements.iter().any(matched_by_case_equality),
+        _ => false,
     }
 }
 
@@ -2875,6 +2891,11 @@ end
         let ExprNode::Send { args, .. } = &*tms[0].tests[0].body.node else { panic!() };
         assert!(args.is_empty());
         assert!(refused("allow(Article).to receive(:find).with(Article)").contains("==="));
+        // rspec compares a Hash's values and an Array's elements with `===` as well.
+        for nested in ["title: /x/", "[1..3]", "{ kind: [Article] }"] {
+            assert!(refused(&format!("allow(Article).to receive(:find).with({nested})")).contains("inside a `with` argument"), "{nested}");
+        }
+        ingest(&example("allow(Article).to receive(:find).with(title: \"x\", ids: [1, 2])"));
         assert!(refused("allow(Article).to receive(:find).with(a_string_including(\"x\"))").contains("a_string_including"));
     }
 

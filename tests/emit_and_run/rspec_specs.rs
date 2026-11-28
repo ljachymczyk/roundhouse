@@ -303,7 +303,7 @@ fn rspec_mocks_run_as_mocha_on_ruby() {
             .write("spec/models/article_mocks_spec.rb", &MOCKS_SPEC.replacen(find, replace, 1))
             .run_test("test/models/models_article_mocks_spec_test.rb");
         assert!(run.errors.is_empty(), "{replace}: {:?}", run.errors);
-        assert!(!run.success, "`{replace}` passed:\n{}\n{}", run.stdout, run.stderr);
+        assert!(!run.program_succeeded(), "`{replace}` passed:\n{}\n{}", run.stdout, run.stderr);
     }
 }
 

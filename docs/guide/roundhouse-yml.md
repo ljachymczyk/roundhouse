@@ -177,7 +177,8 @@ read.
 
 Anything else is refused by name: `roundhouse check` reports it, and
 `--continue` lists every refused construct and leaves out the examples
-that need it. Not read yet: test doubles, shared examples and contexts,
+that need it. Not read yet: `spy`, `instance_spy`, `class_spy` and
+`object_double`, shared examples and contexts,
 `around` hooks, `before(:all)` and `before(:suite)`, and modules from
 gems (`config.include FactoryBot::Syntax::Methods`).
 
