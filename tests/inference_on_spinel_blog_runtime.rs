@@ -725,7 +725,9 @@ fn untyped_subexpressions_baseline() {
     // `merge!` (1473): each hands its untyped `other` to
     // `merge_reference_names!`, whose body reads that `other`, as the rest
     // of those methods already do (+9 in active_record/relation.rb).
-    const CEILING: usize = 1482;
+    // `ActiveRecord::Migrator` (db:migrate / db:prepare over the adapter seam) adds 36 RBS-less vars,
+    // measured on its own as 1471 -> 1507; on top of 1482 that is 1518.
+    const CEILING: usize = 1518;
     assert!(
         existing_untyped <= CEILING && like_untyped <= LIKE_CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ledger: \
