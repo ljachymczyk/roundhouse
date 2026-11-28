@@ -1597,6 +1597,8 @@ fn elems_names(e: &Expr, gems: Option<&Gems<'_>>, context: Option<(&str, bool, &
             }
             // (in the defining class body's context: a constant its value names is that class's, a call its class method)
             let defining = owner_name.as_deref().map(|o| (o, true, ""));
+            // (a level spent per initializer followed: `NAMES = NAMES.freeze` names itself)
+            let depth = depth.checked_sub(1)?;
             values.into_iter().try_fold(Vec::new(), |mut all, v| {
                 all.extend(elems_names(v, Some(gems), defining.or(context), depth)?);
                 Some(all)
@@ -1625,6 +1627,10 @@ fn elems_names(e: &Expr, gems: Option<&Gems<'_>>, context: Option<(&str, bool, &
             let gems = gems?;
             let Some((c, side, _)) = context else {
                 // Not one class's when the body's class is not known (a root's walk): every gem method of the name.
+                // Nor gems' alone where an app model defines it: that body's names are not read here.
+                if gems.model_copies.keys().any(|(_, _, n)| n == method.as_str()) {
+                    return None;
+                }
                 let bodies: Vec<(&str, bool, &Expr)> = gems.entries.iter()
                     .flat_map(|(o, entries)| entries.iter().flat_map(|entry| entry.methods.iter()).map(move |m| (o.as_str(), m)))
                     .filter(|(_, m)| m.name == *method && m.params.is_empty())
@@ -2259,6 +2265,10 @@ mod tests {
         let reach = |table: &str| reach_from(table, "Kit::Table");
         assert!(reach(
             "module Kit\n  class Table\n    def self.names = [:secret]\n    def names = [:size]\n    NAMES = names\n\n    def same?(other)\n      NAMES.all? { |n| other.public_send(n) }\n    end\n  end\nend\n",
+        ));
+        // A constant whose later initializer names itself is read to a bound.
+        assert!(reach(
+            "module Kit\n  class Table\n    NAMES = [:secret]\n    NAMES = NAMES.freeze\n\n    def same?(other)\n      NAMES.all? { |n| other.public_send(n) }\n    end\n  end\nend\n",
         ));
         // A parent's write of the memo reads its constant in the parent.
         assert!(reach(

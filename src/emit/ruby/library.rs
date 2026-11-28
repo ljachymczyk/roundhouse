@@ -12508,7 +12508,8 @@ fn walk_load_time_callee_paths(
         return;
     }
     if let ExprNode::Send { recv, method, args, .. } = &*e.node {
-        let given = args.iter().filter(|a| !matches!(&*a.node, ExprNode::Hash { .. } | ExprNode::Splat { .. })).count();
+        // (a `**opts` binds no positional: Ruby 3 keeps keywords apart)
+        let given = args.iter().filter(|a| !matches!(&*a.node, ExprNode::Hash { .. } | ExprNode::Splat { .. } | ExprNode::KeywordSplat { .. })).count();
         let splat = args.iter().any(|a| matches!(&*a.node, ExprNode::Splat { .. }));
         let target: Option<(&LibraryClass, MethodReceiver)> = match recv.as_ref().map(|r| &*r.node) {
             Some(ExprNode::Const { path }) => {
@@ -12522,10 +12523,20 @@ fn walk_load_time_callee_paths(
             _ => None,
         };
         if let Some((class, side)) = target {
-            // `new` runs `initialize` on the instance it makes.
-            let (called, on) = if method.as_str() == "new" && side == MethodReceiver::Class
-                && !class.methods.iter().any(|m| m.name.as_str() == "new" && m.receiver == MethodReceiver::Class)
-            {
+            // `new` runs `initialize` on the instance it makes, unless the class or an ancestor defines its own `new`.
+            let own_new = |c: &LibraryClass| c.methods.iter().any(|m| m.name.as_str() == "new" && m.receiver == MethodReceiver::Class);
+            let mut chain = Some(class);
+            let mut steps = 0;
+            let mut defines_new = false;
+            while let Some(c) = chain.filter(|_| steps < 32) {
+                if own_new(c) {
+                    defines_new = true;
+                    break;
+                }
+                steps += 1;
+                chain = c.parent.as_ref().and_then(|p| classes.iter().find(|k| k.name == *p));
+            }
+            let (called, on) = if method.as_str() == "new" && side == MethodReceiver::Class && !defines_new {
                 ("initialize", MethodReceiver::Instance)
             } else {
                 (method.as_str(), side)
