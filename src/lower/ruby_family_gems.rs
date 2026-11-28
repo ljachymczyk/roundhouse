@@ -15,9 +15,13 @@ use crate::build_target::BuildTarget;
 
 /// (root constant, gem, what a reference would be written against).
 const GEMS: &[(&str, &str, &str)] = &[
+    ("Faye", "faye-websocket", "a missing WebSocket adapter"),
+    ("EventMachine", "eventmachine", "a missing scheduler"),
     ("Faraday", "faraday", "a missing HTTP client"),
     ("Retryable", "retryable", "a missing retry helper"),
     ("JWT", "jwt", "a missing token codec"),
+    ("RestClient", "rest-client", "a missing HTTP client"),
+    ("ElasticAPM", "elastic-apm", "a missing APM agent"),
 ];
 
 /// As [`GEMS`], for the gems spinel also ships, as a spin package.
@@ -48,6 +52,7 @@ pub fn without_unshipped_gems(app: &App, target: BuildTarget) -> Option<App> {
         .iter()
         .map(|gem| (gem, "only the ruby and jruby trees ship"))
         .chain(spin_packaged.iter().map(|gem| (gem, "only the ruby, jruby and spinel trees ship")))
+        .filter(|((root, _, _), _)| !(target == BuildTarget::Spinel && matches!(*root, "Faye" | "EventMachine")))
         .filter(|((root, _, _), _)| crate::lower::gem_refusal::mentions(app, root))
         .collect();
     if named.is_empty() {

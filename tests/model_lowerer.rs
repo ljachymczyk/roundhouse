@@ -183,6 +183,9 @@ fn article_lowers_with_schema_methods() {
         "_hydrate_all",
         // #818: class-side name table for `reflect_on_association`.
         "_association_names",
+        "_association_macros",
+        "_association_foreign_keys",
+        "_association_polymorphic",
         "schema_column_types",
     ];
     for m in &lc.methods {
@@ -1549,6 +1552,7 @@ fn lowered_real_blog_typing_residual() {
         &app.models,
         test_extras,
         &roundhouse::lower::routes::helper_id_segments(&app),
+        &roundhouse::lower::routes::direct_helper_names(&app),
     );
 
     let mut all_untyped: Vec<String> = Vec::new();
@@ -1602,7 +1606,7 @@ fn lowered_real_blog_typing_residual() {
 }
 
 #[test]
-fn unclaimed_model_dsl_reports_spanned_warning() {
+fn unclaimed_model_dsl_reports_a_spanned_error() {
     use roundhouse::analyze::Severity;
     use roundhouse::diagnostic::DiagnosticKind;
     use roundhouse::ingest::ingest_model;
@@ -1623,9 +1627,7 @@ end
         .expect("ingest")
         .expect("model");
 
-    let (_lc, diags) = roundhouse::emit::diagnostics::scope(|| {
-        lower_model_to_library_class(&model, &Schema::default())
-    });
+    let diags = roundhouse::lower::model_to_library::unclaimed::model_diagnostics(&model, &Schema::default());
 
     let unsupported: Vec<_> = diags
         .iter()
@@ -1639,7 +1641,7 @@ end
         "has_*_attached are claimed by lower::attached and must not report: {diags:?}"
     );
     let d = unsupported[0];
-    assert_eq!(d.severity, Severity::Warning, "tolerable per-app: warning, not error");
+    assert_eq!(d.severity, Severity::Error, "the call's effect is missing from the output");
     assert!(!d.span.is_synthetic(), "declaration site is located");
     // validates was claimed by the recognizer; only the unclaimed DSL reports.
     assert!(
@@ -1650,7 +1652,7 @@ end
 }
 
 #[test]
-fn unclaimed_model_class_writes_report_spanned_warnings() {
+fn unclaimed_model_class_writes_report_spanned_errors() {
     use roundhouse::diagnostic::{DiagnosticKind, Severity};
     use roundhouse::ingest::ingest_model;
     use roundhouse::schema::Schema;
@@ -1663,12 +1665,10 @@ fn unclaimed_model_class_writes_report_spanned_warnings() {
         let model = ingest_model(
             source.as_bytes(), "app/models/widget.rb", &Schema::default(), &Default::default(),
         ).expect("ingest").expect("model");
-        let (_, diags) = roundhouse::emit::diagnostics::scope(|| {
-            lower_model_to_library_class(&model, &Schema::default())
-        });
+        let diags = roundhouse::lower::model_to_library::unclaimed::model_diagnostics(&model, &Schema::default());
         assert_eq!(diags.len(), 1, "dropped class-body write must report: {diags:?}");
         let d = &diags[0];
-        assert_eq!(d.severity, Severity::Warning);
+        assert_eq!(d.severity, Severity::Error);
         assert!(matches!(&d.kind, DiagnosticKind::Unsupported { construct, .. }
             if construct.as_str() == setter));
         assert_eq!(&source[d.span.start as usize..d.span.end as usize], statement);

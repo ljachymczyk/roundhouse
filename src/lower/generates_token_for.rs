@@ -38,7 +38,7 @@
 //! def __token_data(purpose)
 //!   case purpose
 //!   when :email_change
-//!     ActiveRecord::TokenFor.value_data(id, unconfirmed_email)
+//!     ActiveRecord::TokenFor.value_data(id.to_s, unconfirmed_email)
 //!   else
 //!     raise "unknown token purpose"
 //!   end
@@ -74,7 +74,7 @@
 //! worse than none. The methods dispatch on a purpose passed at
 //! runtime, so it is all or nothing per model: a purpose whose LAST
 //! declaration is unclaimed (Rails keeps the last), a computed purpose,
-//! or a key that is not an Integer `id` declines the whole model, and
+//! or a key that is not an Integer or String `id` declines the whole model, and
 //! every declaration on it warns.
 //! `token_for_decls` is the one place that decides, and
 //! `report_unclaimed_unknowns` asks `claims` by span.
@@ -105,9 +105,8 @@ pub(crate) struct TokenForDecl {
 /// `generate_token_for(:that)` raising in the emitted app. An earlier
 /// form must not stand in for it either. That declines the whole model,
 /// as do a computed purpose (it could replace any of them) and a key
-/// that is not an Integer `id`: the payload is `[id, …]` with the id as
-/// a JSON number, and Rails writes a uuid or other String key as a JSON
-/// string the runtime does not read back.
+/// that is neither an Integer nor a String `id`: the payload is `[id, …]`
+/// with the id as Rails' `as_json` writes it, a JSON number or string.
 pub(crate) fn token_for_decls(model: &Model) -> Vec<TokenForDecl> {
     model_decls(model).unwrap_or_default()
 }
@@ -118,15 +117,46 @@ pub(crate) fn token_for_decls(model: &Model) -> Vec<TokenForDecl> {
 /// `report_unclaimed_unknowns` asks.
 pub(crate) fn claims(model: &Model, span: Span) -> bool {
     model_decls(model).is_some()
-        && parse_decls(&model.body).iter().any(|d| matches!(d, Ok(decl) if decl.span == span))
+        && (parse_decls(&model.body).iter().any(|d| matches!(d, Ok(decl) if decl.span == span))
+            || superseded(&model.body, span))
+}
+
+/// A declaration a later one of the same purpose replaces, as Rails' `token_definitions` keeps only the last.
+fn superseded(body: &[ModelBodyItem], span: Span) -> bool {
+    let purposes: Vec<(Span, &Symbol)> = body
+        .iter()
+        .filter_map(|item| {
+            let ModelBodyItem::Unknown { expr, .. } = item else { return None };
+            let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { return None };
+            if method.as_str() != "generates_token_for" || args.is_empty() {
+                return None;
+            }
+            // Not one whose arguments compute: Rails evaluates them as the class loads, before the later one
+            // replaces it (`expires_in: ENV.fetch("TTL").to_i` raises there).
+            let literal = args[1..].iter().all(|a| match &*a.node {
+                ExprNode::Hash { entries, .. } => entries.iter().all(|(k, v)| {
+                    matches!(&*k.node, ExprNode::Lit { .. }) && (matches!(&*v.node, ExprNode::Lit { .. }) || literal_seconds(v).is_some())
+                }),
+                _ => false,
+            });
+            match args.first().map(|a| &*a.node) {
+                Some(ExprNode::Lit { value: Literal::Sym { value } }) if literal => Some((expr.span, value)),
+                // A later declaration still replaces it, so it stays in the list to be found as one.
+                Some(ExprNode::Lit { value: Literal::Sym { value } }) => Some((Span::synthetic(), value)),
+                _ => None,
+            }
+        })
+        .collect();
+    purposes
+        .iter()
+        .position(|(s, _)| *s == span)
+        .is_some_and(|at| purposes[at + 1..].iter().any(|(_, p)| *p == purposes[at].1))
 }
 
 /// The last declaration of each purpose, or `None` when the model is
 /// declined whole (see `token_for_decls`).
 fn model_decls(model: &Model) -> Option<Vec<TokenForDecl>> {
-    if !integer_id(model) {
-        return None;
-    }
+    key_kind(model)?;
     let mut last: Vec<(Symbol, Option<TokenForDecl>)> = Vec::new();
     for d in parse_decls(&model.body) {
         let (purpose, decl) = match d {
@@ -144,9 +174,23 @@ fn model_decls(model: &Model) -> Option<Vec<TokenForDecl>> {
     Some(last.into_iter().filter_map(|(_, decl)| decl).collect())
 }
 
-fn integer_id(model: &Model) -> bool {
-    let named_id = model.primary_key.as_ref().is_none_or(|k| k.as_str() == "id");
-    named_id && model.attributes.fields.get(&Symbol::from("id")).is_none_or(|t| *t == Ty::Int)
+/// An `id` key of a type the payload writes as Rails does: an Integer as
+/// a JSON number, a String (a uuid) as a JSON string.
+#[derive(Clone, Copy, PartialEq)]
+enum KeyKind {
+    Int,
+    Str,
+}
+
+fn key_kind(model: &Model) -> Option<KeyKind> {
+    if !model.primary_key.as_ref().is_none_or(|k| k.as_str() == "id") {
+        return None;
+    }
+    match model.attributes.fields.get(&Symbol::from("id")) {
+        None | Some(Ty::Int) => Some(KeyKind::Int),
+        Some(Ty::Str) => Some(KeyKind::Str),
+        _ => None,
+    }
 }
 
 /// A purpose the synthesized source can spell as a bare Symbol literal
@@ -300,7 +344,7 @@ fn full_purpose(model: &Model, d: &TokenForDecl) -> String {
 /// possibly nil. Any other value goes over as its String form, which
 /// verifies in the emitted app but not across to Rails (a Time or a
 /// Float would need Rails' own `as_json` formatting).
-fn value_payload(e: &Expr, src: &str) -> String {
+fn value_payload(e: &Expr, src: &str, key: &str) -> String {
     let non_nil: Vec<&Ty> = match &e.ty {
         Some(Ty::Union { variants }) => variants.iter().filter(|t| **t != Ty::Nil).collect(),
         Some(t) => vec![t],
@@ -311,16 +355,20 @@ fn value_payload(e: &Expr, src: &str) -> String {
     // parentheses synthesis fails while the analyzer still types the
     // methods (invariant 6).
     match non_nil.as_slice() {
-        [Ty::Str] => format!("value_data(id, ({src}))"),
-        [Ty::Int] => format!("int_value_data(id, ({src}))"),
-        [Ty::Bool] => format!("bool_value_data(id, ({src}))"),
-        _ => format!("value_data(id, ({src})&.to_s)"),
+        [Ty::Str] => format!("value_data({key}, ({src}))"),
+        [Ty::Int] => format!("int_value_data({key}, ({src}))"),
+        [Ty::Bool] => format!("bool_value_data({key}, ({src}))"),
+        _ => format!("value_data({key}, ({src})&.to_s)"),
     }
 }
 
 fn synthesized_source(model: &Model, decls: &[TokenForDecl]) -> String {
     use crate::emit::ruby::emit_expr;
     let class = model.name.0.as_str();
+    let (key, data_id) = match key_kind(model) {
+        Some(KeyKind::Str) => ("ActiveRecord::TokenFor.str_key(id)", "data_str_id"),
+        _ => ("id.to_s", "data_id"),
+    };
     let case = |arms: String| {
         format!("    case purpose\n{arms}    else\n      raise \"unknown token purpose\"\n    end\n")
     };
@@ -338,9 +386,9 @@ fn synthesized_source(model: &Model, decls: &[TokenForDecl]) -> String {
         Some(e) => {
             let mut value = e.clone();
             crate::lower::enumerable_ext::rewrite_body(&mut value);
-            format!("ActiveRecord::TokenFor.{}", value_payload(e, &emit_expr(&value)))
+            format!("ActiveRecord::TokenFor.{}", value_payload(e, &emit_expr(&value), key))
         }
-        None => "ActiveRecord::TokenFor.id_data(id)".to_string(),
+        None => format!("ActiveRecord::TokenFor.id_data({key})"),
     }));
     let meta = case(arms(&|d| {
         format!("[\"{}\", {}]", full_purpose(model, d), d.expires_in)
@@ -371,7 +419,7 @@ fn synthesized_source(model: &Model, decls: &[TokenForDecl]) -> String {
   def self.find_by_token_for(purpose, token)
     data = ActiveRecord::TokenFor.verified_data(token, {class}.__token_meta(purpose)[0])
     return nil if data == \"\"
-    record = where(id: ActiveRecord::TokenFor.data_id(data)).first
+    record = where(id: ActiveRecord::TokenFor.{data_id}(data)).first
     return nil if record.nil?
     record.__token_data(purpose) == data ? record : nil
   end
@@ -379,7 +427,7 @@ fn synthesized_source(model: &Model, decls: &[TokenForDecl]) -> String {
   def self.find_by_token_for!(purpose, token)
     data = ActiveRecord::TokenFor.verified_data(token, {class}.__token_meta(purpose)[0])
     raise ActiveSupport::MessageVerifier::InvalidSignature if data == \"\"
-    id = ActiveRecord::TokenFor.data_id(data)
+    id = ActiveRecord::TokenFor.{data_id}(data)
     record = where(id: id).first
     raise ActiveRecord::RecordNotFound, \"Couldn't find {class} with id=#{{id}}\" if record.nil?
     raise ActiveSupport::MessageVerifier::InvalidSignature unless record.__token_data(purpose) == data

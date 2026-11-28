@@ -319,10 +319,12 @@ mod tests {
                 parent_span: Default::default(),
                 includes: Vec::new(),
                 include_spans: Vec::new(),
+                include_statements: Vec::new(),
                 methods: Vec::new(),
                 nullable_columns: Vec::new(),
                 origin: None,
                 constants: Vec::new(),
+                conditional_definitions: Vec::new(),
                 unknown_calls: Vec::new(),
                 class_ivar_initializers: Vec::new(),
             });

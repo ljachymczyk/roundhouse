@@ -100,6 +100,7 @@ fn build_row_class(model_name: &ClassId, table: &Table) -> LibraryClass {
         parent_span: Default::default(),
         includes: Vec::new(),
         include_spans: Vec::new(),
+        include_statements: Vec::new(),
         methods,
         nullable_columns: super::nullable_column_names(Some(table)),
         origin: Some(LibraryClassOrigin::ResourceRow {
@@ -107,6 +108,7 @@ fn build_row_class(model_name: &ClassId, table: &Table) -> LibraryClass {
             fields,
         }),
         constants: Vec::new(),
+        conditional_definitions: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     }

@@ -4,10 +4,13 @@
 //! through each attribute's casting writer, `:integer` `"7"` is 7,
 //! `:string` 12 is `"12"`, a `:datetime` date string is that day at UTC
 //! midnight, `:boolean` `"0"` is false; an `attr_accessor` beside them is
-//! assigned as given; validations read the cast value.
+//! assigned as given; validations read the cast value. An attribute is
+//! nil until written, so `present?` on it can be false.
 //!
 //! The model path's Attributes API cast only `:boolean`, and the include
 //! was reported as unresolved.
+#[path = "../support/scratch.rs"]
+mod scratch;
 use super::emit_and_run;
 
 const FORM: &str = r#"class Form::Confirm
@@ -21,6 +24,10 @@ const FORM: &str = r#"class Form::Confirm
   attr_accessor :note
 
   validates :label, presence: true
+
+  def count_given?
+    count.present?
+  end
 end
 "#;
 
@@ -38,6 +45,9 @@ check("attr_accessor", f.note, "x")
 f.count = "08"
 check("writer casts", f.count, 8)
 check("valid", f.valid?, true)
+check("a written integer is present", f.count_given?, true)
+check("an unwritten integer is not present", Form::Confirm.new.count_given?, false)
+check("a blank String casts to nil", Form::Confirm.new(count: "").count_given?, false)
 blank = Form::Confirm.new(label: "")
 check("validation reads the cast value", blank.valid?, false)
 puts "ActiveModel form attributes passed"
@@ -162,7 +172,8 @@ fn column_app() -> emit_and_run::Overlay {
 #[test]
 fn an_attribute_over_a_column_of_another_type_keeps_the_column() {
     let run = column_app().run_ruby(COLUMN_SCRIPT);
-    run.assert_passes();
+    // Rails' declared type replaces the column's everywhere; here only the column's is kept, so check reports it.
+    run.assert_runs_reporting("`attribute` in the body of `Article` is not modelled");
     assert!(run.stdout.contains("attribute over column passed"), "{}", run.stdout);
 }
 
@@ -170,8 +181,7 @@ fn an_attribute_over_a_column_of_another_type_keeps_the_column() {
 /// column's type; a matching one and the enum's are not.
 #[test]
 fn an_attribute_over_a_column_of_another_type_is_reported() {
-    let root = std::env::temp_dir().join(format!("roundhouse-attribute-over-column-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = scratch::dir("roundhouse-attribute-over-column");
     let source = root.join("app");
     std::fs::create_dir_all(&root).unwrap();
     assert!(std::process::Command::new("cp").args(["-a"]).arg(roundhouse::fixtures::real_blog()).arg(&source).status().unwrap().success());
@@ -228,7 +238,7 @@ fn an_attribute_over_an_array_column_keeps_the_array() {
             "class Article < ApplicationRecord\n  has_many :comments, dependent: :destroy\n  attribute :tag_ids, :integer\n",
         )
         .run_ruby(ARRAY_COLUMN_SCRIPT);
-    run.assert_passes();
+    run.assert_runs_reporting("`attribute` in the body of `Article` is not modelled");
     assert!(run.stdout.contains("attribute over array column passed"), "{}", run.stdout);
 }
 
@@ -243,6 +253,8 @@ const DEFAULTS_FORM: &str = r#"class Form::Prefs
   attribute :label, :string, default: "none"
   attribute :stamp, :integer, default: -> { CALLS << :call; CALLS.size }
   attribute :origin, :string, default: -> { name }
+
+  validates :label, inclusion: { in: %w[none other] }
 end
 "#;
 
@@ -250,7 +262,8 @@ end
 /// form and an ActiveRecord model): cast as an assigned value is; `new`
 /// with the key, even nil, wins; a String default is fresh per instance; a
 /// lambda is called on the first read, with the class as `self`, kept, and
-/// skipped by an earlier write or `new` key.
+/// skipped by an earlier write or `new` key. A validation reads the
+/// default through the reader.
 const DEFAULTS_SCRIPT: &str = r##"
 require_relative "app/models/form/prefs"
 def check(label, got, want)
@@ -271,6 +284,8 @@ w = Form::Prefs.new
 w.stamp = 6
 check("write before read skips the lambda", [w.stamp, Form::Prefs::CALLS.size], [6, 0])
 check("lambda self is the class", Form::Prefs.new.origin, "Form::Prefs")
+check("validation reads the default", Form::Prefs.new.valid?, true)
+check("validation reads the written value", Form::Prefs.new(label: "x").valid?, false)
 puts "model attribute defaults passed"
 "##;
 
@@ -341,6 +356,36 @@ fn a_source_reader_beside_a_default_on_ruby() {
     assert!(run.stdout.contains("source reader passed"), "{}", run.stdout);
 }
 
+const GUARDED_DEFAULT_FORM: &str = r#"class Form::Note
+  include ActiveModel::Model
+  include ActiveModel::Attributes
+
+  attribute :note, :string, default: ""
+
+  validates :note, presence: true, if: -> { @note.nil? }
+end
+"#;
+
+// A condition keeps the app's own `@note` read, which is nil in Rails
+// 8.1.4; only the check reads through the reader.
+const GUARDED_DEFAULT_SCRIPT: &str = r##"
+require_relative "app/models/form/note"
+def check(label, got, want)
+  raise "#{label}: #{got.inspect} (want #{want.inspect})" unless got == want
+end
+blank = Form::Note.new
+check("the condition reads @note, the check the default", [blank.valid?, blank.errors.to_a], [false, ["Note can't be blank"]])
+check("a written value", Form::Note.new(note: "x").valid?, true)
+puts "guarded default passed"
+"##;
+
+#[test]
+fn a_validation_condition_keeps_its_instance_variable_read_on_ruby() {
+    let run = emit_and_run::real_blog().write("app/models/form/note.rb", GUARDED_DEFAULT_FORM).run_ruby(GUARDED_DEFAULT_SCRIPT);
+    run.assert_passes();
+    assert!(run.stdout.contains("guarded default passed"), "{}", run.stdout);
+}
+
 // Two `default:` declarations this lowering doesn't model, so they stay
 // reported rather than claimed and dropped: one over an existing column
 // (Rails makes it the column's default), and one whose writer the model
@@ -349,8 +394,7 @@ fn a_source_reader_beside_a_default_on_ruby() {
 fn reported_default(decl: &str) -> Vec<String> {
     static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = RUN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let root = std::env::temp_dir().join(format!("roundhouse-reported-default-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = scratch::dir(&format!("roundhouse-reported-default-{n}"));
     let source = root.join("app");
     std::fs::create_dir_all(&root).unwrap();
     assert!(std::process::Command::new("cp").args(["-a"]).arg(roundhouse::fixtures::real_blog()).arg(&source).status().unwrap().success());
@@ -369,7 +413,7 @@ fn reported_default(decl: &str) -> Vec<String> {
     let _ = std::fs::remove_dir_all(&root);
     String::from_utf8_lossy(&out.stderr)
         .lines()
-        .filter(|l| l.contains("attribute not supported") && l.contains("not lowered"))
+        .filter(|l| l.contains("attribute not supported") && l.contains("is not modelled"))
         .map(str::to_string)
         .collect()
 }

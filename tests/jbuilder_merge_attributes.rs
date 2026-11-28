@@ -8,7 +8,8 @@
 //! refused (a raise at render). It is the same object `json.extract!`
 //! builds over the remaining columns, so it lowers to that, wherever the
 //! keys are known: the record is the template's own, the narrowing keys
-//! are literals, and no other statement of the object sets one of them.
+//! are literals, and no other statement of the object sets one of them
+//! (`jbuilder_merge_attributes_override.rs` covers a later pair that does).
 
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
@@ -127,5 +128,5 @@ raise "ignored_columns #{refused.inspect}" unless refused.to_s.include?("merge! 
 puts "ALL OK"
 "##,
         )
-        .assert_passes();
+        .assert_runs_reporting("`ignored_columns=` in the body of `Widget`");
 }

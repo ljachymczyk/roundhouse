@@ -1,4 +1,7 @@
 # Typing contract for runtime/spinel/mocha_stub.rb — see its header.
+class MochaUnexpectedInvocation < Exception
+end
+
 class MochaStub
   def initialize: (String name, Integer expected) -> void
   def self.stub: (String name) -> MochaStub
@@ -7,8 +10,10 @@ class MochaStub
   def raises: () -> String
   def record!: () -> nil
   def verify!: () -> nil
+  def live?: () -> bool
   ANY_INSTANCE: Hash[String, MochaStub]
   PENDING: Array[MochaStub]
+  GENERATION: Array[Integer]
   def self.file_any_instance: (String name, MochaStub stub) -> MochaStub
   def self.any_instance_for: (String name) -> MochaStub?
   def self.pending_expectations: () -> Array[MochaStub]

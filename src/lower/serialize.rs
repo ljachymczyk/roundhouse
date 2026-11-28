@@ -2,6 +2,9 @@
 //! column (text/string/json), decoded at the public accessor boundary
 //! through [`RoundhouseJsonColumn`](crate) the same way a schema `t.json` column is.
 //!
+//! `store :attr, coder: JSON` (no accessors) is the same column through
+//! Rails' indifferent coder: `load_store` / `dump_store`.
+//!
 //! Claimed spellings: `coder: JSON`, positional `JSON`, and toplevel
 //! `::JSON` (Const path `["", "JSON"]`). Bare YAML `serialize :prefs`,
 //! custom coders, and Array/Hash positional classes stay unclaimed.
@@ -18,6 +21,9 @@ use crate::span::Span;
 pub struct SerializeDecl {
     pub span: Span,
     pub column: Symbol,
+    /// `store :col, coder: JSON`: Rails' `IndifferentCoder` over the JSON coder, a Hash read by a String or a
+    /// Symbol, `{}` for nil.
+    pub store: bool,
 }
 
 /// Every claimed JSON `serialize` in a model body.
@@ -30,16 +36,21 @@ pub fn serialize_decls(model: &Model) -> Vec<SerializeDecl> {
         let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else {
             continue;
         };
-        if method.as_str() != "serialize" {
-            continue;
-        }
+        let store = match method.as_str() {
+            "serialize" => false,
+            // Not the positional coder: `store :col, JSON` is not one of its signatures. Accessors define readers this does not.
+            "store" => true,
+            _ => continue,
+        };
         let Some(column) = args.first().and_then(sym_lit) else { continue };
-        if !is_json_coder_args(&args[1..], json_shadowed) {
+        let coder = if store { matches!(&args[1..], [hash] if is_coder_json_hash(hash, json_shadowed)) } else { is_json_coder_args(&args[1..], json_shadowed) };
+        if !coder {
             continue;
         }
         out.push(SerializeDecl {
             span: expr.span,
             column,
+            store,
         });
     }
     out
@@ -48,6 +59,11 @@ pub fn serialize_decls(model: &Model) -> Vec<SerializeDecl> {
 /// Column names claimed by [`serialize_decls`].
 pub fn json_serialize_columns(model: &Model) -> HashSet<Symbol> {
     serialize_decls(model).into_iter().map(|d| d.column).collect()
+}
+
+/// The ones of them a `store` declares.
+pub fn json_store_columns(model: &Model) -> HashSet<Symbol> {
+    serialize_decls(model).into_iter().filter(|d| d.store).map(|d| d.column).collect()
 }
 
 /// Whether a constant path written in `owner`'s body shadows bare `JSON`.
@@ -132,6 +148,7 @@ fn is_json_const(expr: &crate::expr::Expr, json_shadowed: bool) -> bool {
 fn sym_lit(expr: &crate::expr::Expr) -> Option<Symbol> {
     match &*expr.node {
         ExprNode::Lit { value: Literal::Sym { value } } => Some(value.clone()),
+        ExprNode::Lit { value: Literal::Str { value } } => Some(Symbol::from(value.as_str())),
         _ => None,
     }
 }

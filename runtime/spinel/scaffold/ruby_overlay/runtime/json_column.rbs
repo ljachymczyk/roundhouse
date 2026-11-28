@@ -1,4 +1,6 @@
 module RoundhouseJsonColumn
   def self.load: (String? serialized) -> untyped
   def self.dump: (untyped value) -> String?
+  def self.load_store: (String? serialized, ?untyped owner, ?String? writer) -> Hash[String, untyped]
+  def self.dump_store: (untyped value) -> String
 end

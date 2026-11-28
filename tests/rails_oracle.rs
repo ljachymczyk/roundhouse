@@ -3,6 +3,10 @@
 //! Rails checkout, from `RH_RAILS_ORACLE`. Each test runs the helper under
 //! plain `ruby` the way a control does.
 
+#[path = "support/prerequisite.rs"]
+mod prerequisite;
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -29,7 +33,7 @@ fn stdout_of(output: &Output) -> String {
 fn release_installed() -> bool {
     let installed = stdout_of(&oracle_ruby(None, r#"puts RailsOracle.available?("activesupport")"#)) == "true";
     if !installed {
-        eprintln!("skipping: the default release of activesupport is not installed");
+        prerequisite::missing("the default release of activesupport is not installed");
     }
     installed
 }
@@ -37,9 +41,7 @@ fn release_installed() -> bool {
 /// A throwaway Rails checkout holding `activesupport` at `version`, whose
 /// library answers where it was loaded from, plus the `others` components.
 fn checkout(name: &str, version: &str, others: &[&str]) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("rh-rails-oracle-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
+    let root = scratch::dir(&format!("rh-rails-oracle-{name}"));
     std::fs::write(root.join("RAILS_VERSION"), format!("{version}\n")).unwrap();
     for component in std::iter::once("activesupport").chain(others.iter().copied()) {
         std::fs::create_dir_all(root.join(component).join("lib")).unwrap();
@@ -52,6 +54,9 @@ fn checkout(name: &str, version: &str, others: &[&str]) -> PathBuf {
         .unwrap();
     }
     std::fs::create_dir_all(root.join("activesupport/lib/active_support")).unwrap();
+    // `require` records the file's real path, so `__FILE__` is compared
+    // against the checkout's real path: macOS's temp dir sits under the
+    // `/var` -> `/private/var` symlink.
     std::fs::write(root.join("activesupport/lib/active_support/oracle_probe.rb"), "ORACLE_PROBE = __FILE__\n").unwrap();
     root
 }
@@ -117,7 +122,7 @@ fn a_checkout_supplies_the_components_even_beside_a_newer_release() {
 RailsOracle.activate("activesupport")
 require "active_support/oracle_probe"
 puts Gem.loaded_specs.fetch("activesupport").version
-puts ORACLE_PROBE.start_with?(File.expand_path(RailsOracle.source))
+puts ORACLE_PROBE.start_with?(File.realpath(RailsOracle.source))
 puts RailsOracle.label.start_with?("Rails 8.0.0.alpha (")
 puts RailsOracle.env.empty?"#,
     );
@@ -137,7 +142,7 @@ fn a_checkout_at_an_installed_release_s_version_still_supplies_the_components() 
         Some(root.to_str().unwrap()),
         r#"RailsOracle.activate("activesupport")
 require "active_support/oracle_probe"
-puts ORACLE_PROBE.start_with?(File.expand_path(RailsOracle.source))"#,
+puts ORACLE_PROBE.start_with?(File.realpath(RailsOracle.source))"#,
     );
     remove(&root);
     assert_eq!(stdout_of(&output), "true");
@@ -182,7 +187,7 @@ fn a_component_the_checkout_lacks_is_refused_by_name() {
 
 #[test]
 fn a_missing_checkout_is_refused_naming_the_path() {
-    let missing = std::env::temp_dir().join("rh-rails-oracle-no-such-checkout");
+    let missing = scratch::dir("rh-rails-oracle").join("no-such-checkout");
     let output = oracle_ruby(Some(missing.to_str().unwrap()), r#"RailsOracle.activate("activesupport")"#);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);

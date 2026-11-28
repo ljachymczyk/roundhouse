@@ -94,9 +94,11 @@ end
     });
     assert_eq!(survey_files, strict_files, "no emitted behavior changed");
     assert_eq!(survey_emit, strict_emit);
+    let article = surveyed.models.iter().find(|m| m.name.0.as_str() == "Article").unwrap();
+    let unclaimed = roundhouse::lower::model_to_library::unclaimed::model_diagnostics(article, &surveyed.schema);
     assert!(
-        survey_emit.iter().any(|d| d.message.contains("labeled")),
-        "declaration warning must remain: {survey_emit:?}"
+        unclaimed.iter().any(|d| d.message.contains("labeled") && d.severity == roundhouse::diagnostic::Severity::Error),
+        "the unread declaration must stay reported: {unclaimed:?}"
     );
     let article = survey_files
         .iter()
@@ -202,4 +204,22 @@ raise "literal hook lost mixin" unless a.installer_marker == 37
 raise "hook macro did not expand" unless a.headline == "hello"
 "#)
         .assert_passes();
+}
+
+/// `Module.nesting` has one entry per header: a compact `class Vendor::Railtie` nests in `Vendor::Railtie` alone, so
+/// a bare `Adapter` in its hook is not read under `Vendor`; inside `module Vendor` it is.
+#[test]
+fn a_hook_constant_records_the_nesting_of_each_header() {
+    let nesting = |hooks: &str| {
+        let app = ingest_app_from_tree(tree(hooks)).expect("ingest");
+        app.load_hook_constants
+            .iter()
+            .find(|(name, _, _)| name.as_str() == "Adapter")
+            .map(|(_, _, scope)| scope.iter().map(|s| s.as_str().to_string()).collect::<Vec<_>>())
+            .expect("the hook's constant is recorded")
+    };
+    let compact = "class Vendor::Railtie\n  ActiveSupport.on_load(:active_record) do\n    self::Adapter = Adapter\n  end\nend\n";
+    assert_eq!(nesting(compact), ["Vendor::Railtie"]);
+    let nested = "module Vendor\n  class Railtie\n    ActiveSupport.on_load(:active_record) do\n      self::Adapter = Adapter\n    end\n  end\nend\n";
+    assert_eq!(nesting(nested), ["Vendor", "Vendor::Railtie"]);
 }

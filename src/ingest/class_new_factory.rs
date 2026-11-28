@@ -46,12 +46,12 @@ pub(super) fn constant_classes(
         // A block the class-body walk refuses stays a constant, as before.
         let Ok(DeclBody {
             includes,
-            include_spans,
+            include_spans, include_statements,
             methods,
             constants,
             unknown_calls,
             class_initializers,
-            class_attributes: _,
+            class_attributes: _, conditional_definitions,
         }) = walk_decl_body(block_body, &id, file, DeclBodyMode::Instance)
         else {
             continue;
@@ -64,11 +64,12 @@ pub(super) fn constant_classes(
                 parent: Some(ClassId(Symbol::from(parent))),
                 parent_span: node_span(&parent_node, file),
                 includes,
-                include_spans,
+                include_spans, include_statements,
                 methods,
                 nullable_columns: Vec::new(),
                 origin: None,
                 constants,
+                conditional_definitions,
                 unknown_calls,
                 class_ivar_initializers: class_initializers,
             },

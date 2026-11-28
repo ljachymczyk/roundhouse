@@ -17,6 +17,8 @@ extensions:
 - [`test_paths`](#test_paths) adds test folders to the default list.
 - [`extensions`](#extensions) lists directories that describe the app's
   gems and class-body DSLs.
+- [`spinel`](#spinel) passes a compiler mode the Spinel target needs
+  (provisional).
 
 Roundhouse reads the file during ingest, so every tool sees it:
 [`roundhouse check`](check.md), the [editor](editor.md), the
@@ -108,21 +110,81 @@ The supported subset:
   or both, and `type: :model`, `:lib` or `:request` metadata;
 - `let`, `let!`, `subject`, `subject(:name)`, `described_class`, and the
   implicit `subject` (`described_class.new`);
-- `before`, `before(:each)`, `before(:example)`;
+- `before` and `after`, bare or `(:each)` / `(:example)`; `after` hooks
+  run inner group first, after the example whether it passed or not;
 - `it`, `specify`, `example`; an example without a block, and `xit`,
   are pending in RSpec and are not tests here;
 - `expect(x)` and `is_expected` with `to`, `not_to` and `to_not`, and the
   matchers `eq`, `eql`, `equal`, `be(x)`, `be_nil`, `be_truthy`,
   `be_falsey`, `be_a`, `be_an`, `be_kind_of`, `be_a_kind_of`,
   `be_instance_of`, `be_an_instance_of`, `be_<predicate>`,
-  `have_<predicate>`, and `include` of plain values.
+  `have_<predicate>`, and `include` of plain values;
+- `expect { }.to raise_error` with no argument (any `Exception`), a
+  class, a literal message (equal to the error's message, or matched by a
+  Regexp), or both; `expect { }.not_to raise_error`;
+- `expect { }.to change { value }` and `change(receiver, :message)`, bare
+  or with `by`, `by_at_least`, `by_at_most`, `from` and `to`. As in
+  RSpec, the value is not copied: it and its `hash` are compared before
+  and after the block, so a value changed in place reads as a change (the
+  `by` forms compare the delta instead), and `from` is matched before the
+  block runs. An Array or Hash `from`/`to` must hold plain literals.
+- in a request spec (`type: :request`, or `spec/requests` with
+  `infer_spec_type_from_file_location!`), the integration session's
+  `get`, `post` and the other verbs, and on its `response`:
+  `have_http_status` (an Integer, a status Symbol, or the generic
+  `:success` / `:successful`, `:redirect`, `:missing` / `:not_found`,
+  `:error` / `:server_error`, as rspec-rails reads them: `:redirect` is
+  the five redirect codes Rack's `redirect?` names, not every 3xx),
+  `redirect_to`, and the status predicates of `Rack::Response::Helpers`
+  (`be_successful`, `be_ok`, `be_not_found`, `be_redirect`, ...).
+- rspec-mocks, read as the Mocha chains Roundhouse serves for Minitest
+  suites: `allow(x).to receive(:m)` is `x.stubs(:m)`, `expect(x).to
+  receive(:m)` is `x.expects(:m)` (once, as in RSpec), `not_to receive`
+  is `.never`; `with`, `and_return`, `and_raise`, `and_yield`, `once`,
+  `twice`, `thrice`, `exactly` / `at_least` / `at_most(n).times`,
+  `receive_messages`, `allow_any_instance_of` / `expect_any_instance_of`
+  (`any_instance`), and `double` / `instance_double` / `class_double` as
+  Mocha's `stub` (the check that the class defines the doubled methods
+  is dropped). In `with`, `anything`, `instance_of`, `kind_of`,
+  `any_args`, `no_args` and `hash_including` keep their meaning; other
+  argument matchers, and a constant, Regexp or Range argument (RSpec
+  matches it with `===`, Mocha with `==`), are refused, as are spies
+  (`have_received`), `and_call_original` and block implementations.
+  What Roundhouse serves of Mocha on each target is what these chains
+  get. On an app method (a model's or a plain class's, instance or class
+  side) that covers `returns` and `with` of plain values and `anything`
+  on every target, Spinel included: the method answers from a typed
+  slot, the newest matching stub first, and a call no stub admits fails
+  as Mocha's unexpected invocation. The stub's answer has to have the
+  method's own type there, and Roundhouse does not check that yet.
+
+Roundhouse reads `spec/spec_helper.rb` and `spec/rails_helper.rb`, and
+the `spec/support/` files they load with the generated
+`Dir[...support...].each { |f| require f }` line:
+
+- in `RSpec.configure`: `before` and `after` hooks (also `prepend_` and
+  `append_`), `include` of a module a support file defines,
+  `infer_spec_type_from_file_location!`, and settings that change no
+  verdict (fixture paths, ordering, backtraces, formatters, the
+  transaction mode);
+- a hook or `include` filtered by `type:` applies to that type; one
+  filtered by other metadata applies to no supported example, because
+  such examples are refused themselves;
+- methods the helper files define at the top level, for the examples
+  that call them;
+- `RSpec::Matchers.define`, so a spec that uses the custom matcher is
+  refused rather than misread.
+
+Every example starts from an emptied database with `test/fixtures`
+loaded, whatever the transaction mode. A `spec/fixtures` folder is not
+read.
 
 Anything else is refused by name: `roundhouse check` reports it, and
 `--continue` lists every refused construct and leaves out the examples
-that need it. Roundhouse does not read `spec/rails_helper.rb` or
-`spec/spec_helper.rb` yet, so configuration there (included modules,
-global hooks) does not reach the examples, and neither do test doubles,
-`expect { }` block expectations, shared examples or `after` hooks.
+that need it. Not read yet: `spy`, `instance_spy`, `class_spy` and
+`object_double`, shared examples and contexts,
+`around` hooks, `before(:all)` and `before(:suite)`, and modules from
+gems (`config.include FactoryBot::Syntax::Methods`).
 
 ## `extensions`
 
@@ -235,6 +297,37 @@ source_gems:
   before `roundhouse check`; a gem that is not installed, not in the
   lockfile, or also named by another fact is an error.
 
+A `PATH` or source gem's files also run as Ruby loads them on the `ruby`
+and `jruby` trees. Each file's top level, its statements and its
+`require`s in source order, is written as a program under
+`app/models/roundhouse_files/`. `Bundler.require` loads the gem's entry
+file at boot, before the app's own files, and that file's requires load
+the rest. A literal-list loop of `require_relative` and a
+`Dir[File.join(__dir__, "x/**/*.rb")]` glob become one require per file.
+An `autoload :Name, "path"` (or `ActiveSupport::Autoload`'s path-less
+`autoload :Name`) loads that file's program when the constant is first
+read. Once the boot loads a gem, its classes and modules load only where
+its own requires and autoloads reach them, as natively: a file nothing
+requires defines nothing. The boot loads a gem through `Bundler.require`,
+a literal `require` in `config/boot.rb`, `config/application.rb` or
+`config/environment.rb`, or an app file's `require` of it.
+A file-level `if` / `unless` that declares a class or module runs its
+branches as Ruby does, so the class exists only where its branch ran.
+A `require` of a Rails framework feature is left to the runtime, as are
+`ActiveSupport.on_load` (see `on_load` reopens) and `I18n.load_path`
+(the gem's locale files are compiled in). A
+statement that cannot be carried is an error (`file_statement_unsupported`),
+as is a `require_relative` of a file the tree does not carry
+(`file_require_not_carried`). The `spinel` tree compiles the gem's
+declarations and loads no file, so its boot runs the statements instead,
+ahead of the app's initializer code, in the order Ruby loads their files:
+the boot's requires as above, then the files declaring a constant the
+app's own code names and the files an `autoload` of such a constant
+names. Only a call on a class the tree carries is run there
+(`Warden::Strategies.add(:database_authenticatable, …)`); any other
+statement of those files, and one inside a file-level `if`, is a warning
+(`gem file statement`): the `spinel` tree does not run it.
+
 Extension gem facts also select the locked gems' Tapioca RBIs under
 `sorbet/rbi/gems/`. This includes gems classified as infrastructure or
 standard-library gems. An RBI supplies types and ownership, not executable
@@ -295,3 +388,23 @@ extensions.
 
 Extension facts belong to the app that lists them. An app that lists no
 extensions behaves as before.
+
+## `spinel`
+
+```yaml
+spinel:
+  int_overflow: promote
+```
+
+`int_overflow` is handed to Spinel as `--int-overflow` on every compile
+the emitted Makefile runs: the app binary and each test binary. Ruby's
+Integer never overflows; Spinel's default (`raise`) stops with a
+`RangeError` when a value passes 64 bits, `promote` turns it into a
+big integer as Ruby does, and `wrap` wraps it. An app needs `promote`
+when it, or a gem compiled from source, computes past 64 bits: rotp
+builds its Base32 secret in one shifted integer, so lobsters' two-factor
+sign-in needs it. `promote` with the emitted RBS needs Spinel with
+matz/spinel#10494.
+
+This setting is provisional. Whether a program needs the mode should be
+decided without asking the app, and the setting will go once it is.
